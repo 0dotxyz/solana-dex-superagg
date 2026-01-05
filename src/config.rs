@@ -46,6 +46,72 @@ pub enum RoutingStrategy {
     },
 }
 
+/// Custom deserializer for wallet_keypair that accepts both strings and sequences
+///
+/// When figment parses a JSON array string like "[1,2,3,...]", it treats it as a sequence.
+/// This deserializer accepts both formats and converts sequences back to JSON strings.
+fn deserialize_wallet_keypair<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct WalletKeypairVisitor;
+
+    impl<'de> Visitor<'de> for WalletKeypairVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or a sequence of bytes")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value.to_string()))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(WalletKeypairVisitor)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::new();
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            // Convert sequence back to JSON string
+            Ok(Some(
+                serde_json::to_string(&bytes).map_err(de::Error::custom)?,
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(WalletKeypairVisitor)
+}
+
 /// Shared configuration used by both Jupiter and Titan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,6 +122,7 @@ pub struct SharedConfig {
     pub slippage_bps: u16,
     /// Wallet keypair (base58 encoded string, JSON array, or comma-separated bytes)
     /// Optional - not required for simulation/quote-only operations
+    #[serde(deserialize_with = "deserialize_wallet_keypair")]
     pub wallet_keypair: Option<String>,
     /// Compute unit price in micro lamports
     pub compute_unit_price_micro_lamports: u64,
@@ -84,12 +151,23 @@ impl Default for SharedConfig {
 pub struct JupiterConfig {
     /// Jupiter Swap API URL
     pub jup_swap_api_url: String,
+    /// Jupiter API key (optional, but recommended for production use)
+    /// Get your API key from https://portal.jup.ag/
+    ///
+    /// **Note**: Currently stored but not yet used in requests. The jupiter-swap-api-client
+    /// crate doesn't support custom headers yet. To use API keys, you'll need to either:
+    /// 1. Wait for the crate to add API key support
+    /// 2. Fork/wrap the crate to add x-api-key header support
+    ///
+    /// Environment variable: `DEX_SUPERAGG_JUPITER__JUPITER_API_KEY`
+    pub jupiter_api_key: Option<String>,
 }
 
 impl Default for JupiterConfig {
     fn default() -> Self {
         Self {
-            jup_swap_api_url: "https://quote-api.jup.ag/v6".to_string(),
+            jup_swap_api_url: "https://api.jup.ag".to_string(),
+            jupiter_api_key: None,
         }
     }
 }
@@ -179,11 +257,20 @@ impl ClientConfig {
     /// Examples:
     /// - `DEX_SUPERAGG_SHARED__RPC_URL` for `shared.rpc_url`
     /// - `DEX_SUPERAGG_JUPITER__JUP_SWAP_API_URL` for `jupiter.jup_swap_api_url`
+    /// - `DEX_SUPERAGG_JUPITER__JUPITER_API_KEY` for `jupiter.jupiter_api_key` (optional, not yet used)
     /// - `DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT` for `titan.titan_ws_endpoint`
+    ///
+    /// Note: `DEX_SUPERAGG_SHARED__WALLET_KEYPAIR` can be:
+    /// - A JSON array string (e.g., `"[1,2,3,...]"`) - will be parsed correctly via custom deserializer
+    /// - A base58 string
+    /// - Comma-separated bytes
     pub fn from_env() -> Result<Self, figment::Error> {
-        Figment::new()
+        // Extract config from environment - custom deserializer handles WALLET_KEYPAIR parsing
+        let config: Self = Figment::new()
             .merge(Env::prefixed("DEX_SUPERAGG_").split("__"))
-            .extract()
+            .extract()?;
+
+        Ok(config)
     }
 
     /// Check if Titan is configured
@@ -394,23 +481,33 @@ impl ClientConfig {
     }
 
     async fn validate_titan_endpoint(&self, titan: &TitanConfig) -> anyhow::Result<()> {
-        // Build the WebSocket URL
-        let ws_url = if titan.titan_ws_endpoint.starts_with("ws://")
-            || titan.titan_ws_endpoint.starts_with("wss://")
-        {
-            titan.titan_ws_endpoint.clone()
+        // Determine Titan endpoint configuration (same logic as TitanAggregator::new)
+        let (titan_ws_endpoint, titan_api_key) = if let Some(api_key) = &titan.titan_api_key {
+            if api_key.is_empty() {
+                return Err(anyhow::anyhow!("TITAN_API_KEY is set but empty"));
+            }
+            (titan.titan_ws_endpoint.clone(), api_key.clone())
+        } else if let Some(hermes_endpoint) = &titan.hermes_endpoint {
+            let ws_endpoint = format!("{}/ws", hermes_endpoint);
+            (ws_endpoint, String::new())
         } else {
-            format!("wss://{}", titan.titan_ws_endpoint)
+            return Err(anyhow::anyhow!(
+                "Either titan_api_key or hermes_endpoint must be provided"
+            ));
         };
 
-        // Try to connect to the WebSocket endpoint
-        timeout(
-            Duration::from_secs(5),
-            tokio_tungstenite::connect_async(&ws_url),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("WebSocket connection timeout"))?
-        .map_err(|e| anyhow::anyhow!("Failed to connect to Titan WebSocket: {}", e))?;
+        // Create TitanClient and try to connect (let TitanClient handle all URL building)
+        use crate::aggregators::titan::TitanClient;
+        let titan_client = TitanClient::new(titan_ws_endpoint, titan_api_key);
+
+        // Try to connect with timeout
+        timeout(Duration::from_secs(5), titan_client.connect())
+            .await
+            .map_err(|_| anyhow::anyhow!("WebSocket connection timeout"))?
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Titan: {}", e))?;
+
+        // Clean up connection
+        let _ = titan_client.close().await;
 
         Ok(())
     }
@@ -678,6 +775,42 @@ mod tests {
     }
 
     #[test]
+    fn test_wallet_keypair_json_array_via_env() {
+        // Test that JSON array format works through from_env() with custom deserializer
+        figment::Jail::expect_with(|jail| {
+            // Create a test keypair and encode it as JSON array
+            let test_keypair = solana_sdk::signature::Keypair::new();
+            let json_keypair = serde_json::to_string(&test_keypair.to_bytes().to_vec()).unwrap();
+
+            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", &json_keypair);
+
+            let config = ClientConfig::from_env()?;
+            let parsed_keypair = config
+                .get_keypair()
+                .map_err(|e| figment::Error::from(e.to_string()))?
+                .expect("Keypair should be parsed");
+
+            assert_eq!(parsed_keypair.pubkey(), test_keypair.pubkey());
+
+            // Verify the stored value is a JSON string (not parsed as sequence)
+            assert!(config
+                .shared
+                .wallet_keypair
+                .as_ref()
+                .unwrap()
+                .starts_with('['));
+            assert!(config
+                .shared
+                .wallet_keypair
+                .as_ref()
+                .unwrap()
+                .ends_with(']'));
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_wallet_keypair_comma_separated() {
         figment::Jail::expect_with(|jail| {
             // Create a test keypair and encode it as comma-separated bytes
@@ -759,7 +892,7 @@ mod tests {
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
         config.shared.wallet_keypair = Some(base58_keypair);
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag".to_string();
 
         let result = config.validate().await;
 
@@ -774,7 +907,7 @@ mod tests {
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
         config.shared.wallet_keypair = Some("invalid_keypair".to_string());
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag".to_string();
 
         let result = config.validate().await;
 
@@ -789,7 +922,7 @@ mod tests {
         // Test with a real Solana RPC endpoint
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag".to_string();
 
         let result = config.validate().await;
 
@@ -807,7 +940,7 @@ mod tests {
     async fn test_validate_jupiter_endpoint() {
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag".to_string();
 
         let result = config.validate().await;
 

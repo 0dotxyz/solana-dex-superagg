@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use solana_client::{rpc_client::RpcClient, rpc_config::CommitmentConfig};
 use solana_sdk::signature::{Keypair, Signer};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Main client for routing orders across multiple DEX aggregators (Jupiter, Titan, etc.)
 pub struct DexSuperAggClient {
@@ -15,6 +16,9 @@ pub struct DexSuperAggClient {
     rpc_client: RpcClient,
     /// Client configuration
     config: ClientConfig,
+    /// Cached Titan aggregator (lazily initialized, reused across swaps)
+    /// This prevents opening a new WebSocket connection for each swap
+    titan_aggregator: Arc<Mutex<Option<Arc<TitanAggregator>>>>,
 }
 
 impl DexSuperAggClient {
@@ -32,6 +36,7 @@ impl DexSuperAggClient {
             signer: Arc::new(signer),
             rpc_client,
             config,
+            titan_aggregator: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -59,6 +64,31 @@ impl DexSuperAggClient {
     /// Get a reference to the signer
     pub fn signer(&self) -> &Arc<Keypair> {
         &self.signer
+    }
+
+    /// Get or create Titan aggregator (reuses WebSocket connection)
+    /// This method lazily initializes the Titan aggregator and reuses it across swaps
+    async fn get_titan_aggregator(&self) -> Result<Arc<TitanAggregator>> {
+        let mut titan_opt = self.titan_aggregator.lock().await;
+
+        if titan_opt.is_none() {
+            // Initialize Titan aggregator if not already created
+            let titan = TitanAggregator::new(&self.config, Arc::clone(&self.signer)).await?;
+            *titan_opt = Some(Arc::new(titan));
+        }
+
+        // Clone the Arc to return a reference
+        Ok(titan_opt.as_ref().unwrap().clone())
+    }
+
+    /// Close the Titan WebSocket connection
+    /// Call this when you're done with the client to clean up resources
+    pub async fn close(&self) -> Result<()> {
+        let mut titan_opt = self.titan_aggregator.lock().await;
+        if let Some(titan) = titan_opt.take() {
+            titan.close().await?;
+        }
+        Ok(())
     }
 
     /// Execute a swap using default routing configuration
@@ -176,10 +206,9 @@ impl DexSuperAggClient {
                 jupiter.swap(input, output, amount, slippage_bps).await
             }
             Aggregator::Titan => {
-                let titan = TitanAggregator::new(&self.config, Arc::clone(&self.signer)).await?;
-                let result = titan.swap(input, output, amount, slippage_bps).await;
-                let _ = titan.close().await; // Clean up connection
-                result
+                // Reuse existing Titan aggregator to avoid opening new WebSocket connections
+                let titan = self.get_titan_aggregator().await?;
+                titan.swap(input, output, amount, slippage_bps).await
             }
         }
     }
@@ -207,9 +236,9 @@ impl DexSuperAggClient {
                     .await?;
             }
             Aggregator::Titan => {
-                let titan = TitanAggregator::new(&self.config, Arc::clone(&self.signer)).await?;
+                // Reuse existing Titan aggregator to avoid opening new WebSocket connections
+                let titan = self.get_titan_aggregator().await?;
                 let _simulate_result = titan.simulate(input, output, amount, slippage_bps).await?;
-                let _ = titan.close().await; // Clean up connection
             }
         }
 
@@ -288,10 +317,9 @@ impl DexSuperAggClient {
 
         // Titan simulation (if configured)
         if self.config.is_titan_configured() {
-            if let Ok(titan) = TitanAggregator::new(&self.config, Arc::clone(&self.signer)).await {
+            if let Ok(titan) = self.get_titan_aggregator().await {
                 if let Ok(sim_result) = titan.simulate(input, output, amount, slippage_bps).await {
                     results.push((Aggregator::Titan, sim_result.out_amount));
-                    let _ = titan.close().await; // Clean up connection
                 }
             }
         }

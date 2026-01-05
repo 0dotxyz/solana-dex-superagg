@@ -23,6 +23,11 @@ pub struct JupiterAggregator {
     rpc_client: RpcClient,
     signer: Arc<Keypair>,
     compute_unit_price_micro_lamports: u64,
+    /// Jupiter API key (stored for future use)
+    /// Note: The jupiter-swap-api-client crate may need to be updated to support API keys
+    /// API keys should be passed as `x-api-key` header in HTTP requests
+    #[allow(dead_code)]
+    api_key: Option<String>,
 }
 
 impl JupiterAggregator {
@@ -43,11 +48,19 @@ impl JupiterAggregator {
             RpcClient::new_with_commitment(&config.shared.rpc_url, CommitmentConfig::confirmed());
         let jupiter_client = JupiterSwapApiClient::new(config.jupiter.jup_swap_api_url.clone());
 
+        // Warn if API key is provided but can't be used
+        // TODO: The jupiter-swap-api-client crate needs to be updated to support API keys
+        // via x-api-key header, or we need to fork/wrap it to add header support
+        if config.jupiter.jupiter_api_key.is_some() {
+            eprintln!("⚠️  Warning: Jupiter API key is configured but not yet used. The jupiter-swap-api-client crate doesn't currently support custom headers. API key will be stored but requests won't include the x-api-key header.");
+        }
+
         Ok(Self {
             jupiter_client,
             rpc_client,
             signer,
             compute_unit_price_micro_lamports,
+            api_key: config.jupiter.jupiter_api_key.clone(),
         })
     }
 
@@ -56,6 +69,7 @@ impl JupiterAggregator {
         rpc_url: &str,
         signer: Arc<Keypair>,
         compute_unit_price_micro_lamports: u64,
+        api_key: Option<String>,
     ) -> Result<Self> {
         let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
         let jupiter_client = JupiterSwapApiClient::new(jupiter_api_url.to_string());
@@ -65,6 +79,7 @@ impl JupiterAggregator {
             rpc_client,
             signer,
             compute_unit_price_micro_lamports,
+            api_key,
         })
     }
 }
