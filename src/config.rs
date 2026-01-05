@@ -5,6 +5,16 @@ use solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair};
 use std::time::Duration;
 use tokio::time::timeout;
 
+/// Preferred aggregator for routing swaps
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PreferredAggregator {
+    /// Use Jupiter aggregator
+    Jupiter,
+    /// Use Titan aggregator
+    Titan,
+}
+
 /// Shared configuration used by both Jupiter and Titan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,6 +28,8 @@ pub struct SharedConfig {
     pub wallet_keypair: Option<String>,
     /// Compute unit price in micro lamports
     pub compute_unit_price_micro_lamports: u64,
+    /// Preferred aggregator for routing swaps (None = use best price)
+    pub preferred_aggregator: Option<PreferredAggregator>,
 }
 
 impl Default for SharedConfig {
@@ -27,6 +39,7 @@ impl Default for SharedConfig {
             slippage_bps: 50, // 0.5% default slippage
             wallet_keypair: None,
             compute_unit_price_micro_lamports: 0,
+            preferred_aggregator: None, // None = use best price from available aggregators
         }
     }
 }
@@ -299,6 +312,7 @@ mod tests {
         let shared = SharedConfig::default();
         assert_eq!(shared.slippage_bps, 50);
         assert!(!shared.rpc_url.is_empty());
+        assert_eq!(shared.preferred_aggregator, None);
 
         let jupiter = JupiterConfig::default();
         assert!(!jupiter.jup_swap_api_url.is_empty());
@@ -643,5 +657,34 @@ mod tests {
         // Should have errors for both invalid endpoints
         assert!(errors.iter().any(|e| e.contains("RPC URL")));
         assert!(errors.iter().any(|e| e.contains("Jupiter API URL")));
+    }
+
+    #[test]
+    fn test_preferred_aggregator_default() {
+        let shared = SharedConfig::default();
+        assert_eq!(shared.preferred_aggregator, None);
+    }
+
+    #[test]
+    fn test_preferred_aggregator_from_env() {
+        figment::Jail::expect_with(|jail| {
+            // Test Jupiter
+            jail.set_env("DEX_SUPERAGG_SHARED__PREFERRED_AGGREGATOR", "jupiter");
+            let config = ClientConfig::from_env()?;
+            assert_eq!(
+                config.shared.preferred_aggregator,
+                Some(PreferredAggregator::Jupiter)
+            );
+
+            // Test Titan
+            jail.set_env("DEX_SUPERAGG_SHARED__PREFERRED_AGGREGATOR", "titan");
+            let config = ClientConfig::from_env()?;
+            assert_eq!(
+                config.shared.preferred_aggregator,
+                Some(PreferredAggregator::Titan)
+            );
+
+            Ok(())
+        });
     }
 }
