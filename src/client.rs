@@ -1,12 +1,16 @@
-use crate::config::ClientConfig;
-use anyhow::Result;
+use crate::aggregators::{
+    jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator, SwapResult,
+};
+use crate::config::{Aggregator, ClientConfig, RouteConfig, RoutingStrategy};
+use anyhow::{anyhow, Result};
 use solana_client::{rpc_client::RpcClient, rpc_config::CommitmentConfig};
 use solana_sdk::signature::{Keypair, Signer};
+use std::sync::Arc;
 
 /// Main client for routing orders across multiple DEX aggregators (Jupiter, Titan, etc.)
 pub struct DexSuperAggClient {
     /// Wallet keypair for signing transactions
-    signer: Keypair,
+    signer: Arc<Keypair>,
     /// Solana RPC client
     rpc_client: RpcClient,
     /// Client configuration
@@ -25,7 +29,7 @@ impl DexSuperAggClient {
             RpcClient::new_with_commitment(&config.shared.rpc_url, CommitmentConfig::confirmed());
 
         Ok(Self {
-            signer,
+            signer: Arc::new(signer),
             rpc_client,
             config,
         })
@@ -53,8 +57,265 @@ impl DexSuperAggClient {
     }
 
     /// Get a reference to the signer
-    pub fn signer(&self) -> &Keypair {
+    pub fn signer(&self) -> &Arc<Keypair> {
         &self.signer
+    }
+
+    /// Execute a swap using default routing configuration
+    ///
+    /// # Arguments
+    /// * `input` - Input token mint address (as string)
+    /// * `output` - Output token mint address (as string)
+    /// * `amount` - Input amount in lamports/base units
+    ///
+    /// # Returns
+    /// `SwapResult` containing the transaction signature and output amount
+    ///
+    /// Uses the default routing strategy from the client configuration.
+    pub async fn swap(&self, input: &str, output: &str, amount: u64) -> Result<SwapResult> {
+        let route_config = self.config.default_route_config();
+        self.swap_with_route_config(input, output, amount, route_config)
+            .await
+    }
+
+    /// Execute a swap with a custom route configuration
+    ///
+    /// # Arguments
+    /// * `input` - Input token mint address (as string)
+    /// * `output` - Output token mint address (as string)
+    /// * `amount` - Input amount in lamports/base units
+    /// * `route_config` - Route configuration for this swap
+    ///
+    /// # Returns
+    /// `SwapResult` containing the transaction signature and output amount
+    ///
+    /// The route configuration allows per-swap customization of:
+    /// - Compute unit price
+    /// - Routing strategy (which aggregator to use)
+    /// - Retry behavior
+    pub async fn swap_with_route_config(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        route_config: RouteConfig,
+    ) -> Result<SwapResult> {
+        let slippage_bps = self.config.shared.slippage_bps;
+
+        // Determine which aggregator(s) to use based on routing strategy
+        match &route_config.routing_strategy {
+            Some(RoutingStrategy::BestPrice) | None => {
+                // Compare available aggregators and use the one with best price (most tokens)
+                self.swap_best_price(input, output, amount, slippage_bps, &route_config)
+                    .await
+            }
+            Some(RoutingStrategy::PreferredAggregator {
+                aggregator,
+                simulate,
+            }) => {
+                if *simulate {
+                    // Simulate first, then execute
+                    self.swap_with_simulation(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        aggregator,
+                        &route_config,
+                    )
+                    .await
+                } else {
+                    // Direct swap without simulation
+                    self.swap_direct(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        aggregator,
+                        &route_config,
+                    )
+                    .await
+                }
+            }
+            Some(RoutingStrategy::LowestSlippageClimber {
+                floor_slippage_bps,
+                max_slippage_bps,
+                step_bps,
+            }) => {
+                self.swap_lowest_slippage_climber(
+                    input,
+                    output,
+                    amount,
+                    *floor_slippage_bps,
+                    *max_slippage_bps,
+                    *step_bps,
+                    &route_config,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Execute a direct swap with a specific aggregator
+    async fn swap_direct(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        aggregator: &Aggregator,
+        route_config: &RouteConfig,
+    ) -> Result<SwapResult> {
+        match aggregator {
+            Aggregator::Jupiter => {
+                let jupiter = JupiterAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                jupiter.swap(input, output, amount, slippage_bps).await
+            }
+            Aggregator::Titan => {
+                let titan = TitanAggregator::new(&self.config, Arc::clone(&self.signer)).await?;
+                let result = titan.swap(input, output, amount, slippage_bps).await;
+                let _ = titan.close().await; // Clean up connection
+                result
+            }
+        }
+    }
+
+    /// Execute a swap with simulation first
+    async fn swap_with_simulation(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        aggregator: &Aggregator,
+        route_config: &RouteConfig,
+    ) -> Result<SwapResult> {
+        // Simulate first to validate the swap
+        match aggregator {
+            Aggregator::Jupiter => {
+                let jupiter = JupiterAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                let _simulate_result = jupiter
+                    .simulate(input, output, amount, slippage_bps)
+                    .await?;
+            }
+            Aggregator::Titan => {
+                let titan = TitanAggregator::new(&self.config, Arc::clone(&self.signer)).await?;
+                let _simulate_result = titan.simulate(input, output, amount, slippage_bps).await?;
+                let _ = titan.close().await; // Clean up connection
+            }
+        }
+
+        // Then execute the swap
+        self.swap_direct(
+            input,
+            output,
+            amount,
+            slippage_bps,
+            aggregator,
+            route_config,
+        )
+        .await
+    }
+
+    /// Execute swap using lowest slippage climber strategy
+    async fn swap_lowest_slippage_climber(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        floor_slippage_bps: u16,
+        max_slippage_bps: u16,
+        step_bps: u16,
+        route_config: &RouteConfig,
+    ) -> Result<SwapResult> {
+        // Try each slippage level starting from floor
+        let mut current_slippage = floor_slippage_bps;
+        let mut last_error = None;
+
+        while current_slippage <= max_slippage_bps {
+            // Try swap with current slippage using best price strategy
+            match self
+                .swap_best_price(input, output, amount, current_slippage, route_config)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_error = Some(e);
+                    current_slippage += step_bps;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to execute swap with any slippage level")))
+    }
+
+    /// Execute swap using best price (compare available aggregators)
+    ///
+    /// This is the default strategy when no routing strategy is specified.
+    /// It compares output amounts from all available aggregators and selects the one
+    /// that gives you the most tokens (best price).
+    ///
+    /// **This is what most users want** - maximizing the tokens you receive.
+    async fn swap_best_price(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        route_config: &RouteConfig,
+    ) -> Result<SwapResult> {
+        // Simulate both aggregators to compare output amounts
+        let mut results = Vec::new();
+
+        // Jupiter simulation
+        if let Ok(jupiter) = JupiterAggregator::new_with_compute_price(
+            &self.config,
+            Arc::clone(&self.signer),
+            route_config.compute_unit_price_micro_lamports,
+        ) {
+            if let Ok(sim_result) = jupiter.simulate(input, output, amount, slippage_bps).await {
+                results.push((Aggregator::Jupiter, sim_result.out_amount));
+            }
+        }
+
+        // Titan simulation (if configured)
+        if self.config.is_titan_configured() {
+            if let Ok(titan) = TitanAggregator::new(&self.config, Arc::clone(&self.signer)).await {
+                if let Ok(sim_result) = titan.simulate(input, output, amount, slippage_bps).await {
+                    results.push((Aggregator::Titan, sim_result.out_amount));
+                    let _ = titan.close().await; // Clean up connection
+                }
+            }
+        }
+
+        if results.is_empty() {
+            return Err(anyhow!("No aggregators available for swap"));
+        }
+
+        // Find aggregator with highest output amount (most tokens = best price)
+        let (best_aggregator, _) = results
+            .iter()
+            .max_by_key(|(_, out_amount)| out_amount)
+            .ok_or_else(|| anyhow!("Failed to determine best aggregator"))?;
+
+        // Execute swap with aggregator that gives the most tokens
+        self.swap_direct(
+            input,
+            output,
+            amount,
+            slippage_bps,
+            best_aggregator,
+            route_config,
+        )
+        .await
     }
 }
 

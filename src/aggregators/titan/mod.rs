@@ -15,6 +15,7 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
+use std::sync::Arc;
 
 pub use client::TitanClient;
 pub use types::SwapRoute;
@@ -30,14 +31,14 @@ pub struct TitanAggregator {
     /// Async RPC client for blockhash fetching
     async_rpc_client: AsyncRpcClient,
     /// Wallet keypair for signing transactions
-    signer: Keypair,
+    signer: Arc<Keypair>,
     /// RPC URL for transaction building
     rpc_url: String,
 }
 
 impl TitanAggregator {
     /// Create a new Titan aggregator from ClientConfig
-    pub async fn new(config: &ClientConfig, signer: Keypair) -> Result<Self> {
+    pub async fn new(config: &ClientConfig, signer: Arc<Keypair>) -> Result<Self> {
         let titan_config = config
             .titan
             .as_ref()
@@ -85,7 +86,7 @@ impl TitanAggregator {
         titan_api_key: Option<String>,
         hermes_endpoint: Option<String>,
         rpc_url: String,
-        signer: Keypair,
+        signer: Arc<Keypair>,
     ) -> Result<Self> {
         // Determine Titan endpoint configuration
         let (ws_endpoint, api_key) = if let Some(api_key) = titan_api_key {
@@ -143,7 +144,7 @@ impl DexAggregator for TitanAggregator {
         amount: u64,
         slippage_bps: u16,
     ) -> Result<SwapResult> {
-        let user_pubkey = self.signer.pubkey().to_string();
+        let user_pubkey = self.signer.as_ref().pubkey().to_string();
 
         // Request swap quotes with slippage
         let (_provider, route) = self
@@ -162,7 +163,7 @@ impl DexAggregator for TitanAggregator {
         // Build transaction
         let transaction_bytes = build_transaction_from_route(
             &route,
-            self.signer.pubkey(),
+            self.signer.as_ref().pubkey(),
             recent_blockhash,
             &self.rpc_url,
             None, // No Jito tip for now
@@ -176,7 +177,7 @@ impl DexAggregator for TitanAggregator {
 
         // Sign transaction
         let message = transaction.message.serialize();
-        let signature = self.signer.sign_message(&message);
+        let signature = self.signer.as_ref().sign_message(&message);
         transaction.signatures[0] = signature;
 
         // Send transaction
@@ -198,7 +199,7 @@ impl DexAggregator for TitanAggregator {
         amount: u64,
         slippage_bps: u16,
     ) -> Result<SimulateResult> {
-        let user_pubkey = self.signer.pubkey().to_string();
+        let user_pubkey = self.signer.as_ref().pubkey().to_string();
 
         // Request swap quotes with slippage (simulation doesn't execute)
         let (_provider, route) = self

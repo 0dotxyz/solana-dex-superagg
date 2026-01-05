@@ -19,6 +19,11 @@ pub enum Aggregator {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RoutingStrategy {
+    /// Compare available aggregators and use the one that gives the most tokens (best price)
+    ///
+    /// This is the default strategy. It simulates swaps on all available aggregators
+    /// (Jupiter and Titan if configured) and selects the one with the highest output amount.
+    BestPrice,
     /// Use a preferred aggregator
     ///
     /// # Fields
@@ -28,8 +33,6 @@ pub enum RoutingStrategy {
         aggregator: Aggregator,
         simulate: bool,
     },
-    /// Compare price impact from both aggregators and use the one with lowest impact
-    LowestPriceImpact,
     /// Test multiple slippage levels and use the one with lowest slippage that succeeds
     ///
     /// # Fields
@@ -56,9 +59,9 @@ pub struct SharedConfig {
     pub wallet_keypair: Option<String>,
     /// Compute unit price in micro lamports
     pub compute_unit_price_micro_lamports: u64,
-    /// Routing strategy for determining which aggregator to use (None = use best price)
+    /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
     pub routing_strategy: Option<RoutingStrategy>,
-    /// Number of times to retry transaction landing/submission for LowestPriceImpact and FloorClimber strategies
+    /// Number of times to retry transaction landing/submission for LowestSlippageClimber strategy
     pub retry_tx_landing: u32,
 }
 
@@ -69,8 +72,8 @@ impl Default for SharedConfig {
             slippage_bps: 50, // 0.5% default slippage
             wallet_keypair: None,
             compute_unit_price_micro_lamports: 0,
-            routing_strategy: None, // None = use best price from available aggregators
-            retry_tx_landing: 3,    // Default to 3 retries for transaction landing
+            routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
+            retry_tx_landing: 3, // Default to 3 retries for transaction landing
         }
     }
 }
@@ -109,6 +112,40 @@ impl Default for TitanConfig {
             titan_ws_endpoint: String::new(),
             titan_api_key: None,
             hermes_endpoint: None,
+        }
+    }
+}
+
+/// Route configuration for individual swap operations
+///
+/// This configuration can be passed per-swap to override default routing behavior.
+/// If not provided, the client will use values from `SharedConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteConfig {
+    /// Compute unit price in micro lamports
+    pub compute_unit_price_micro_lamports: u64,
+    /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
+    pub routing_strategy: Option<RoutingStrategy>,
+    /// Number of times to retry transaction landing/submission for LowestSlippageClimber strategy
+    pub retry_tx_landing: u32,
+}
+
+impl Default for RouteConfig {
+    fn default() -> Self {
+        Self {
+            compute_unit_price_micro_lamports: 0,
+            routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
+            retry_tx_landing: 3,
+        }
+    }
+}
+
+impl From<&SharedConfig> for RouteConfig {
+    fn from(shared: &SharedConfig) -> Self {
+        Self {
+            compute_unit_price_micro_lamports: shared.compute_unit_price_micro_lamports,
+            routing_strategy: shared.routing_strategy.clone(),
+            retry_tx_landing: shared.retry_tx_landing,
         }
     }
 }
@@ -194,6 +231,18 @@ impl ClientConfig {
         // Validate aggregators based on routing strategy requirements
         if let Some(ref strategy) = self.shared.routing_strategy {
             match strategy {
+                RoutingStrategy::BestPrice => {
+                    // BestPrice strategy compares all available aggregators
+                    // Validate Jupiter (always required) and Titan if configured
+                    if let Err(errs) = self.validate_jupiter().await {
+                        errors.extend(errs);
+                    }
+                    if self.titan.is_some() {
+                        if let Err(errs) = self.validate_titan().await {
+                            errors.extend(errs);
+                        }
+                    }
+                }
                 RoutingStrategy::PreferredAggregator { aggregator, .. } => match aggregator {
                     Aggregator::Jupiter => {
                         if let Err(errs) = self.validate_jupiter().await {
@@ -206,9 +255,8 @@ impl ClientConfig {
                         }
                     }
                 },
-                RoutingStrategy::LowestPriceImpact
-                | RoutingStrategy::LowestSlippageClimber { .. } => {
-                    // Both strategies require Jupiter and Titan (if configured)
+                RoutingStrategy::LowestSlippageClimber { .. } => {
+                    // This strategy requires Jupiter and Titan (if configured)
                     if let Err(errs) = self.validate_jupiter().await {
                         errors.extend(errs);
                     }
@@ -220,7 +268,8 @@ impl ClientConfig {
                 }
             }
         } else {
-            // No routing strategy: validate Jupiter (always required) and Titan if configured
+            // No routing strategy specified: validate Jupiter (always required) and Titan if configured
+            // This should rarely happen now since BestPrice is the default
             if let Err(errs) = self.validate_jupiter().await {
                 errors.extend(errs);
             }
@@ -366,6 +415,11 @@ impl ClientConfig {
         Ok(())
     }
 
+    /// Get the default route configuration from shared config
+    pub fn default_route_config(&self) -> RouteConfig {
+        RouteConfig::from(&self.shared)
+    }
+
     /// Get the wallet keypair from the configuration
     /// Returns None if no keypair is configured (useful for simulation/quote-only operations)
     pub fn get_keypair(&self) -> anyhow::Result<Option<Keypair>> {
@@ -426,7 +480,7 @@ mod tests {
         let shared = SharedConfig::default();
         assert_eq!(shared.slippage_bps, 50);
         assert!(!shared.rpc_url.is_empty());
-        assert_eq!(shared.routing_strategy, None);
+        assert_eq!(shared.routing_strategy, Some(RoutingStrategy::BestPrice));
 
         let jupiter = JupiterConfig::default();
         assert!(!jupiter.jup_swap_api_url.is_empty());
@@ -788,14 +842,17 @@ mod tests {
     #[test]
     fn test_routing_strategy_default() {
         figment::Jail::expect_with(|jail| {
-            // Don't set routing_strategy - should default to None
+            // Don't set routing_strategy - should default to BestPrice
             jail.set_env(
                 "DEX_SUPERAGG_SHARED__RPC_URL",
                 "https://api.testnet.solana.com",
             );
 
             let config = ClientConfig::from_env()?;
-            assert_eq!(config.shared.routing_strategy, None);
+            assert_eq!(
+                config.shared.routing_strategy,
+                Some(RoutingStrategy::BestPrice)
+            );
 
             Ok(())
         });
@@ -860,56 +917,6 @@ mod tests {
                     assert_eq!(*simulate, false);
                 }
                 _ => panic!("Expected PreferredAggregator with Titan"),
-            }
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_routing_strategy_lowest_price_impact() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE",
-                "lowest_price_impact",
-            );
-
-            let config = ClientConfig::from_env()?;
-
-            match &config.shared.routing_strategy {
-                Some(RoutingStrategy::LowestPriceImpact) => {
-                    // Success
-                }
-                _ => panic!("Expected LowestPriceImpact"),
-            }
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_routing_strategy_fastest_sim() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE",
-                "lowest_price_impact",
-            );
-
-            let config = ClientConfig::from_env()?;
-
-            match &config.shared.routing_strategy {
-                Some(RoutingStrategy::LowestPriceImpact) => {
-                    // Success
-                }
-                _ => panic!("Expected LowestPriceImpact"),
             }
 
             Ok(())

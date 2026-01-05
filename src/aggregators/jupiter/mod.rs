@@ -16,17 +16,29 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 pub struct JupiterAggregator {
     jupiter_client: JupiterSwapApiClient,
     rpc_client: RpcClient,
-    signer: Keypair,
+    signer: Arc<Keypair>,
     compute_unit_price_micro_lamports: u64,
 }
 
 impl JupiterAggregator {
-    pub fn new(config: &ClientConfig, signer: Keypair) -> Result<Self> {
+    pub fn new(config: &ClientConfig, signer: Arc<Keypair>) -> Result<Self> {
+        Self::new_with_compute_price(
+            config,
+            signer,
+            config.shared.compute_unit_price_micro_lamports,
+        )
+    }
+
+    pub fn new_with_compute_price(
+        config: &ClientConfig,
+        signer: Arc<Keypair>,
+        compute_unit_price_micro_lamports: u64,
+    ) -> Result<Self> {
         let rpc_client =
             RpcClient::new_with_commitment(&config.shared.rpc_url, CommitmentConfig::confirmed());
         let jupiter_client = JupiterSwapApiClient::new(config.jupiter.jup_swap_api_url.clone());
@@ -35,14 +47,14 @@ impl JupiterAggregator {
             jupiter_client,
             rpc_client,
             signer,
-            compute_unit_price_micro_lamports: config.shared.compute_unit_price_micro_lamports,
+            compute_unit_price_micro_lamports,
         })
     }
 
     pub fn with_config(
         jupiter_api_url: &str,
         rpc_url: &str,
-        signer: Keypair,
+        signer: Arc<Keypair>,
         compute_unit_price_micro_lamports: u64,
     ) -> Result<Self> {
         let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
@@ -100,7 +112,7 @@ impl DexAggregator for JupiterAggregator {
         };
 
         // Convert solana_sdk::pubkey::Pubkey to solana_pubkey::Pubkey
-        let user_pubkey_bytes: [u8; 32] = self.signer.pubkey().to_bytes();
+        let user_pubkey_bytes: [u8; 32] = self.signer.as_ref().pubkey().to_bytes();
         let user_pubkey = Pubkey::from(user_pubkey_bytes);
 
         let swap_response = self
@@ -119,7 +131,7 @@ impl DexAggregator for JupiterAggregator {
         let tx: VersionedTransaction = bincode::deserialize(&swap_response.swap_transaction)
             .map_err(|e| anyhow!("Failed to deserialize transaction: {}", e))?;
 
-        let signed_tx = VersionedTransaction::try_new(tx.message, &[&self.signer])
+        let signed_tx = VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
             .map_err(|e| anyhow!("Failed to sign transaction: {}", e))?;
 
         let sig = self
