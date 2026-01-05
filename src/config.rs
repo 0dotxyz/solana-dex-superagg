@@ -58,6 +58,8 @@ pub struct SharedConfig {
     pub compute_unit_price_micro_lamports: u64,
     /// Routing strategy for determining which aggregator to use (None = use best price)
     pub routing_strategy: Option<RoutingStrategy>,
+    /// Number of times to retry transaction landing/submission for LowestPriceImpact and FloorClimber strategies
+    pub retry_tx_landing: u32,
 }
 
 impl Default for SharedConfig {
@@ -68,6 +70,7 @@ impl Default for SharedConfig {
             wallet_keypair: None,
             compute_unit_price_micro_lamports: 0,
             routing_strategy: None, // None = use best price from available aggregators
+            retry_tx_landing: 3,    // Default to 3 retries for transaction landing
         }
     }
 }
@@ -161,9 +164,10 @@ impl ClientConfig {
     /// - RPC URL is reachable and responds
     /// - Jupiter API URL is reachable and responds
     /// - Titan WebSocket endpoint (if configured) is reachable
+    /// - Routing strategy aggregator requirements are met
     ///
-    /// Returns a vector of validation errors, empty if all checks pass
-    pub async fn validate(&self) -> Vec<String> {
+    /// Returns Ok(()) if valid, Err(Vec<String>) with validation errors if invalid
+    pub async fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Validate wallet keypair if provided
@@ -187,44 +191,51 @@ impl ClientConfig {
             errors.push("RPC URL is required".to_string());
         }
 
-        // Validate Jupiter API URL by making a test request
-        if !self.jupiter.jup_swap_api_url.is_empty() {
-            if let Err(e) = self.validate_jupiter_url().await {
-                errors.push(format!(
-                    "Jupiter API URL validation failed ({}): {}",
-                    self.jupiter.jup_swap_api_url, e
-                ));
-            }
-        } else {
-            errors.push("Jupiter API URL is required".to_string());
-        }
-
-        // Validate Titan configuration if provided
-        if let Some(ref titan) = self.titan {
-            if titan.titan_ws_endpoint.is_empty() {
-                errors.push(
-                    "Titan WebSocket endpoint is required when Titan is configured".to_string(),
-                );
-            } else {
-                // Test WebSocket connectivity
-                if let Err(e) = self.validate_titan_endpoint(titan).await {
-                    errors.push(format!(
-                        "Titan WebSocket endpoint validation failed ({}): {}",
-                        titan.titan_ws_endpoint, e
-                    ));
+        // Validate aggregators based on routing strategy requirements
+        if let Some(ref strategy) = self.shared.routing_strategy {
+            match strategy {
+                RoutingStrategy::PreferredAggregator { aggregator, .. } => match aggregator {
+                    Aggregator::Jupiter => {
+                        if let Err(errs) = self.validate_jupiter().await {
+                            errors.extend(errs);
+                        }
+                    }
+                    Aggregator::Titan => {
+                        if let Err(errs) = self.validate_titan().await {
+                            errors.extend(errs);
+                        }
+                    }
+                },
+                RoutingStrategy::LowestPriceImpact
+                | RoutingStrategy::LowestSlippageClimber { .. } => {
+                    // Both strategies require Jupiter and Titan (if configured)
+                    if let Err(errs) = self.validate_jupiter().await {
+                        errors.extend(errs);
+                    }
+                    if self.titan.is_some() {
+                        if let Err(errs) = self.validate_titan().await {
+                            errors.extend(errs);
+                        }
+                    }
                 }
             }
-
-            // Check that either API key or Hermes endpoint is provided
-            if titan.titan_api_key.is_none() && titan.hermes_endpoint.is_none() {
-                errors.push(
-                    "Either Titan API key or Hermes endpoint must be provided when Titan is configured"
-                        .to_string(),
-                );
+        } else {
+            // No routing strategy: validate Jupiter (always required) and Titan if configured
+            if let Err(errs) = self.validate_jupiter().await {
+                errors.extend(errs);
+            }
+            if self.titan.is_some() {
+                if let Err(errs) = self.validate_titan().await {
+                    errors.extend(errs);
+                }
             }
         }
 
-        errors
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     async fn validate_rpc_url(&self) -> anyhow::Result<()> {
@@ -247,6 +258,72 @@ impl ClientConfig {
         .map_err(|e| anyhow::anyhow!("RPC task error: {}", e))??;
 
         Ok(())
+    }
+
+    /// Validate Jupiter configuration and connectivity
+    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
+    async fn validate_jupiter(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if self.jupiter.jup_swap_api_url.is_empty() {
+            errors.push("Jupiter API URL is required".to_string());
+            return Err(errors);
+        }
+
+        if let Err(e) = self.validate_jupiter_url().await {
+            errors.push(format!(
+                "Jupiter API URL validation failed ({}): {}",
+                self.jupiter.jup_swap_api_url, e
+            ));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate Titan configuration and connectivity
+    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
+    async fn validate_titan(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        let titan = match &self.titan {
+            Some(t) => t,
+            None => {
+                errors.push("Titan is not configured".to_string());
+                return Err(errors);
+            }
+        };
+
+        if titan.titan_ws_endpoint.is_empty() {
+            errors
+                .push("Titan WebSocket endpoint is required when Titan is configured".to_string());
+            return Err(errors);
+        }
+
+        // Test WebSocket connectivity
+        if let Err(e) = self.validate_titan_endpoint(titan).await {
+            errors.push(format!(
+                "Titan WebSocket endpoint validation failed ({}): {}",
+                titan.titan_ws_endpoint, e
+            ));
+        }
+
+        // Check that either API key or Hermes endpoint is provided
+        if titan.titan_api_key.is_none() && titan.hermes_endpoint.is_none() {
+            errors.push(
+                "Either Titan API key or Hermes endpoint must be provided when Titan is configured"
+                    .to_string(),
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     async fn validate_jupiter_url(&self) -> anyhow::Result<()> {
@@ -621,10 +698,12 @@ mod tests {
         config.shared.wallet_keypair = Some(base58_keypair);
         config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should only have errors for endpoint connectivity, not keypair
-        assert!(!errors.iter().any(|e| e.contains("wallet keypair")));
+        if let Err(errors) = result {
+            assert!(!errors.iter().any(|e| e.contains("wallet keypair")));
+        }
     }
 
     #[tokio::test]
@@ -634,9 +713,12 @@ mod tests {
         config.shared.wallet_keypair = Some("invalid_keypair".to_string());
         config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
-        assert!(errors.iter().any(|e| e.contains("wallet keypair")));
+        assert!(result.is_err());
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| e.contains("wallet keypair")));
+        }
     }
 
     #[tokio::test]
@@ -646,14 +728,16 @@ mod tests {
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
         config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should not have RPC URL errors if it's reachable
         // (may have other errors if endpoints are down, but RPC should work)
-        let rpc_errors: Vec<_> = errors.iter().filter(|e| e.contains("RPC URL")).collect();
-        // If RPC is unreachable, that's fine for the test - we just want to make sure
-        // the validation logic works
-        println!("RPC validation errors: {:?}", rpc_errors);
+        if let Err(errors) = result {
+            let rpc_errors: Vec<_> = errors.iter().filter(|e| e.contains("RPC URL")).collect();
+            // If RPC is unreachable, that's fine for the test - we just want to make sure
+            // the validation logic works
+            println!("RPC validation errors: {:?}", rpc_errors);
+        }
     }
 
     #[tokio::test]
@@ -662,15 +746,17 @@ mod tests {
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
         config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should not have Jupiter URL errors if it's reachable
-        let jupiter_errors: Vec<_> = errors
-            .iter()
-            .filter(|e| e.contains("Jupiter API URL"))
-            .collect();
-        // If Jupiter is unreachable, that's fine for the test
-        println!("Jupiter validation errors: {:?}", jupiter_errors);
+        if let Err(errors) = result {
+            let jupiter_errors: Vec<_> = errors
+                .iter()
+                .filter(|e| e.contains("Jupiter API URL"))
+                .collect();
+            // If Jupiter is unreachable, that's fine for the test
+            println!("Jupiter validation errors: {:?}", jupiter_errors);
+        }
     }
 
     #[tokio::test]
@@ -680,11 +766,14 @@ mod tests {
         config.jupiter.jup_swap_api_url =
             "https://invalid-jupiter-url-that-does-not-exist.com".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should have errors for both invalid endpoints
-        assert!(errors.iter().any(|e| e.contains("RPC URL")));
-        assert!(errors.iter().any(|e| e.contains("Jupiter API URL")));
+        assert!(result.is_err());
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| e.contains("RPC URL")));
+            assert!(errors.iter().any(|e| e.contains("Jupiter API URL")));
+        }
     }
 
     #[test]
