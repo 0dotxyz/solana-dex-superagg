@@ -82,3 +82,6 @@ pub trait DexAggregator: Send + Sync {
 
 pub mod jupiter;
 pub mod titan;
+
+pub use jupiter::JupiterAggregator;
+pub use titan::TitanAggregator;

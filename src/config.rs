@@ -1,7 +1,7 @@
 use figment::{providers::Env, Figment};
 use serde::{Deserialize, Serialize};
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair};
+use solana_client::{rpc_client::RpcClient, rpc_config::CommitmentConfig};
+use solana_sdk::signature::Keypair;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -377,9 +377,10 @@ impl ClientConfig {
         // Try parsing as base58 string first
         if let Ok(bytes) = bs58::decode(wallet_keypair).into_vec() {
             if bytes.len() == 64 {
-                if let Ok(keypair) = Keypair::from_bytes(&bytes) {
-                    return Ok(Some(keypair));
-                }
+                let mut secret_key = [0u8; 32];
+                secret_key.copy_from_slice(&bytes[..32]);
+                let keypair = Keypair::new_from_array(secret_key);
+                return Ok(Some(keypair));
             }
         }
 
@@ -401,9 +402,17 @@ impl ClientConfig {
             ));
         };
 
-        Keypair::from_bytes(&bytes)
-            .map(|kp| Some(kp))
-            .map_err(|e| anyhow::anyhow!("Failed to create keypair from bytes: {}", e))
+        if bytes.len() != 64 {
+            return Err(anyhow::anyhow!(
+                "Invalid keypair length: expected 64 bytes, got {} bytes",
+                bytes.len()
+            ));
+        }
+
+        let mut secret_key = [0u8; 32];
+        secret_key.copy_from_slice(&bytes[..32]);
+        let keypair = Keypair::new_from_array(secret_key);
+        Ok(Some(keypair))
     }
 }
 

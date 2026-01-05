@@ -1,10 +1,7 @@
 use crate::config::ClientConfig;
 use anyhow::Result;
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    signature::{Keypair, Signer},
-};
+use solana_client::{rpc_client::RpcClient, rpc_config::CommitmentConfig};
+use solana_sdk::signature::{Keypair, Signer};
 
 /// Main client for routing orders across multiple DEX aggregators (Jupiter, Titan, etc.)
 pub struct DexSuperAggClient {

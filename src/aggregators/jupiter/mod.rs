@@ -9,10 +9,10 @@ use jupiter_swap_api_client::{
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
 };
+use solana_client::rpc_config::{CommitmentConfig, CommitmentLevel};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_pubkey::Pubkey;
 use solana_sdk::{
-    commitment_config::{CommitmentConfig, CommitmentLevel},
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
@@ -99,11 +99,15 @@ impl DexAggregator for JupiterAggregator {
             ..Default::default()
         };
 
+        // Convert solana_sdk::pubkey::Pubkey to solana_pubkey::Pubkey
+        let user_pubkey_bytes: [u8; 32] = self.signer.pubkey().to_bytes();
+        let user_pubkey = Pubkey::from(user_pubkey_bytes);
+
         let swap_response = self
             .jupiter_client
             .swap(
                 &SwapRequest {
-                    user_public_key: Pubkey::from(self.signer.pubkey()),
+                    user_public_key: user_pubkey,
                     quote_response: quote_response.clone(),
                     config: swap_config,
                 },
@@ -165,9 +169,16 @@ impl DexAggregator for JupiterAggregator {
             .await
             .map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
 
+        // Convert Decimal to f64 using TryInto
+        let price_impact = quote_response
+            .price_impact_pct
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+
         Ok(SimulateResult {
             out_amount: quote_response.out_amount,
-            price_impact: quote_response.price_impact_pct.unwrap_or(0.0),
+            price_impact,
             metadata: QuoteMetadata {
                 route: None,
                 fees: quote_response.platform_fee.as_ref().map(|f| f.amount),
