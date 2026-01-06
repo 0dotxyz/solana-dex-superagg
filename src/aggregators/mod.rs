@@ -3,6 +3,7 @@
 //! This module provides a trait-based interface for DEX aggregators (Jupiter, Titan, etc.)
 //! and their implementations.
 
+use crate::config::Aggregator;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -16,6 +17,9 @@ pub struct SwapResult {
     /// Slippage tolerance actually used in basis points (e.g., 25 = 0.25%)
     /// This is particularly useful for LowestSlippageClimber strategy to know which slippage level succeeded
     pub slippage_bps_used: Option<u16>,
+    /// Aggregator that was used for this swap (Jupiter or Titan)
+    /// This is particularly useful for BestPrice and LowestSlippageClimber strategies to see which aggregator was selected
+    pub aggregator_used: Option<Aggregator>,
 }
 
 /// Result of a simulation/quote operation

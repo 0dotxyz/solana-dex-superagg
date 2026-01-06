@@ -153,6 +153,13 @@ async fn test_titan_swap(
     println!("  ✓ Swap successful!");
     println!("  Transaction: {}", result.signature);
     println!("  Output Amount: {} lamports", result.out_amount);
+    if let Some(agg) = result.aggregator_used {
+        let agg_name = match agg {
+            Aggregator::Titan => "Titan",
+            Aggregator::Jupiter => "Jupiter",
+        };
+        println!("  Aggregator Used: {}", agg_name);
+    }
     if let Some(slippage_used) = result.slippage_bps_used {
         println!(
             "  Slippage Used: {} bps ({:.2}%)",
@@ -233,6 +240,13 @@ async fn test_jupiter_swap(
     println!("  ✓ Swap successful!");
     println!("  Transaction: {}", result.signature);
     println!("  Output Amount: {} lamports", result.out_amount);
+    if let Some(agg) = result.aggregator_used {
+        let agg_name = match agg {
+            Aggregator::Titan => "Titan",
+            Aggregator::Jupiter => "Jupiter",
+        };
+        println!("  Aggregator Used: {}", agg_name);
+    }
     if let Some(slippage_used) = result.slippage_bps_used {
         println!(
             "  Slippage Used: {} bps ({:.2}%)",
@@ -311,6 +325,13 @@ async fn test_best_price(
     println!("  ✓ Swap successful!");
     println!("  Transaction: {}", result.signature);
     println!("  Output Amount: {} lamports", result.out_amount);
+    if let Some(agg) = result.aggregator_used {
+        let agg_name = match agg {
+            Aggregator::Titan => "Titan",
+            Aggregator::Jupiter => "Jupiter",
+        };
+        println!("  Aggregator Used: {}", agg_name);
+    }
     if let Some(slippage_used) = result.slippage_bps_used {
         println!(
             "  Slippage Used: {} bps ({:.2}%)",
@@ -372,17 +393,18 @@ async fn test_staircase(
     println!("Swapping {} lamports of {} -> {}", amount, input, output);
     println!("  Strategy: LowestSlippageClimber (tests multiple slippage levels)");
 
+    let floor_slippage_bps = 10; // Start at 0.1%
+    let max_slippage_bps = 100; // Up to 1%
+    let step_bps = 10; // Step by 0.1%
+
     let route_config = RouteConfig {
         routing_strategy: Some(RoutingStrategy::LowestSlippageClimber {
-            floor_slippage_bps: 10, // Start at 0.1%
-            max_slippage_bps: 100,  // Up to 1%
-            step_bps: 10,           // Step by 0.1%
+            floor_slippage_bps,
+            max_slippage_bps,
+            step_bps,
         }),
         ..Default::default()
     };
-
-    let floor_slippage_bps = 10;
-    let max_slippage_bps = 100;
 
     let result = client
         .swap_with_route_config(input, output, amount, route_config)
@@ -391,12 +413,31 @@ async fn test_staircase(
     println!("  ✓ Swap successful!");
     println!("  Transaction: {}", result.signature);
     println!("  Output Amount: {} lamports", result.out_amount);
+    if let Some(agg) = result.aggregator_used {
+        let agg_name = match agg {
+            Aggregator::Titan => "Titan",
+            Aggregator::Jupiter => "Jupiter",
+        };
+        println!("  Aggregator Used: {}", agg_name);
+    }
     if let Some(slippage_used) = result.slippage_bps_used {
         println!(
-            "  Slippage Used: {} bps ({:.2}%)",
+            "  Final Slippage Used: {} bps ({:.2}%)",
             slippage_used,
             slippage_used as f64 / 100.0
         );
+
+        // Show if slippage climbed higher than expected
+        if slippage_used > floor_slippage_bps {
+            let excess = slippage_used - floor_slippage_bps;
+            println!(
+                "  ⚠ Note: Required {} bps more than floor slippage ({} bps)",
+                excess, floor_slippage_bps
+            );
+        } else {
+            println!("  ✓ Succeeded at floor slippage - optimal!");
+        }
+
         // Validate slippage used is within the expected range
         assert!(
             slippage_used >= floor_slippage_bps && slippage_used <= max_slippage_bps,
@@ -414,9 +455,9 @@ async fn test_staircase(
     println!("\n  Swapping back: {} -> {}", output, input);
     let route_config_back = RouteConfig {
         routing_strategy: Some(RoutingStrategy::LowestSlippageClimber {
-            floor_slippage_bps: 10,
-            max_slippage_bps: 100,
-            step_bps: 10,
+            floor_slippage_bps,
+            max_slippage_bps,
+            step_bps,
         }),
         ..Default::default()
     };
@@ -430,10 +471,22 @@ async fn test_staircase(
     println!("  Output Amount: {} lamports", result_back.out_amount);
     if let Some(slippage_used) = result_back.slippage_bps_used {
         println!(
-            "  Slippage Used: {} bps ({:.2}%)",
+            "  Final Slippage Used: {} bps ({:.2}%)",
             slippage_used,
             slippage_used as f64 / 100.0
         );
+
+        // Show if slippage climbed higher than expected
+        if slippage_used > floor_slippage_bps {
+            let excess = slippage_used - floor_slippage_bps;
+            println!(
+                "  ⚠ Note: Required {} bps more than floor slippage ({} bps)",
+                excess, floor_slippage_bps
+            );
+        } else {
+            println!("  ✓ Succeeded at floor slippage - optimal!");
+        }
+
         // Validate slippage used is within the expected range
         assert!(
             slippage_used >= floor_slippage_bps && slippage_used <= max_slippage_bps,

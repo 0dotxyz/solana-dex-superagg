@@ -167,6 +167,7 @@ impl DexAggregator for JupiterAggregator {
             signature: sig.to_string(),
             out_amount,
             slippage_bps_used: Some(slippage_bps),
+            aggregator_used: Some(crate::config::Aggregator::Jupiter),
         })
     }
 

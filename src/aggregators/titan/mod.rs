@@ -179,6 +179,7 @@ impl DexAggregator for TitanAggregator {
             signature: tx_signature.to_string(),
             out_amount: route.out_amount,
             slippage_bps_used: Some(slippage_bps),
+            aggregator_used: Some(crate::config::Aggregator::Titan),
         })
     }
 

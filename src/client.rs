@@ -314,21 +314,28 @@ impl DexSuperAggClient {
         aggregator: &Aggregator,
         route_config: &RouteConfig,
     ) -> Result<SwapResult> {
-        match aggregator {
+        let mut result = match aggregator {
             Aggregator::Jupiter => {
                 let jupiter = JupiterAggregator::new_with_compute_price(
                     &self.config,
                     Arc::clone(&self.signer),
                     route_config.compute_unit_price_micro_lamports,
                 )?;
-                jupiter.swap(input, output, amount, slippage_bps).await
+                jupiter.swap(input, output, amount, slippage_bps).await?
             }
             Aggregator::Titan => {
                 // Reuse existing Titan aggregator to avoid opening new WebSocket connections
                 let titan = self.get_titan_aggregator().await?;
-                titan.swap(input, output, amount, slippage_bps).await
+                titan.swap(input, output, amount, slippage_bps).await?
             }
+        };
+
+        // Ensure aggregator_used is set (should already be set by aggregators, but ensure it)
+        if result.aggregator_used.is_none() {
+            result.aggregator_used = Some(*aggregator);
         }
+
+        Ok(result)
     }
 
     /// Execute a swap with simulation first
@@ -422,6 +429,15 @@ impl DexSuperAggClient {
 
                     let slippage_used = result.slippage_bps_used.unwrap_or(current_slippage);
 
+                    // Show aggregator used
+                    if let Some(agg) = &result.aggregator_used {
+                        let agg_name = match agg {
+                            Aggregator::Jupiter => "Jupiter",
+                            Aggregator::Titan => "Titan",
+                        };
+                        println!("  Aggregator used: {}", agg_name);
+                    }
+
                     // Warn if slippage climbed higher than floor
                     if slippage_used > floor_slippage_bps {
                         let excess_slippage = slippage_used - floor_slippage_bps;
@@ -511,10 +527,27 @@ impl DexSuperAggClient {
         }
 
         // Find aggregator with highest output amount (most tokens = best price)
-        let (best_aggregator, _) = results
+        let (best_aggregator, best_out_amount) = results
             .iter()
             .max_by_key(|(_, out_amount)| out_amount)
             .ok_or_else(|| anyhow!("Failed to determine best aggregator"))?;
+
+        println!("  Comparing aggregators:");
+        for (agg, out_amt) in &results {
+            let agg_name = match agg {
+                Aggregator::Jupiter => "Jupiter",
+                Aggregator::Titan => "Titan",
+            };
+            println!("    {}: {} lamports", agg_name, out_amt);
+        }
+        let best_name = match best_aggregator {
+            Aggregator::Jupiter => "Jupiter",
+            Aggregator::Titan => "Titan",
+        };
+        println!(
+            "  Selected: {} (best price: {} lamports)",
+            best_name, best_out_amount
+        );
 
         // Execute swap with aggregator that gives the most tokens
         self.swap_direct(
