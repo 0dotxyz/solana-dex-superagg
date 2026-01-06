@@ -9,13 +9,23 @@ path = "src/lib.rs"
 
 [dependencies]
 figment = { version = "0.10", features = ["env", "test"] }
-solana-sdk = "1.18"
-solana-client = "1.18"
+solana-sdk = "=2.1.20"
+solana-client = "=2.1.20"
+solana-program = "=2.1.20"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bs58 = "0.5"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
-reqwest = { version = "0.11", features = ["json"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "0.13.1", features = ["json"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 futures-util = "0.3"
+bincode = "1.3.3"
+base64 = "0.22.1"
+bytes = "1.7"
+async-trait = "0.1"
+rmp-serde = "1.3"
+urlencoding = "2.1"
+jupiter-swap-api-client = { git = "https://github.com/IliaZyrin/jupiter-swap-api-client", rev = "6e209786084a4344538a1aa695f126169fa95022" }
+spl-associated-token-account = "6.0.0"
+spl-token = "7.0.0"

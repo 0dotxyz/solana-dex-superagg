@@ -19,6 +19,11 @@ pub enum Aggregator {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RoutingStrategy {
+    /// Compare available aggregators and use the one that gives the most tokens (best price)
+    ///
+    /// This is the default strategy. It simulates swaps on all available aggregators
+    /// (Jupiter and Titan if configured) and selects the one with the highest output amount.
+    BestPrice,
     /// Use a preferred aggregator
     ///
     /// # Fields
@@ -28,8 +33,6 @@ pub enum RoutingStrategy {
         aggregator: Aggregator,
         simulate: bool,
     },
-    /// Compare price impact from both aggregators and use the one with lowest impact
-    LowestPriceImpact,
     /// Test multiple slippage levels and use the one with lowest slippage that succeeds
     ///
     /// # Fields
@@ -43,6 +46,88 @@ pub enum RoutingStrategy {
     },
 }
 
+/// Behavior for handling output Associated Token Account (ATA) creation
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputAtaBehavior {
+    /// Create the ATA if it doesn't exist before executing the swap
+    Create,
+    /// Ignore ATA creation (let the aggregator handle it)
+    Ignore,
+}
+
+impl Default for OutputAtaBehavior {
+    fn default() -> Self {
+        Self::Create
+    }
+}
+
+/// Custom deserializer for wallet_keypair that accepts both strings and sequences
+///
+/// When figment parses a JSON array string like "[1,2,3,...]", it treats it as a sequence.
+/// This deserializer accepts both formats and converts sequences back to JSON strings.
+fn deserialize_wallet_keypair<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct WalletKeypairVisitor;
+
+    impl<'de> Visitor<'de> for WalletKeypairVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or a sequence of bytes")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value.to_string()))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(WalletKeypairVisitor)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::new();
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            // Convert sequence back to JSON string
+            Ok(Some(
+                serde_json::to_string(&bytes).map_err(de::Error::custom)?,
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(WalletKeypairVisitor)
+}
+
 /// Shared configuration used by both Jupiter and Titan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,11 +138,14 @@ pub struct SharedConfig {
     pub slippage_bps: u16,
     /// Wallet keypair (base58 encoded string, JSON array, or comma-separated bytes)
     /// Optional - not required for simulation/quote-only operations
+    #[serde(deserialize_with = "deserialize_wallet_keypair")]
     pub wallet_keypair: Option<String>,
     /// Compute unit price in micro lamports
     pub compute_unit_price_micro_lamports: u64,
-    /// Routing strategy for determining which aggregator to use (None = use best price)
+    /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
     pub routing_strategy: Option<RoutingStrategy>,
+    /// Number of times to retry transaction landing/submission for LowestSlippageClimber strategy
+    pub retry_tx_landing: u32,
 }
 
 impl Default for SharedConfig {
@@ -67,7 +155,8 @@ impl Default for SharedConfig {
             slippage_bps: 50, // 0.5% default slippage
             wallet_keypair: None,
             compute_unit_price_micro_lamports: 0,
-            routing_strategy: None, // None = use best price from available aggregators
+            routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
+            retry_tx_landing: 3, // Default to 3 retries for transaction landing
         }
     }
 }
@@ -78,12 +167,23 @@ impl Default for SharedConfig {
 pub struct JupiterConfig {
     /// Jupiter Swap API URL
     pub jup_swap_api_url: String,
+    /// Jupiter API key (optional, but recommended for production use)
+    /// Get your API key from https://portal.jup.ag/
+    ///
+    /// **Note**: Currently stored but not yet used in requests. The jupiter-swap-api-client
+    /// crate doesn't support custom headers yet. To use API keys, you'll need to either:
+    /// 1. Wait for the crate to add API key support
+    /// 2. Fork/wrap the crate to add x-api-key header support
+    ///
+    /// Environment variable: `DEX_SUPERAGG_JUPITER__API_KEY`
+    pub api_key: Option<String>,
 }
 
 impl Default for JupiterConfig {
     fn default() -> Self {
         Self {
-            jup_swap_api_url: "https://quote-api.jup.ag/v6".to_string(),
+            jup_swap_api_url: "https://api.jup.ag/swap/v1".to_string(),
+            api_key: None,
         }
     }
 }
@@ -94,10 +194,8 @@ impl Default for JupiterConfig {
 pub struct TitanConfig {
     /// Titan WebSocket endpoint (e.g., "us1.api.demo.titan.exchange")
     pub titan_ws_endpoint: String,
-    /// Titan API key (required for direct mode)
+    /// Titan API key (required)
     pub titan_api_key: Option<String>,
-    /// Hermes proxy endpoint (alternative to direct mode)
-    pub hermes_endpoint: Option<String>,
 }
 
 impl Default for TitanConfig {
@@ -105,7 +203,49 @@ impl Default for TitanConfig {
         Self {
             titan_ws_endpoint: String::new(),
             titan_api_key: None,
-            hermes_endpoint: None,
+        }
+    }
+}
+
+/// Route configuration for individual swap operations
+///
+/// This configuration can be passed per-swap to override default routing behavior.
+/// If not provided, the client will use values from `SharedConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteConfig {
+    /// Compute unit price in micro lamports
+    pub compute_unit_price_micro_lamports: u64,
+    /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
+    pub routing_strategy: Option<RoutingStrategy>,
+    /// Number of times to retry transaction landing/submission for LowestSlippageClimber strategy
+    pub retry_tx_landing: u32,
+    /// Behavior for handling output Associated Token Account (ATA) creation
+    #[serde(default)]
+    pub output_ata: OutputAtaBehavior,
+    /// Slippage tolerance in basis points (overrides config default if Some)
+    pub slippage_bps: Option<u16>,
+}
+
+impl Default for RouteConfig {
+    fn default() -> Self {
+        Self {
+            compute_unit_price_micro_lamports: 0,
+            routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
+            retry_tx_landing: 3,
+            output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
+            slippage_bps: None,                    // Use config default if not specified
+        }
+    }
+}
+
+impl From<&SharedConfig> for RouteConfig {
+    fn from(shared: &SharedConfig) -> Self {
+        Self {
+            compute_unit_price_micro_lamports: shared.compute_unit_price_micro_lamports,
+            routing_strategy: shared.routing_strategy.clone(),
+            retry_tx_landing: shared.retry_tx_landing,
+            output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
+            slippage_bps: None,                    // Use config default
         }
     }
 }
@@ -139,11 +279,20 @@ impl ClientConfig {
     /// Examples:
     /// - `DEX_SUPERAGG_SHARED__RPC_URL` for `shared.rpc_url`
     /// - `DEX_SUPERAGG_JUPITER__JUP_SWAP_API_URL` for `jupiter.jup_swap_api_url`
+    /// - `DEX_SUPERAGG_JUPITER__JUPITER_API_KEY` for `jupiter.jupiter_api_key` (optional, not yet used)
     /// - `DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT` for `titan.titan_ws_endpoint`
+    ///
+    /// Note: `DEX_SUPERAGG_SHARED__WALLET_KEYPAIR` can be:
+    /// - A JSON array string (e.g., `"[1,2,3,...]"`) - will be parsed correctly via custom deserializer
+    /// - A base58 string
+    /// - Comma-separated bytes
     pub fn from_env() -> Result<Self, figment::Error> {
-        Figment::new()
+        // Extract config from environment - custom deserializer handles WALLET_KEYPAIR parsing
+        let config: Self = Figment::new()
             .merge(Env::prefixed("DEX_SUPERAGG_").split("__"))
-            .extract()
+            .extract()?;
+
+        Ok(config)
     }
 
     /// Check if Titan is configured
@@ -161,9 +310,10 @@ impl ClientConfig {
     /// - RPC URL is reachable and responds
     /// - Jupiter API URL is reachable and responds
     /// - Titan WebSocket endpoint (if configured) is reachable
+    /// - Routing strategy aggregator requirements are met
     ///
-    /// Returns a vector of validation errors, empty if all checks pass
-    pub async fn validate(&self) -> Vec<String> {
+    /// Returns Ok(()) if valid, Err(Vec<String>) with validation errors if invalid
+    pub async fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Validate wallet keypair if provided
@@ -187,44 +337,63 @@ impl ClientConfig {
             errors.push("RPC URL is required".to_string());
         }
 
-        // Validate Jupiter API URL by making a test request
-        if !self.jupiter.jup_swap_api_url.is_empty() {
-            if let Err(e) = self.validate_jupiter_url().await {
-                errors.push(format!(
-                    "Jupiter API URL validation failed ({}): {}",
-                    self.jupiter.jup_swap_api_url, e
-                ));
-            }
-        } else {
-            errors.push("Jupiter API URL is required".to_string());
-        }
-
-        // Validate Titan configuration if provided
-        if let Some(ref titan) = self.titan {
-            if titan.titan_ws_endpoint.is_empty() {
-                errors.push(
-                    "Titan WebSocket endpoint is required when Titan is configured".to_string(),
-                );
-            } else {
-                // Test WebSocket connectivity
-                if let Err(e) = self.validate_titan_endpoint(titan).await {
-                    errors.push(format!(
-                        "Titan WebSocket endpoint validation failed ({}): {}",
-                        titan.titan_ws_endpoint, e
-                    ));
+        // Validate aggregators based on routing strategy requirements
+        if let Some(ref strategy) = self.shared.routing_strategy {
+            match strategy {
+                RoutingStrategy::BestPrice => {
+                    // BestPrice strategy compares all available aggregators
+                    // Validate Jupiter (always required) and Titan if configured
+                    if let Err(errs) = self.validate_jupiter().await {
+                        errors.extend(errs);
+                    }
+                    if self.titan.is_some() {
+                        if let Err(errs) = self.validate_titan().await {
+                            errors.extend(errs);
+                        }
+                    }
+                }
+                RoutingStrategy::PreferredAggregator { aggregator, .. } => match aggregator {
+                    Aggregator::Jupiter => {
+                        if let Err(errs) = self.validate_jupiter().await {
+                            errors.extend(errs);
+                        }
+                    }
+                    Aggregator::Titan => {
+                        if let Err(errs) = self.validate_titan().await {
+                            errors.extend(errs);
+                        }
+                    }
+                },
+                RoutingStrategy::LowestSlippageClimber { .. } => {
+                    // This strategy requires Jupiter and Titan (if configured)
+                    if let Err(errs) = self.validate_jupiter().await {
+                        errors.extend(errs);
+                    }
+                    if self.titan.is_some() {
+                        if let Err(errs) = self.validate_titan().await {
+                            errors.extend(errs);
+                        }
+                    }
                 }
             }
-
-            // Check that either API key or Hermes endpoint is provided
-            if titan.titan_api_key.is_none() && titan.hermes_endpoint.is_none() {
-                errors.push(
-                    "Either Titan API key or Hermes endpoint must be provided when Titan is configured"
-                        .to_string(),
-                );
+        } else {
+            // No routing strategy specified: validate Jupiter (always required) and Titan if configured
+            // This should rarely happen now since BestPrice is the default
+            if let Err(errs) = self.validate_jupiter().await {
+                errors.extend(errs);
+            }
+            if self.titan.is_some() {
+                if let Err(errs) = self.validate_titan().await {
+                    errors.extend(errs);
+                }
             }
         }
 
-        errors
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     async fn validate_rpc_url(&self) -> anyhow::Result<()> {
@@ -249,6 +418,69 @@ impl ClientConfig {
         Ok(())
     }
 
+    /// Validate Jupiter configuration and connectivity
+    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
+    async fn validate_jupiter(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if self.jupiter.jup_swap_api_url.is_empty() {
+            errors.push("Jupiter API URL is required".to_string());
+            return Err(errors);
+        }
+
+        if let Err(e) = self.validate_jupiter_url().await {
+            errors.push(format!(
+                "Jupiter API URL validation failed ({}): {}",
+                self.jupiter.jup_swap_api_url, e
+            ));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate Titan configuration and connectivity
+    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
+    async fn validate_titan(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        let titan = match &self.titan {
+            Some(t) => t,
+            None => {
+                errors.push("Titan is not configured".to_string());
+                return Err(errors);
+            }
+        };
+
+        if titan.titan_ws_endpoint.is_empty() {
+            errors
+                .push("Titan WebSocket endpoint is required when Titan is configured".to_string());
+            return Err(errors);
+        }
+
+        // Test WebSocket connectivity
+        if let Err(e) = self.validate_titan_endpoint(titan).await {
+            errors.push(format!(
+                "Titan WebSocket endpoint validation failed ({}): {}",
+                titan.titan_ws_endpoint, e
+            ));
+        }
+
+        // Check that API key is provided
+        if titan.titan_api_key.is_none() {
+            errors.push("Titan API key must be provided when Titan is configured".to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     async fn validate_jupiter_url(&self) -> anyhow::Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -268,25 +500,37 @@ impl ClientConfig {
     }
 
     async fn validate_titan_endpoint(&self, titan: &TitanConfig) -> anyhow::Result<()> {
-        // Build the WebSocket URL
-        let ws_url = if titan.titan_ws_endpoint.starts_with("ws://")
-            || titan.titan_ws_endpoint.starts_with("wss://")
-        {
-            titan.titan_ws_endpoint.clone()
-        } else {
-            format!("wss://{}", titan.titan_ws_endpoint)
-        };
+        // Determine Titan endpoint configuration (same logic as TitanAggregator::new)
+        let titan_api_key = titan
+            .titan_api_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Titan API key must be provided"))?;
 
-        // Try to connect to the WebSocket endpoint
-        timeout(
-            Duration::from_secs(5),
-            tokio_tungstenite::connect_async(&ws_url),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("WebSocket connection timeout"))?
-        .map_err(|e| anyhow::anyhow!("Failed to connect to Titan WebSocket: {}", e))?;
+        if titan_api_key.is_empty() {
+            return Err(anyhow::anyhow!("TITAN_API_KEY is set but empty"));
+        }
+
+        let titan_ws_endpoint = titan.titan_ws_endpoint.clone();
+
+        // Create TitanClient and try to connect (let TitanClient handle all URL building)
+        use crate::aggregators::titan::TitanClient;
+        let titan_client = TitanClient::new(titan_ws_endpoint, titan_api_key.clone());
+
+        // Try to connect with timeout
+        timeout(Duration::from_secs(5), titan_client.connect())
+            .await
+            .map_err(|_| anyhow::anyhow!("WebSocket connection timeout"))?
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Titan: {}", e))?;
+
+        // Clean up connection
+        let _ = titan_client.close().await;
 
         Ok(())
+    }
+
+    /// Get the default route configuration from shared config
+    pub fn default_route_config(&self) -> RouteConfig {
+        RouteConfig::from(&self.shared)
     }
 
     /// Get the wallet keypair from the configuration
@@ -297,20 +541,14 @@ impl ClientConfig {
             None => return Ok(None),
         };
 
-        // Try parsing as base58 string first
-        if let Ok(bytes) = bs58::decode(wallet_keypair).into_vec() {
-            if bytes.len() == 64 {
-                if let Ok(keypair) = Keypair::from_bytes(&bytes) {
-                    return Ok(Some(keypair));
-                }
-            }
-        }
-
-        // Try parsing as bytes (comma-separated or JSON array)
+        // Match eva01 exactly: parse as JSON array (Vec<u8>), then use Keypair::from_bytes with full 64 bytes
         let bytes: Vec<u8> = if wallet_keypair.starts_with('[') {
-            // JSON array format
+            // JSON array format (like eva01 uses)
             serde_json::from_str(wallet_keypair)
                 .map_err(|e| anyhow::anyhow!("Failed to parse wallet keypair as JSON: {}", e))?
+        } else if let Ok(decoded) = bs58::decode(wallet_keypair).into_vec() {
+            // Base58 format - convert to Vec<u8>
+            decoded
         } else if wallet_keypair.contains(',') {
             // Comma-separated format
             wallet_keypair
@@ -324,9 +562,17 @@ impl ClientConfig {
             ));
         };
 
-        Keypair::from_bytes(&bytes)
-            .map(|kp| Some(kp))
-            .map_err(|e| anyhow::anyhow!("Failed to create keypair from bytes: {}", e))
+        if bytes.len() != 64 {
+            return Err(anyhow::anyhow!(
+                "Invalid keypair length: expected 64 bytes, got {} bytes",
+                bytes.len()
+            ));
+        }
+
+        // Match eva01 exactly: Keypair::from_bytes expects full 64-byte keypair (32 secret + 32 public)
+        let keypair = Keypair::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to create keypair from bytes: {}", e))?;
+        Ok(Some(keypair))
     }
 }
 
@@ -340,7 +586,7 @@ mod tests {
         let shared = SharedConfig::default();
         assert_eq!(shared.slippage_bps, 50);
         assert!(!shared.rpc_url.is_empty());
-        assert_eq!(shared.routing_strategy, None);
+        assert_eq!(shared.routing_strategy, Some(RoutingStrategy::BestPrice));
 
         let jupiter = JupiterConfig::default();
         assert!(!jupiter.jup_swap_api_url.is_empty());
@@ -376,10 +622,6 @@ mod tests {
                 "us1.api.test.titan.exchange",
             );
             jail.set_env("DEX_SUPERAGG_TITAN__TITAN_API_KEY", "test_titan_api_key");
-            jail.set_env(
-                "DEX_SUPERAGG_TITAN__HERMES_ENDPOINT",
-                "https://hermes.test.titan.exchange",
-            );
 
             let config = ClientConfig::from_env()?;
 
@@ -405,10 +647,6 @@ mod tests {
                 .expect("Titan config should be present");
             assert_eq!(titan.titan_ws_endpoint, "us1.api.test.titan.exchange");
             assert_eq!(titan.titan_api_key, Some("test_titan_api_key".to_string()));
-            assert_eq!(
-                titan.hermes_endpoint,
-                Some("https://hermes.test.titan.exchange".to_string())
-            );
 
             Ok(())
         });
@@ -538,6 +776,42 @@ mod tests {
     }
 
     #[test]
+    fn test_wallet_keypair_json_array_via_env() {
+        // Test that JSON array format works through from_env() with custom deserializer
+        figment::Jail::expect_with(|jail| {
+            // Create a test keypair and encode it as JSON array
+            let test_keypair = solana_sdk::signature::Keypair::new();
+            let json_keypair = serde_json::to_string(&test_keypair.to_bytes().to_vec()).unwrap();
+
+            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", &json_keypair);
+
+            let config = ClientConfig::from_env()?;
+            let parsed_keypair = config
+                .get_keypair()
+                .map_err(|e| figment::Error::from(e.to_string()))?
+                .expect("Keypair should be parsed");
+
+            assert_eq!(parsed_keypair.pubkey(), test_keypair.pubkey());
+
+            // Verify the stored value is a JSON string (not parsed as sequence)
+            assert!(config
+                .shared
+                .wallet_keypair
+                .as_ref()
+                .unwrap()
+                .starts_with('['));
+            assert!(config
+                .shared
+                .wallet_keypair
+                .as_ref()
+                .unwrap()
+                .ends_with(']'));
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_wallet_keypair_comma_separated() {
         figment::Jail::expect_with(|jail| {
             // Create a test keypair and encode it as comma-separated bytes
@@ -590,7 +864,7 @@ mod tests {
                 "test.titan.exchange",
             );
             // Don't set Jupiter config - it should use defaults automatically
-            // Don't set titan_api_key or hermes_endpoint - they should be None
+            // Don't set titan_api_key - it should be None
 
             let config = ClientConfig::from_env()?;
 
@@ -599,7 +873,6 @@ mod tests {
                 .as_ref()
                 .expect("Titan config should be present");
             assert_eq!(titan.titan_api_key, None);
-            assert_eq!(titan.hermes_endpoint, None);
             assert_eq!(titan.titan_ws_endpoint, "test.titan.exchange");
             // Verify Jupiter uses default
             assert_eq!(
@@ -619,12 +892,14 @@ mod tests {
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
         config.shared.wallet_keypair = Some(base58_keypair);
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should only have errors for endpoint connectivity, not keypair
-        assert!(!errors.iter().any(|e| e.contains("wallet keypair")));
+        if let Err(errors) = result {
+            assert!(!errors.iter().any(|e| e.contains("wallet keypair")));
+        }
     }
 
     #[tokio::test]
@@ -632,11 +907,14 @@ mod tests {
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
         config.shared.wallet_keypair = Some("invalid_keypair".to_string());
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
-        assert!(errors.iter().any(|e| e.contains("wallet keypair")));
+        assert!(result.is_err());
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| e.contains("wallet keypair")));
+        }
     }
 
     #[tokio::test]
@@ -644,33 +922,37 @@ mod tests {
         // Test with a real Solana RPC endpoint
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should not have RPC URL errors if it's reachable
         // (may have other errors if endpoints are down, but RPC should work)
-        let rpc_errors: Vec<_> = errors.iter().filter(|e| e.contains("RPC URL")).collect();
-        // If RPC is unreachable, that's fine for the test - we just want to make sure
-        // the validation logic works
-        println!("RPC validation errors: {:?}", rpc_errors);
+        if let Err(errors) = result {
+            let rpc_errors: Vec<_> = errors.iter().filter(|e| e.contains("RPC URL")).collect();
+            // If RPC is unreachable, that's fine for the test - we just want to make sure
+            // the validation logic works
+            println!("RPC validation errors: {:?}", rpc_errors);
+        }
     }
 
     #[tokio::test]
     async fn test_validate_jupiter_endpoint() {
         let mut config = ClientConfig::default();
         config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.jupiter.jup_swap_api_url = "https://quote-api.jup.ag/v6".to_string();
+        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should not have Jupiter URL errors if it's reachable
-        let jupiter_errors: Vec<_> = errors
-            .iter()
-            .filter(|e| e.contains("Jupiter API URL"))
-            .collect();
-        // If Jupiter is unreachable, that's fine for the test
-        println!("Jupiter validation errors: {:?}", jupiter_errors);
+        if let Err(errors) = result {
+            let jupiter_errors: Vec<_> = errors
+                .iter()
+                .filter(|e| e.contains("Jupiter API URL"))
+                .collect();
+            // If Jupiter is unreachable, that's fine for the test
+            println!("Jupiter validation errors: {:?}", jupiter_errors);
+        }
     }
 
     #[tokio::test]
@@ -680,24 +962,30 @@ mod tests {
         config.jupiter.jup_swap_api_url =
             "https://invalid-jupiter-url-that-does-not-exist.com".to_string();
 
-        let errors = config.validate().await;
+        let result = config.validate().await;
 
         // Should have errors for both invalid endpoints
-        assert!(errors.iter().any(|e| e.contains("RPC URL")));
-        assert!(errors.iter().any(|e| e.contains("Jupiter API URL")));
+        assert!(result.is_err());
+        if let Err(errors) = result {
+            assert!(errors.iter().any(|e| e.contains("RPC URL")));
+            assert!(errors.iter().any(|e| e.contains("Jupiter API URL")));
+        }
     }
 
     #[test]
     fn test_routing_strategy_default() {
         figment::Jail::expect_with(|jail| {
-            // Don't set routing_strategy - should default to None
+            // Don't set routing_strategy - should default to BestPrice
             jail.set_env(
                 "DEX_SUPERAGG_SHARED__RPC_URL",
                 "https://api.testnet.solana.com",
             );
 
             let config = ClientConfig::from_env()?;
-            assert_eq!(config.shared.routing_strategy, None);
+            assert_eq!(
+                config.shared.routing_strategy,
+                Some(RoutingStrategy::BestPrice)
+            );
 
             Ok(())
         });
@@ -762,56 +1050,6 @@ mod tests {
                     assert_eq!(*simulate, false);
                 }
                 _ => panic!("Expected PreferredAggregator with Titan"),
-            }
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_routing_strategy_lowest_price_impact() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE",
-                "lowest_price_impact",
-            );
-
-            let config = ClientConfig::from_env()?;
-
-            match &config.shared.routing_strategy {
-                Some(RoutingStrategy::LowestPriceImpact) => {
-                    // Success
-                }
-                _ => panic!("Expected LowestPriceImpact"),
-            }
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_routing_strategy_fastest_sim() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE",
-                "lowest_price_impact",
-            );
-
-            let config = ClientConfig::from_env()?;
-
-            match &config.shared.routing_strategy {
-                Some(RoutingStrategy::LowestPriceImpact) => {
-                    // Success
-                }
-                _ => panic!("Expected LowestPriceImpact"),
             }
 
             Ok(())

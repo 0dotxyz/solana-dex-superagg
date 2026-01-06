@@ -40,8 +40,7 @@ The configuration system uses a hierarchical structure:
 
 - **TitanConfig**: Titan-specific settings (optional)
   - Titan WebSocket endpoint
-  - Titan API key (for direct mode)
-  - Hermes endpoint (alternative to direct mode)
+  - Titan API key (required)
 
 - **ClientConfig**: Combines all configurations
   - Loads from environment variables using `DEX_SUPERAGG_` prefix
@@ -129,12 +128,11 @@ DEX_SUPERAGG_SHARED__WALLET_KEYPAIR=<base58_keypair>
 DEX_SUPERAGG_SHARED__COMPUTE_UNIT_PRICE_MICRO_LAMPORTS=0
 
 # Jupiter configuration
-DEX_SUPERAGG_JUPITER__JUP_SWAP_API_URL=https://quote-api.jup.ag/v6
+DEX_SUPERAGG_JUPITER__JUP_SWAP_API_URL=https://api.jup.ag/swap/v1
 
 # Titan configuration (optional)
 DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT=us1.api.demo.titan.exchange
 DEX_SUPERAGG_TITAN__TITAN_API_KEY=<titan_api_key>
-DEX_SUPERAGG_TITAN__HERMES_ENDPOINT=https://hermes.demo.titan.exchange
 ```
 
 ## Current State
