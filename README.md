@@ -262,3 +262,17 @@ async fn main() -> anyhow::Result<()> {
 - **Slippage**: Slippage is specified in basis points (bps). 1 bps = 0.01%, so 25 bps = 0.25%.
 - **Titan WebSocket**: The Titan aggregator maintains a persistent WebSocket connection that is reused across swaps for efficiency. Make sure to call `client.close().await?` when you're done to clean up resources.
 - **ATA Creation**: By default, the client will create Associated Token Accounts (ATAs) for output tokens if they don't exist. You can control this behavior via `RouteConfig::output_ata`.
+
+# Testing
+
+To test this, simply use:
+
+```bash
+DEX_SUPERAGG_SHARED__RPC_URL='https://api.mainnet-beta.solana.com' \
+DEX_SUPERAGG_TITAN__TITAN_API_KEY='xxxxx' \
+DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT='us1.api.demo.titan.exchange' \
+DEX_SUPERAGG_JUPITER__JUP_SWAP_API_URL='https://api.jup.ag/swap/v1' \
+DEX_SUPERAGG_JUPITER__API_KEY='xxxx' \
+DEX_SUPERAGG_SHARED__WALLET_KEYPAIR='[1,2,3,4.....]' \
+cargo test test_all_swap -- --nocapture --ignored
+```
