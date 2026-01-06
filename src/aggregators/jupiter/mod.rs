@@ -43,13 +43,13 @@ impl JupiterAggregator {
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         );
 
-        if config.jupiter.api_key.is_none() {
-            return Err(anyhow!("Jupiter API key is not configured"));
-        }
-        let jupiter_client = JupiterSwapApiClient::new(
-            config.jupiter.jup_swap_api_url.clone(),
-            config.jupiter.api_key.as_ref().unwrap().to_string(),
-        )?;
+        let api_key = config
+            .jupiter
+            .api_key
+            .clone()
+            .ok_or_else(|| anyhow!("Jupiter API key is not configured"))?;
+        let jupiter_client =
+            JupiterSwapApiClient::new(config.jupiter.jup_swap_api_url.clone(), api_key)?;
 
         Ok(Self {
             jupiter_client,
@@ -72,7 +72,7 @@ impl JupiterAggregator {
         );
         let jupiter_client = JupiterSwapApiClient::new(
             jupiter_api_url.to_string(),
-            api_key.ok_or_else(|| anyhow!("Jupiter API key is required"))?,
+            api_key.ok_or_else(|| anyhow!("Jupiter API key is required when using with_config"))?,
         )?;
 
         Ok(Self {
