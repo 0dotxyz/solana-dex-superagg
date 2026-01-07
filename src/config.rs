@@ -1,7 +1,10 @@
 use figment::{providers::Env, Figment};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair};
+use solana_sdk::{
+    commitment_config::{CommitmentConfig, CommitmentLevel},
+    signature::Keypair,
+};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -128,6 +131,42 @@ where
     deserializer.deserialize_option(WalletKeypairVisitor)
 }
 
+/// Custom deserializer for CommitmentLevel that accepts string values
+fn deserialize_commitment_level<'de, D>(deserializer: D) -> Result<CommitmentLevel, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct CommitmentLevelVisitor;
+
+    impl<'de> Visitor<'de> for CommitmentLevelVisitor {
+        type Value = CommitmentLevel;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string: \"processed\", \"confirmed\", or \"finalized\"")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            match value.to_lowercase().as_str() {
+                "processed" => Ok(CommitmentLevel::Processed),
+                "confirmed" => Ok(CommitmentLevel::Confirmed),
+                "finalized" => Ok(CommitmentLevel::Finalized),
+                _ => Err(de::Error::custom(format!(
+                    "Invalid commitment level: {}. Must be one of: processed, confirmed, finalized",
+                    value
+                ))),
+            }
+        }
+    }
+
+    deserializer.deserialize_str(CommitmentLevelVisitor)
+}
+
 /// Shared configuration used by both Jupiter and Titan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -146,6 +185,13 @@ pub struct SharedConfig {
     pub routing_strategy: Option<RoutingStrategy>,
     /// Number of times to retry transaction landing/submission for LowestSlippageClimber strategy
     pub retry_tx_landing: u32,
+    /// Commitment level for transaction confirmation (defaults to Confirmed)
+    /// Options: "processed", "confirmed", "finalized"
+    /// - Processed: Fastest (~400ms), but can be rolled back
+    /// - Confirmed: Good balance (~1-2s), very unlikely to roll back
+    /// - Finalized: Slowest (~15s), cannot be rolled back
+    #[serde(default, deserialize_with = "deserialize_commitment_level")]
+    pub commitment_level: CommitmentLevel,
 }
 
 impl Default for SharedConfig {
@@ -157,6 +203,7 @@ impl Default for SharedConfig {
             compute_unit_price_micro_lamports: 0,
             routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
             retry_tx_landing: 3, // Default to 3 retries for transaction landing
+            commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed for good balance
         }
     }
 }
@@ -224,6 +271,9 @@ pub struct RouteConfig {
     pub output_ata: OutputAtaBehavior,
     /// Slippage tolerance in basis points (overrides config default if Some)
     pub slippage_bps: Option<u16>,
+    /// Commitment level for transaction confirmation
+    #[serde(default)]
+    pub commitment_level: CommitmentLevel,
 }
 
 impl Default for RouteConfig {
@@ -234,6 +284,7 @@ impl Default for RouteConfig {
             retry_tx_landing: 3,
             output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
             slippage_bps: None,                    // Use config default if not specified
+            commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed
         }
     }
 }
@@ -246,6 +297,7 @@ impl From<&SharedConfig> for RouteConfig {
             retry_tx_landing: shared.retry_tx_landing,
             output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
             slippage_bps: None,                    // Use config default
+            commitment_level: shared.commitment_level, // Copy from shared config
         }
     }
 }

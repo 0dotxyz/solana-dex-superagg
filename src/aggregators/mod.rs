@@ -6,6 +6,7 @@
 use crate::config::Aggregator;
 use anyhow::Result;
 use async_trait::async_trait;
+use solana_sdk::commitment_config::CommitmentLevel;
 use std::time::Duration;
 
 /// Result of a swap operation
@@ -72,6 +73,7 @@ pub trait DexAggregator: Send + Sync {
     /// * `output` - Output token mint address (as string)
     /// * `amount` - Input amount in lamports/base units
     /// * `slippage_bps` - Slippage tolerance in basis points (e.g., 25 = 0.25%)
+    /// * `commitment_level` - Commitment level for transaction confirmation
     ///
     /// # Returns
     /// `SwapResult` containing the transaction signature and output amount
@@ -81,6 +83,7 @@ pub trait DexAggregator: Send + Sync {
         output: &str,
         amount: u64,
         slippage_bps: u16,
+        commitment_level: CommitmentLevel,
     ) -> Result<SwapResult>;
 
     /// Simulate a swap to get quote information without executing

@@ -326,12 +326,28 @@ impl DexSuperAggClient {
                     Arc::clone(&self.signer),
                     route_config.compute_unit_price_micro_lamports,
                 )?;
-                jupiter.swap(input, output, amount, slippage_bps).await?
+                jupiter
+                    .swap(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        route_config.commitment_level,
+                    )
+                    .await?
             }
             Aggregator::Titan => {
                 // Reuse existing Titan aggregator to avoid opening new WebSocket connections
                 let titan = self.get_titan_aggregator().await?;
-                titan.swap(input, output, amount, slippage_bps).await?
+                titan
+                    .swap(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        route_config.commitment_level,
+                    )
+                    .await?
             }
         };
 

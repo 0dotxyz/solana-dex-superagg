@@ -93,6 +93,7 @@ impl DexAggregator for JupiterAggregator {
         output: &str,
         amount: u64,
         slippage_bps: u16,
+        commitment_level: solana_sdk::commitment_config::CommitmentLevel,
     ) -> Result<SwapResult> {
         let start_time = Instant::now();
 
@@ -155,7 +156,9 @@ impl DexAggregator for JupiterAggregator {
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
                 &tx,
-                solana_sdk::commitment_config::CommitmentConfig::finalized(),
+                solana_sdk::commitment_config::CommitmentConfig {
+                    commitment: commitment_level,
+                },
                 RpcSendTransactionConfig {
                     skip_preflight: false,
                     preflight_commitment: Some(

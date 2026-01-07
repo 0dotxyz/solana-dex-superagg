@@ -10,8 +10,12 @@ mod types;
 use crate::aggregators::{DexAggregator, QuoteMetadata, SimulateResult, SwapResult};
 use crate::config::ClientConfig;
 use anyhow::{anyhow, Result};
-use solana_client::{nonblocking::rpc_client::RpcClient as AsyncRpcClient, rpc_client::RpcClient};
+use solana_client::{
+    nonblocking::rpc_client::RpcClient as AsyncRpcClient, rpc_client::RpcClient,
+    rpc_config::RpcSendTransactionConfig,
+};
 use solana_sdk::{
+    commitment_config::CommitmentConfig,
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
@@ -133,6 +137,7 @@ impl DexAggregator for TitanAggregator {
         output: &str,
         amount: u64,
         slippage_bps: u16,
+        commitment_level: solana_sdk::commitment_config::CommitmentLevel,
     ) -> Result<SwapResult> {
         let start_time = Instant::now();
 
@@ -172,10 +177,23 @@ impl DexAggregator for TitanAggregator {
         let signature = self.signer.as_ref().sign_message(&message);
         transaction.signatures[0] = signature;
 
-        // Send transaction
+        // Send transaction with specified commitment level
+        let commitment_config = CommitmentConfig {
+            commitment: commitment_level,
+        };
         let tx_signature = self
             .rpc_client
-            .send_and_confirm_transaction(&transaction)
+            .send_and_confirm_transaction_with_spinner_and_config(
+                &transaction,
+                commitment_config,
+                RpcSendTransactionConfig {
+                    skip_preflight: false,
+                    preflight_commitment: Some(
+                        solana_sdk::commitment_config::CommitmentLevel::Processed,
+                    ),
+                    ..Default::default()
+                },
+            )
             .map_err(|e| anyhow!("Failed to send transaction: {}", e))?;
 
         let execution_time = start_time.elapsed();
