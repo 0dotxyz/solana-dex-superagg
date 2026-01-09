@@ -16,6 +16,7 @@ use spl_token::state::Mint;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing;
 
 /// Main client for routing orders across multiple DEX aggregators (Jupiter, Titan, etc.)
 pub struct DexSuperAggClient {
@@ -429,18 +430,20 @@ impl DexSuperAggClient {
         let mut last_error = None;
         let mut attempt_count = 0;
 
-        println!(
-            "  Climbing slippage staircase (floor: {} bps, max: {} bps, step: {} bps)",
-            floor_slippage_bps, max_slippage_bps, step_bps
+        tracing::debug!(
+            floor_slippage_bps = floor_slippage_bps,
+            max_slippage_bps = max_slippage_bps,
+            step_bps = step_bps,
+            "Climbing slippage staircase"
         );
 
         while current_slippage <= max_slippage_bps {
             attempt_count += 1;
-            println!(
-                "  Attempt {}: Trying slippage {} bps ({:.2}%)",
-                attempt_count,
-                current_slippage,
-                current_slippage as f64 / 100.0
+            tracing::debug!(
+                attempt = attempt_count,
+                slippage_bps = current_slippage,
+                slippage_percent = current_slippage as f64 / 100.0,
+                "Attempting swap with slippage"
             );
 
             // Try swap with current slippage using best price strategy
@@ -465,7 +468,7 @@ impl DexSuperAggClient {
                             Aggregator::Jupiter => "Jupiter",
                             Aggregator::Titan => "Titan",
                         };
-                        println!("  Aggregator used: {}", agg_name);
+                        tracing::debug!(aggregator = agg_name, "Aggregator used");
                     }
 
                     // Warn if slippage climbed higher than floor
@@ -473,33 +476,31 @@ impl DexSuperAggClient {
                         let excess_slippage = slippage_used - floor_slippage_bps;
                         let excess_percent =
                             (excess_slippage as f64 / floor_slippage_bps as f64) * 100.0;
-                        println!("  ⚠ Warning: Slippage climbed higher than expected!");
-                        println!(
-                            "    Floor slippage: {} bps ({:.2}%)",
-                            floor_slippage_bps,
-                            floor_slippage_bps as f64 / 100.0
+                        tracing::warn!(
+                            floor_slippage_bps = floor_slippage_bps,
+                            floor_slippage_percent = floor_slippage_bps as f64 / 100.0,
+                            actual_slippage_bps = slippage_used,
+                            actual_slippage_percent = slippage_used as f64 / 100.0,
+                            excess_slippage_bps = excess_slippage,
+                            excess_percent = excess_percent,
+                            attempts = attempt_count,
+                            "Slippage climbed higher than expected"
                         );
-                        println!(
-                            "    Actual slippage: {} bps ({:.2}%)",
-                            slippage_used,
-                            slippage_used as f64 / 100.0
-                        );
-                        println!(
-                            "    Excess: {} bps ({:.1}% higher than floor)",
-                            excess_slippage, excess_percent
-                        );
-                        println!("    Attempts needed: {}", attempt_count);
                     } else {
-                        println!(
-                            "  ✓ Swap succeeded at floor slippage ({} bps)",
-                            slippage_used
+                        tracing::info!(
+                            slippage_bps = slippage_used,
+                            "Swap succeeded at floor slippage"
                         );
                     }
 
                     return Ok(summary);
                 }
                 Err(e) => {
-                    println!("  ✗ Failed at {} bps: {}", current_slippage, e);
+                    tracing::debug!(
+                        slippage_bps = current_slippage,
+                        error = %e,
+                        "Swap failed at slippage level"
+                    );
                     last_error = Some(e);
                     current_slippage += step_bps;
                 }
@@ -565,21 +566,26 @@ impl DexSuperAggClient {
             .max_by_key(|(_, out_amount)| out_amount)
             .ok_or_else(|| anyhow!("Failed to determine best aggregator"))?;
 
-        println!("  Comparing aggregators:");
+        tracing::debug!("Comparing aggregators");
         for (agg, out_amt) in &comparison_results {
             let agg_name = match agg {
                 Aggregator::Jupiter => "Jupiter",
                 Aggregator::Titan => "Titan",
             };
-            println!("    {}: {} lamports", agg_name, out_amt);
+            tracing::debug!(
+                aggregator = agg_name,
+                output_amount = out_amt,
+                "Aggregator quote"
+            );
         }
         let best_name = match best_aggregator {
             Aggregator::Jupiter => "Jupiter",
             Aggregator::Titan => "Titan",
         };
-        println!(
-            "  Selected: {} (best price: {} lamports)",
-            best_name, best_out_amount
+        tracing::info!(
+            aggregator = best_name,
+            output_amount = best_out_amount,
+            "Selected aggregator with best price"
         );
 
         // Execute swap with aggregator that gives the most tokens
