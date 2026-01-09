@@ -28,40 +28,34 @@ use solana_dex_superagg::{
     config::{Aggregator, ClientConfig, RouteConfig, RoutingStrategy},
 };
 use solana_sdk::commitment_config::CommitmentLevel;
-use std::time::Duration;
+use tracing;
 
 /// Token addresses
 const SOL_TOKEN: &str = "So11111111111111111111111111111111111111112";
 const USDC_TOKEN: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-fn format_duration_ms(d: Option<Duration>) -> String {
-    match d {
-        Some(dur) => format!("{:.2} ms", dur.as_secs_f64() * 1000.0),
-        None => "N/A".to_string(),
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("=== Solana DEX SuperAgg Examples ===\n");
+    tracing_subscriber::fmt::init();
+
+    tracing::info!("Starting Solana DEX SuperAgg Examples");
 
     // Load config from environment variables
     let config = ClientConfig::from_env()?;
 
     // Validate config (optional but recommended)
-    println!("Validating configuration...");
+    tracing::info!("Validating configuration");
     if let Err(errors) = config.validate().await {
-        eprintln!("Configuration errors:");
         for error in errors {
-            eprintln!("  - {}", error);
+            tracing::error!(error = %error, "Configuration error");
         }
         return Err(anyhow::anyhow!("Invalid configuration"));
     }
-    println!("✓ Configuration valid\n");
+    tracing::info!("Configuration valid");
 
     // Create client
     let client = DexSuperAggClient::new(config)?;
-    println!("✓ Client created\n");
+    tracing::info!("Client created");
 
     // Token addresses
     let sol = SOL_TOKEN;
@@ -74,22 +68,19 @@ async fn main() -> Result<()> {
 
     // Example 1: Simple swap (uses default strategy from config - usually BestPrice)
     // This is the easiest way to swap - no configuration needed!
-    println!("=== Example 1: Simple Swap (Default Strategy) ===");
+    tracing::info!("Example 1: Simple Swap (Default Strategy)");
     let summary = client.swap(sol, usdc, amount).await?;
-    println!("✓ Swap successful!");
-    println!("  Transaction: {}", summary.swap_result.signature);
-    println!("  Output: {} lamports", summary.swap_result.out_amount);
-    if let Some(agg) = summary.swap_result.aggregator_used {
-        println!("  Aggregator: {:?}", agg);
-    }
-    if let Some(time) = summary.swap_result.execution_time {
-        println!("  Execution time: {}", format_duration_ms(Some(time)));
-    }
-    println!();
+    tracing::info!(
+        transaction = %summary.swap_result.signature,
+        output_amount = summary.swap_result.out_amount,
+        aggregator = ?summary.swap_result.aggregator_used,
+        execution_time_ms = summary.swap_result.execution_time.map(|t| t.as_secs_f64() * 1000.0),
+        "Swap successful"
+    );
 
     // Example 2: Best Price Strategy (explicitly compare all aggregators)
     // This compares Jupiter and Titan (if configured) and uses whichever gives more tokens
-    println!("=== Example 2: Best Price Strategy ===");
+    tracing::info!("Example 2: Best Price Strategy");
     let route_config = RouteConfig {
         routing_strategy: Some(RoutingStrategy::BestPrice),
         slippage_bps: Some(25), // Override default slippage to 0.25%
@@ -99,36 +90,31 @@ async fn main() -> Result<()> {
     let summary = client
         .swap_with_route_config(sol, usdc, amount, route_config)
         .await?;
-    println!("✓ Swap successful!");
-    println!("  Transaction: {}", summary.swap_result.signature);
-    println!("  Output: {} lamports", summary.swap_result.out_amount);
-    if let Some(agg) = summary.swap_result.aggregator_used {
-        println!("  Aggregator used: {:?}", agg);
-    }
-    if let Some(slippage) = summary.swap_result.slippage_bps_used {
-        println!(
-            "  Slippage used: {} bps ({:.2}%)",
-            slippage,
-            slippage as f64 / 100.0
-        );
-    }
+    tracing::info!(
+        transaction = %summary.swap_result.signature,
+        output_amount = summary.swap_result.out_amount,
+        aggregator = ?summary.swap_result.aggregator_used,
+        slippage_bps = summary.swap_result.slippage_bps_used,
+        slippage_percent = summary.swap_result.slippage_bps_used.map(|s| s as f64 / 100.0),
+        "Swap successful"
+    );
     // Show simulation results for all aggregators that were tried
     for (agg, sim_result) in &summary.sim_results {
-        println!(
-            "  {} simulation: {} lamports (sim time: {})",
-            match agg {
-                Aggregator::Jupiter => "Jupiter",
-                Aggregator::Titan => "Titan",
-            },
-            sim_result.out_amount,
-            format_duration_ms(sim_result.sim_time)
+        let agg_name = match agg {
+            Aggregator::Jupiter => "Jupiter",
+            Aggregator::Titan => "Titan",
+        };
+        tracing::debug!(
+            aggregator = agg_name,
+            output_amount = sim_result.out_amount,
+            sim_time_ms = sim_result.sim_time.map(|t| t.as_secs_f64() * 1000.0),
+            "Simulation result"
         );
     }
-    println!();
 
     // Example 3: Preferred Aggregator - Use Jupiter
     // Force the swap to use Jupiter instead of comparing aggregators
-    println!("=== Example 3: Preferred Aggregator (Jupiter) ===");
+    tracing::info!("Example 3: Preferred Aggregator (Jupiter)");
     let route_config = RouteConfig {
         routing_strategy: Some(RoutingStrategy::PreferredAggregator {
             aggregator: Aggregator::Jupiter,
@@ -141,17 +127,16 @@ async fn main() -> Result<()> {
     let summary = client
         .swap_with_route_config(sol, usdc, amount, route_config)
         .await?;
-    println!("✓ Swap successful!");
-    println!("  Transaction: {}", summary.swap_result.signature);
-    println!("  Output: {} lamports", summary.swap_result.out_amount);
-    if let Some(agg) = summary.swap_result.aggregator_used {
-        println!("  Aggregator used: {:?}", agg);
-    }
-    println!();
+    tracing::info!(
+        transaction = %summary.swap_result.signature,
+        output_amount = summary.swap_result.out_amount,
+        aggregator = ?summary.swap_result.aggregator_used,
+        "Swap successful"
+    );
 
     // Example 4: Preferred Aggregator - Use Titan
     if client.config().is_titan_configured() {
-        println!("=== Example 4: Preferred Aggregator (Titan) ===");
+        tracing::info!("Example 4: Preferred Aggregator (Titan)");
         let route_config = RouteConfig {
             routing_strategy: Some(RoutingStrategy::PreferredAggregator {
                 aggregator: Aggregator::Titan,
@@ -164,23 +149,21 @@ async fn main() -> Result<()> {
         let summary = client
             .swap_with_route_config(sol, usdc, amount, route_config)
             .await?;
-        println!("✓ Swap successful!");
-        println!("  Transaction: {}", summary.swap_result.signature);
-        println!("  Output: {} lamports", summary.swap_result.out_amount);
-        if let Some(agg) = summary.swap_result.aggregator_used {
-            println!("  Aggregator used: {:?}", agg);
-        }
-        println!();
+        tracing::info!(
+            transaction = %summary.swap_result.signature,
+            output_amount = summary.swap_result.out_amount,
+            aggregator = ?summary.swap_result.aggregator_used,
+            "Swap successful"
+        );
     } else {
-        println!("=== Example 4: Preferred Aggregator (Titan) ===");
-        println!("⚠ Skipped: Titan not configured\n");
+        tracing::warn!("Example 4: Preferred Aggregator (Titan) - Skipped: Titan not configured");
     }
 
     // Example 5: Lowest Slippage Climber (Staircase Strategy)
     // Tests multiple slippage levels starting from floor_slippage_bps and incrementing by step_bps
     // until a swap succeeds or max_slippage_bps is reached
     // This is useful for finding the minimum slippage needed for a swap
-    println!("=== Example 5: Lowest Slippage Climber (Staircase) ===");
+    tracing::info!("Example 5: Lowest Slippage Climber (Staircase)");
     let route_config = RouteConfig {
         routing_strategy: Some(RoutingStrategy::LowestSlippageClimber {
             floor_slippage_bps: 10, // Start at 0.1%
@@ -193,25 +176,18 @@ async fn main() -> Result<()> {
     let summary = client
         .swap_with_route_config(sol, usdc, amount, route_config)
         .await?;
-    println!("✓ Swap successful!");
-    println!("  Transaction: {}", summary.swap_result.signature);
-    println!("  Output: {} lamports", summary.swap_result.out_amount);
-    if let Some(agg) = summary.swap_result.aggregator_used {
-        println!("  Aggregator used: {:?}", agg);
-    }
-    if let Some(slippage) = summary.swap_result.slippage_bps_used {
-        println!(
-            "  Slippage used: {} bps ({:.2}%)",
-            slippage,
-            slippage as f64 / 100.0
-        );
-        // The staircase strategy will warn if slippage climbed higher than the floor
-    }
-    println!();
+    tracing::info!(
+        transaction = %summary.swap_result.signature,
+        output_amount = summary.swap_result.out_amount,
+        aggregator = ?summary.swap_result.aggregator_used,
+        slippage_bps = summary.swap_result.slippage_bps_used,
+        slippage_percent = summary.swap_result.slippage_bps_used.map(|s| s as f64 / 100.0),
+        "Swap successful"
+    );
 
     // Example 6: Use Finalized commitment for critical swaps
     // Finalized provides absolute guarantee but takes ~15 seconds
-    println!("=== Example 6: Critical Swap with Finalized Commitment ===");
+    tracing::info!("Example 6: Critical Swap with Finalized Commitment");
     let route_config = RouteConfig {
         routing_strategy: Some(RoutingStrategy::BestPrice),
         commitment_level: CommitmentLevel::Finalized, // Use Finalized for critical swaps
@@ -220,16 +196,15 @@ async fn main() -> Result<()> {
     let summary = client
         .swap_with_route_config(sol, usdc, amount, route_config)
         .await?;
-    println!("✓ Swap finalized!");
-    println!("  Transaction: {}", summary.swap_result.signature);
-    if let Some(time) = summary.swap_result.execution_time {
-        println!("  Execution time: {}", format_duration_ms(Some(time)));
-    }
-    println!();
+    tracing::info!(
+        transaction = %summary.swap_result.signature,
+        execution_time_ms = summary.swap_result.execution_time.map(|t| t.as_secs_f64() * 1000.0),
+        "Swap finalized"
+    );
 
     // Clean up when done (closes Titan WebSocket connection if used)
     client.close().await?;
 
-    println!("=== All Examples Completed Successfully ===");
+    tracing::info!("All examples completed successfully");
     Ok(())
 }

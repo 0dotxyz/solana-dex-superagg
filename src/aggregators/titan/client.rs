@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tracing;
 
 use super::codec::*;
 use super::types::*;
@@ -128,10 +129,10 @@ impl TitanClient {
 
         // Log response headers only on error
         if !response.status().is_success() {
-            eprintln!(
-                "Connection failed: {} - Response headers: {:?}",
-                response.status(),
-                response.headers()
+            tracing::error!(
+                status = %response.status(),
+                headers = ?response.headers(),
+                "Connection failed"
             );
         }
 

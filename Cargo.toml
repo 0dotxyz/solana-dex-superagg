@@ -33,6 +33,8 @@ bytes = "1.7"
 async-trait = "0.1"
 rmp-serde = "1.3"
 urlencoding = "2.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jupiter-swap-api-client = { git = "https://github.com/IliaZyrin/jupiter-swap-api-client", rev = "6e209786084a4344538a1aa695f126169fa95022" }
 spl-associated-token-account = "6.0.0"
 spl-token = "7.0.0"
