@@ -1,5 +1,6 @@
 use crate::aggregators::{
-    jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator, SwapResult, SwapSummary,
+    dflow::DflowAggregator, jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator,
+    SwapResult, SwapSummary,
 };
 use crate::config::{Aggregator, ClientConfig, OutputAtaBehavior, RouteConfig, RoutingStrategy};
 use anyhow::{anyhow, Result};
@@ -350,6 +351,22 @@ impl DexSuperAggClient {
                     )
                     .await?
             }
+            Aggregator::Dflow => {
+                let dflow = DflowAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                dflow
+                    .swap(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        route_config.commitment_level,
+                    )
+                    .await?
+            }
         };
 
         // Ensure aggregator_used is set (should already be set by aggregators, but ensure it)
@@ -386,6 +403,14 @@ impl DexSuperAggClient {
                 // Reuse existing Titan aggregator to avoid opening new WebSocket connections
                 let titan = self.get_titan_aggregator().await?;
                 titan.simulate(input, output, amount, slippage_bps).await?
+            }
+            Aggregator::Dflow => {
+                let dflow = DflowAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                dflow.simulate(input, output, amount, slippage_bps).await?
             }
         };
 
@@ -467,6 +492,7 @@ impl DexSuperAggClient {
                         let agg_name = match agg {
                             Aggregator::Jupiter => "Jupiter",
                             Aggregator::Titan => "Titan",
+                            Aggregator::Dflow => "DFlow",
                         };
                         tracing::debug!(aggregator = agg_name, "Aggregator used");
                     }
@@ -556,6 +582,20 @@ impl DexSuperAggClient {
             }
         }
 
+        // DFlow simulation (if configured)
+        if self.config.is_dflow_configured() {
+            if let Ok(dflow) = DflowAggregator::new_with_compute_price(
+                &self.config,
+                Arc::clone(&self.signer),
+                route_config.compute_unit_price_micro_lamports,
+            ) {
+                if let Ok(sim_result) = dflow.simulate(input, output, amount, slippage_bps).await {
+                    sim_results.push((Aggregator::Dflow, sim_result.clone()));
+                    comparison_results.push((Aggregator::Dflow, sim_result.out_amount));
+                }
+            }
+        }
+
         if comparison_results.is_empty() {
             return Err(anyhow!("No aggregators available for swap"));
         }
@@ -571,6 +611,7 @@ impl DexSuperAggClient {
             let agg_name = match agg {
                 Aggregator::Jupiter => "Jupiter",
                 Aggregator::Titan => "Titan",
+                Aggregator::Dflow => "DFlow",
             };
             tracing::debug!(
                 aggregator = agg_name,
@@ -581,6 +622,7 @@ impl DexSuperAggClient {
         let best_name = match best_aggregator {
             Aggregator::Jupiter => "Jupiter",
             Aggregator::Titan => "Titan",
+            Aggregator::Dflow => "DFlow",
         };
         tracing::info!(
             aggregator = best_name,

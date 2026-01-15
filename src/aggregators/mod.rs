@@ -105,8 +105,10 @@ pub trait DexAggregator: Send + Sync {
     ) -> Result<SimulateResult>;
 }
 
+pub mod dflow;
 pub mod jupiter;
 pub mod titan;
 
+pub use dflow::DflowAggregator;
 pub use jupiter::JupiterAggregator;
 pub use titan::TitanAggregator;

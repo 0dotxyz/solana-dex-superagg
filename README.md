@@ -1,6 +1,6 @@
 # solana-dex-superagg
 
-A simple Rust library for accessing **Titan** and **Jupiter** DEX aggregators on Solana. Easily plug and play into your code to get the best swap prices across multiple aggregators.
+A simple Rust library for accessing **Jupiter**, **Titan**, and **DFlow** DEX aggregators on Solana. Easily plug and play into your code to get the best swap prices across multiple aggregators.
 
 ## Installation
 
@@ -20,7 +20,7 @@ solana-dex-superagg = { git = "https://github.com/abdulrabbani/solana-dex-supera
 
 ## Features
 
-- **Multi-aggregator support**: Access both Titan and Jupiter from a single interface
+- **Multi-aggregator support**: Access Jupiter, Titan, and DFlow from a single interface
 - **Smart routing**: Automatically compare aggregators and use the one with the best price
 - **Flexible strategies**: Choose from multiple routing strategies including best price, preferred aggregator, or lowest slippage climber
 - **Slippage tracking**: Know exactly what slippage was used for your swaps (especially useful for staircase strategy)
@@ -53,6 +53,13 @@ export DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT="us1.api.demo.titan.exchange"
 
 # Titan API key (required)
 export DEX_SUPERAGG_TITAN__TITAN_API_KEY="your_titan_api_key"
+
+# DFlow Configuration (Optional)
+# DFlow API URL (defaults to https://d.quote-api.dflow.net if not set)
+export DEX_SUPERAGG_DFLOW__API_URL="https://d.quote-api.dflow.net"
+
+# DFlow API key (optional - DFlow works without it but with rate limiting)
+export DEX_SUPERAGG_DFLOW__API_KEY="your_dflow_api_key"
 
 # Optional Configuration
 # Slippage tolerance in basis points (default: 50 = 0.5%)
@@ -130,3 +137,13 @@ DEX_SUPERAGG_JUPITER__API_KEY='xxxx' \
 DEX_SUPERAGG_SHARED__WALLET_KEYPAIR='[1,2,3,4.....]' \
 cargo test test_all_swap -- --nocapture --ignored
 ```
+
+# Adding New Aggregators
+
+Want to integrate a new DEX aggregator (Raydium, Orca, Phoenix, etc.)? See **[AGGREGATOR_INTEGRATION.md](./AGGREGATOR_INTEGRATION.md)** for a complete step-by-step guide with:
+- Code templates and examples
+- Configuration setup
+- Integration checklist (24 steps)
+- Testing and verification
+
+The library's architecture makes it straightforward to add new aggregators by implementing the `DexAggregator` trait.

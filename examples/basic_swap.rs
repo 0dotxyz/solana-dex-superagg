@@ -36,9 +36,15 @@ const USDC_TOKEN: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with INFO level by default if RUST_LOG is not set
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     tracing::info!("Starting Solana DEX SuperAgg Examples");
+
+    // Load .env file if it exists (ignore errors if it doesn't exist)
+    let _ = dotenvy::dotenv();
 
     // Load config from environment variables
     let config = ClientConfig::from_env()?;
@@ -103,6 +109,7 @@ async fn main() -> Result<()> {
         let agg_name = match agg {
             Aggregator::Jupiter => "Jupiter",
             Aggregator::Titan => "Titan",
+            Aggregator::Dflow => "DFlow",
         };
         tracing::debug!(
             aggregator = agg_name,
@@ -157,6 +164,31 @@ async fn main() -> Result<()> {
         );
     } else {
         tracing::warn!("Example 4: Preferred Aggregator (Titan) - Skipped: Titan not configured");
+    }
+
+    // Example 4.5: Preferred Aggregator - Use DFlow
+    if client.config().is_dflow_configured() {
+        tracing::info!("Example 4.5: Preferred Aggregator (DFlow)");
+        let route_config = RouteConfig {
+            routing_strategy: Some(RoutingStrategy::PreferredAggregator {
+                aggregator: Aggregator::Dflow,
+                simulate: false,
+            }),
+            slippage_bps: Some(25),
+            commitment_level: CommitmentLevel::Confirmed,
+            ..Default::default()
+        };
+        let summary = client
+            .swap_with_route_config(sol, usdc, amount, route_config)
+            .await?;
+        tracing::info!(
+            transaction = %summary.swap_result.signature,
+            output_amount = summary.swap_result.out_amount,
+            aggregator = ?summary.swap_result.aggregator_used,
+            "Swap successful"
+        );
+    } else {
+        tracing::warn!("Example 4.5: Preferred Aggregator (DFlow) - Skipped: DFlow not configured");
     }
 
     // Example 5: Lowest Slippage Climber (Staircase Strategy)

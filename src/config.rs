@@ -16,6 +16,8 @@ pub enum Aggregator {
     Jupiter,
     /// Use Titan aggregator
     Titan,
+    /// Use DFlow aggregator
+    Dflow,
 }
 
 /// Routing strategy for determining which aggregator to use
@@ -254,6 +256,26 @@ impl Default for TitanConfig {
     }
 }
 
+/// DFlow-specific configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DflowConfig {
+    /// DFlow API URL (e.g., "https://d.quote-api.dflow.net")
+    pub api_url: String,
+    /// DFlow API key (optional, but recommended for production)
+    /// DFlow works without an API key but with rate limiting
+    pub api_key: Option<String>,
+}
+
+impl Default for DflowConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://d.quote-api.dflow.net".to_string(),
+            api_key: None,
+        }
+    }
+}
+
 /// Route configuration for individual swap operations
 ///
 /// This configuration can be passed per-swap to override default routing behavior.
@@ -302,7 +324,7 @@ impl From<&SharedConfig> for RouteConfig {
     }
 }
 
-/// Complete client configuration combining shared, Jupiter, and Titan configs
+/// Complete client configuration combining shared, Jupiter, Titan, and DFlow configs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     #[serde(default)]
@@ -312,6 +334,9 @@ pub struct ClientConfig {
     /// Titan configuration (optional - if not provided, Titan will not be used)
     #[serde(default)]
     pub titan: Option<TitanConfig>,
+    /// DFlow configuration (optional - if not provided, DFlow will not be used)
+    #[serde(default)]
+    pub dflow: Option<DflowConfig>,
 }
 
 impl Default for ClientConfig {
@@ -320,6 +345,7 @@ impl Default for ClientConfig {
             shared: SharedConfig::default(),
             jupiter: JupiterConfig::default(),
             titan: None,
+            dflow: None,
         }
     }
 }
@@ -352,6 +378,14 @@ impl ClientConfig {
         self.titan
             .as_ref()
             .map(|t| !t.titan_ws_endpoint.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Check if DFlow is configured
+    pub fn is_dflow_configured(&self) -> bool {
+        self.dflow
+            .as_ref()
+            .map(|d| !d.api_url.is_empty())
             .unwrap_or(false)
     }
 
@@ -394,12 +428,17 @@ impl ClientConfig {
             match strategy {
                 RoutingStrategy::BestPrice => {
                     // BestPrice strategy compares all available aggregators
-                    // Validate Jupiter (always required) and Titan if configured
+                    // Validate Jupiter (always required) and Titan/DFlow if configured
                     if let Err(errs) = self.validate_jupiter().await {
                         errors.extend(errs);
                     }
                     if self.titan.is_some() {
                         if let Err(errs) = self.validate_titan().await {
+                            errors.extend(errs);
+                        }
+                    }
+                    if self.dflow.is_some() {
+                        if let Err(errs) = self.validate_dflow().await {
                             errors.extend(errs);
                         }
                     }
@@ -415,9 +454,14 @@ impl ClientConfig {
                             errors.extend(errs);
                         }
                     }
+                    Aggregator::Dflow => {
+                        if let Err(errs) = self.validate_dflow().await {
+                            errors.extend(errs);
+                        }
+                    }
                 },
                 RoutingStrategy::LowestSlippageClimber { .. } => {
-                    // This strategy requires Jupiter and Titan (if configured)
+                    // This strategy requires Jupiter and Titan/DFlow (if configured)
                     if let Err(errs) = self.validate_jupiter().await {
                         errors.extend(errs);
                     }
@@ -426,16 +470,26 @@ impl ClientConfig {
                             errors.extend(errs);
                         }
                     }
+                    if self.dflow.is_some() {
+                        if let Err(errs) = self.validate_dflow().await {
+                            errors.extend(errs);
+                        }
+                    }
                 }
             }
         } else {
-            // No routing strategy specified: validate Jupiter (always required) and Titan if configured
+            // No routing strategy specified: validate Jupiter (always required) and Titan/DFlow if configured
             // This should rarely happen now since BestPrice is the default
             if let Err(errs) = self.validate_jupiter().await {
                 errors.extend(errs);
             }
             if self.titan.is_some() {
                 if let Err(errs) = self.validate_titan().await {
+                    errors.extend(errs);
+                }
+            }
+            if self.dflow.is_some() {
+                if let Err(errs) = self.validate_dflow().await {
                     errors.extend(errs);
                 }
             }
@@ -531,6 +585,61 @@ impl ClientConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// Validate DFlow configuration and connectivity
+    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
+    async fn validate_dflow(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        let dflow = match &self.dflow {
+            Some(d) => d,
+            None => {
+                errors.push("DFlow is not configured".to_string());
+                return Err(errors);
+            }
+        };
+
+        if dflow.api_url.is_empty() {
+            errors.push("DFlow API URL is required when DFlow is configured".to_string());
+            return Err(errors);
+        }
+
+        // Test API connectivity - DFlow works without an API key (just has rate limiting)
+        if let Err(e) = self.validate_dflow_endpoint(dflow).await {
+            errors.push(format!(
+                "DFlow API endpoint validation failed ({}): {}",
+                dflow.api_url, e
+            ));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    async fn validate_dflow_endpoint(&self, dflow: &DflowConfig) -> anyhow::Result<()> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
+
+        // Test connectivity by making a simple GET request to the base URL
+        let mut request = client.get(&dflow.api_url);
+
+        // Add API key if configured
+        if let Some(ref api_key) = dflow.api_key {
+            request = request.header("x-api-key", api_key);
+        }
+
+        timeout(Duration::from_secs(5), request.send())
+            .await
+            .map_err(|_| anyhow::anyhow!("DFlow API request timeout"))?
+            .map_err(|e| anyhow::anyhow!("Failed to connect to DFlow API: {}", e))?;
+
+        Ok(())
     }
 
     async fn validate_jupiter_url(&self) -> anyhow::Result<()> {

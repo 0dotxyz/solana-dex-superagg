@@ -38,3 +38,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jupiter-swap-api-client = { git = "https://github.com/IliaZyrin/jupiter-swap-api-client", rev = "6e209786084a4344538a1aa695f126169fa95022" }
 spl-associated-token-account = "6.0.0"
 spl-token = "7.0.0"
+dotenvy = "0.15"

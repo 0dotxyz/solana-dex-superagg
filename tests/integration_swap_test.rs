@@ -53,6 +53,8 @@ struct TestTimingSummary {
     titan_back: Option<(Option<Duration>, Option<Duration>)>,
     jupiter_forward: Option<(Option<Duration>, Option<Duration>)>,
     jupiter_back: Option<(Option<Duration>, Option<Duration>)>,
+    dflow_forward: Option<(Option<Duration>, Option<Duration>)>,
+    dflow_back: Option<(Option<Duration>, Option<Duration>)>,
     best_price_forward: Option<AggregatorTimings>,
     best_price_back: Option<AggregatorTimings>,
     staircase_forward: Option<AggregatorTimings>,
@@ -81,6 +83,9 @@ fn extract_timing_from_sim_results(
 #[ignore] // Ignore by default - requires environment setup
 async fn test_all_swap_methods() -> Result<()> {
     println!("=== Integration Test: All Swap Methods ===\n");
+
+    // Load .env file if it exists (ignore errors if it doesn't exist)
+    let _ = dotenvy::dotenv();
 
     // Load configuration from environment
     let config = ClientConfig::from_env()
@@ -160,6 +165,24 @@ async fn test_all_swap_methods() -> Result<()> {
     .await?;
     println!();
 
+    // Test 2.5: Simple DFlow Swap
+    if client.config().is_dflow_configured() {
+        println!("=== Test 2.5: Simple DFlow Swap ===");
+        test_dflow_swap(
+            &client,
+            SOL_TOKEN,
+            USDC_TOKEN,
+            sol_amount,
+            slippage_bps,
+            &mut timing_summary,
+        )
+        .await?;
+        println!();
+    } else {
+        println!("=== Test 2.5: Simple DFlow Swap ===");
+        println!("⚠ Skipped: DFlow not configured\n");
+    }
+
     // Test 3: Best Price (compares both aggregators)
     if client.config().is_titan_configured() {
         println!("=== Test 3: Best Price Strategy ===");
@@ -222,6 +245,20 @@ async fn test_all_swap_methods() -> Result<()> {
 
     if let Some((sim, exec)) = timing_summary.jupiter_back {
         println!("Jupiter Swap (Back):");
+        println!("  Simulation: {}", format_duration_ms(sim));
+        println!("  Execution: {}", format_duration_ms(exec));
+        println!();
+    }
+
+    if let Some((sim, exec)) = timing_summary.dflow_forward {
+        println!("DFlow Swap (Forward):");
+        println!("  Simulation: {}", format_duration_ms(sim));
+        println!("  Execution: {}", format_duration_ms(exec));
+        println!();
+    }
+
+    if let Some((sim, exec)) = timing_summary.dflow_back {
+        println!("DFlow Swap (Back):");
         println!("  Simulation: {}", format_duration_ms(sim));
         println!("  Execution: {}", format_duration_ms(exec));
         println!();
@@ -354,6 +391,7 @@ async fn test_titan_swap(
         let agg_name = match agg {
             Aggregator::Titan => "Titan",
             Aggregator::Jupiter => "Jupiter",
+            Aggregator::Dflow => "DFlow",
         };
         println!("  Aggregator Used: {}", agg_name);
     }
@@ -464,6 +502,7 @@ async fn test_jupiter_swap(
         let agg_name = match agg {
             Aggregator::Titan => "Titan",
             Aggregator::Jupiter => "Jupiter",
+            Aggregator::Dflow => "DFlow",
         };
         println!("  Aggregator Used: {}", agg_name);
     }
@@ -510,6 +549,117 @@ async fn test_jupiter_swap(
         extract_timing_from_sim_results(&summary_back.sim_results, Aggregator::Jupiter);
     let exec_time_back = summary_back.swap_result.execution_time;
     timing_summary.jupiter_back = Some((sim_time_back, exec_time_back));
+
+    println!("  ✓ Swap back successful!");
+    println!("  Transaction: {}", summary_back.swap_result.signature);
+    println!(
+        "  Output Amount: {} lamports",
+        summary_back.swap_result.out_amount
+    );
+    if let Some(slippage_used) = summary_back.swap_result.slippage_bps_used {
+        println!(
+            "  Slippage Used: {} bps ({:.2}%)",
+            slippage_used,
+            slippage_used as f64 / 100.0
+        );
+        // Validate slippage used is <= slippage requested
+        assert!(
+            slippage_used <= slippage_bps,
+            "Slippage used ({}) should be <= slippage requested ({})",
+            slippage_used,
+            slippage_bps
+        );
+    }
+
+    Ok(())
+}
+
+/// Test simple DFlow swap
+async fn test_dflow_swap(
+    client: &DexSuperAggClient,
+    input: &str,
+    output: &str,
+    amount: u64,
+    slippage_bps: u16,
+    timing_summary: &mut TestTimingSummary,
+) -> Result<()> {
+    println!("Swapping {} lamports of {} -> {}", amount, input, output);
+
+    let route_config = RouteConfig {
+        routing_strategy: Some(RoutingStrategy::PreferredAggregator {
+            aggregator: Aggregator::Dflow,
+            simulate: false, // Direct swap
+        }),
+        slippage_bps: Some(slippage_bps),
+        ..Default::default()
+    };
+
+    let summary = client
+        .swap_with_route_config(input, output, amount, route_config)
+        .await?;
+
+    // Collect timing data
+    let sim_time = extract_timing_from_sim_results(&summary.sim_results, Aggregator::Dflow);
+    let exec_time = summary.swap_result.execution_time;
+    timing_summary.dflow_forward = Some((sim_time, exec_time));
+
+    println!("  ✓ Swap successful!");
+    println!("  Transaction: {}", summary.swap_result.signature);
+    println!(
+        "  Output Amount: {} lamports",
+        summary.swap_result.out_amount
+    );
+    if let Some(agg) = summary.swap_result.aggregator_used {
+        let agg_name = match agg {
+            Aggregator::Titan => "Titan",
+            Aggregator::Jupiter => "Jupiter",
+            Aggregator::Dflow => "DFlow",
+        };
+        println!("  Aggregator Used: {}", agg_name);
+    }
+    if let Some(slippage_used) = summary.swap_result.slippage_bps_used {
+        println!(
+            "  Slippage Used: {} bps ({:.2}%)",
+            slippage_used,
+            slippage_used as f64 / 100.0
+        );
+        // Validate slippage used is <= slippage requested
+        assert!(
+            slippage_used <= slippage_bps,
+            "Slippage used ({}) should be <= slippage requested ({})",
+            slippage_used,
+            slippage_bps
+        );
+    }
+
+    // Wait a bit for transaction to settle
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Swap back
+    println!("\n  Swapping back: {} -> {}", output, input);
+    let route_config_back = RouteConfig {
+        routing_strategy: Some(RoutingStrategy::PreferredAggregator {
+            aggregator: Aggregator::Dflow,
+            simulate: false,
+        }),
+        slippage_bps: Some(slippage_bps),
+        ..Default::default()
+    };
+
+    let summary_back = client
+        .swap_with_route_config(
+            output,
+            input,
+            summary.swap_result.out_amount,
+            route_config_back,
+        )
+        .await?;
+
+    // Collect timing data for swap back
+    let sim_time_back =
+        extract_timing_from_sim_results(&summary_back.sim_results, Aggregator::Dflow);
+    let exec_time_back = summary_back.swap_result.execution_time;
+    timing_summary.dflow_back = Some((sim_time_back, exec_time_back));
 
     println!("  ✓ Swap back successful!");
     println!("  Transaction: {}", summary_back.swap_result.signature);
@@ -587,6 +737,7 @@ async fn test_best_price(
         let agg_name = match agg {
             Aggregator::Titan => "Titan",
             Aggregator::Jupiter => "Jupiter",
+            Aggregator::Dflow => "DFlow",
         };
         println!("  Aggregator Used: {}", agg_name);
     }
@@ -729,6 +880,7 @@ async fn test_staircase(
         let agg_name = match agg {
             Aggregator::Titan => "Titan",
             Aggregator::Jupiter => "Jupiter",
+            Aggregator::Dflow => "DFlow",
         };
         println!("  Aggregator Used: {}", agg_name);
     }
