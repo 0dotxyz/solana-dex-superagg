@@ -8,13 +8,6 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-solana-dex-superagg = { git = "https://github.com/abdulrabbani/solana-dex-superagg", tag = "v1.1.2" }
-```
-
-Or use the latest version from the main branch:
-
-```toml
-[dependencies]
 solana-dex-superagg = { git = "https://github.com/abdulrabbani/solana-dex-superagg" }
 ```
 
