@@ -8,7 +8,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-solana-dex-superagg = { git = "https://github.com/abdulrabbani/solana-dex-superagg" }
+solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg" }
 ```
 
 ## Features
