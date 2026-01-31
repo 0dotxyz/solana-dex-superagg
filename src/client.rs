@@ -128,19 +128,19 @@ impl DexSuperAggClient {
         let token_program_id = mint_account.owner;
 
         // Parse the mint account to validate it's a valid mint (and get token program ID)
-        if token_program_id == spl_token::id() {
-            spl_token::state::Mint::unpack(&mint_account.data)
-                .map_err(|e| anyhow!("Failed to parse mint account: {}", e))?;
-        } else if token_program_id == spl_token_2022::id() {
-            spl_token_2022::state::Mint::unpack(&mint_account.data)
-                .map_err(|e| anyhow!("Failed to parse mint account: {}", e))?;
-        } else {
-            return Err(anyhow!(
-                "Unsupported token program owner for mint {}: {}",
-                mint_pubkey,
-                token_program_id
-            ));
-        }
+        // if token_program_id == spl_token::id() {
+        //     spl_token::state::Mint::unpack(&mint_account.data)
+        //         .map_err(|e| anyhow!("Failed to parse mint account: {}", e))?;
+        // } else if token_program_id == spl_token_2022::id() {
+        //     spl_token_2022::state::Mint::unpack(&mint_account.data)
+        //         .map_err(|e| anyhow!("Failed to parse mint account: {}", e))?;
+        // } else {
+        //     return Err(anyhow!(
+        //         "Unsupported token program owner for mint {}: {}",
+        //         mint_pubkey,
+        //         token_program_id
+        //     ));
+        // }
 
         // Get the ATA address
         let ata_address = get_associated_token_address_with_program_id(
