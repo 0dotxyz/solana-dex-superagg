@@ -234,22 +234,13 @@ impl Default for JupiterConfig {
 }
 
 /// Titan-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TitanConfig {
     /// Titan WebSocket endpoint (e.g., "us1.api.demo.titan.exchange")
     pub titan_ws_endpoint: String,
     /// Titan API key (required)
     pub titan_api_key: Option<String>,
-}
-
-impl Default for TitanConfig {
-    fn default() -> Self {
-        Self {
-            titan_ws_endpoint: String::new(),
-            titan_api_key: None,
-        }
-    }
 }
 
 /// DFlow-specific configuration
@@ -292,6 +283,8 @@ pub struct RouteConfig {
     /// Commitment level for transaction confirmation
     #[serde(default)]
     pub commitment_level: CommitmentLevel,
+    /// Whether to wrap and unwrap SOL in the swap
+    pub wrap_and_unwrap_sol: bool,
 }
 
 impl Default for RouteConfig {
@@ -303,6 +296,7 @@ impl Default for RouteConfig {
             output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
             slippage_bps: None,                    // Use config default if not specified
             commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed
+            wrap_and_unwrap_sol: false,
         }
     }
 }
@@ -316,12 +310,13 @@ impl From<&SharedConfig> for RouteConfig {
             output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
             slippage_bps: None,                    // Use config default
             commitment_level: shared.commitment_level, // Copy from shared config
+            wrap_and_unwrap_sol: false,
         }
     }
 }
 
 /// Complete client configuration combining shared, Jupiter, Titan, and DFlow configs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     #[serde(default)]
     pub shared: SharedConfig,
@@ -333,17 +328,6 @@ pub struct ClientConfig {
     /// DFlow configuration (optional - if not provided, DFlow will not be used)
     #[serde(default)]
     pub dflow: Option<DflowConfig>,
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            shared: SharedConfig::default(),
-            jupiter: JupiterConfig::default(),
-            titan: None,
-            dflow: None,
-        }
-    }
 }
 
 impl ClientConfig {
@@ -360,6 +344,7 @@ impl ClientConfig {
     /// - A JSON array string (e.g., `"[1,2,3,...]"`) - will be parsed correctly via custom deserializer
     /// - A base58 string
     /// - Comma-separated bytes
+    #[allow(clippy::result_large_err)]
     pub fn from_env() -> Result<Self, figment::Error> {
         // Extract config from environment - custom deserializer handles WALLET_KEYPAIR parsing
         let config: Self = Figment::new()

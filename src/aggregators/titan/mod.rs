@@ -138,6 +138,7 @@ impl DexAggregator for TitanAggregator {
         amount: u64,
         slippage_bps: u16,
         commitment_level: solana_sdk::commitment_config::CommitmentLevel,
+        _wrap_and_unwrap_sol: bool,
     ) -> Result<SwapSummary> {
         let start_time = Instant::now();
 

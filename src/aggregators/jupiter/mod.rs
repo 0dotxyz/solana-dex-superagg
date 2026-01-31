@@ -94,6 +94,7 @@ impl DexAggregator for JupiterAggregator {
         amount: u64,
         slippage_bps: u16,
         commitment_level: solana_sdk::commitment_config::CommitmentLevel,
+        wrap_and_unwrap_sol: bool,
     ) -> Result<SwapSummary> {
         let start_time = Instant::now();
 
@@ -138,7 +139,7 @@ impl DexAggregator for JupiterAggregator {
         };
 
         let swap_config = TransactionConfig {
-            wrap_and_unwrap_sol: true,
+            wrap_and_unwrap_sol,
             compute_unit_price_micro_lamports: if self.compute_unit_price_micro_lamports > 0 {
                 Some(ComputeUnitPriceMicroLamports::MicroLamports(
                     self.compute_unit_price_micro_lamports,

@@ -387,7 +387,7 @@ async fn test_titan_swap(
     };
 
     let summary = client
-        .swap_with_route_config(input, output, amount, route_config)
+        .swap_with_route_config(input, output, amount, route_config, true)
         .await?;
 
     // Collect timing data
@@ -443,6 +443,7 @@ async fn test_titan_swap(
             input,
             summary.swap_result.out_amount,
             route_config_back,
+            true,
         )
         .await?;
 
@@ -496,7 +497,7 @@ async fn test_jupiter_swap(
     };
 
     let summary = client
-        .swap_with_route_config(input, output, amount, route_config)
+        .swap_with_route_config(input, output, amount, route_config, true)
         .await?;
 
     // Collect timing data
@@ -552,6 +553,7 @@ async fn test_jupiter_swap(
             input,
             summary.swap_result.out_amount,
             route_config_back,
+            true,
         )
         .await?;
 
@@ -605,7 +607,7 @@ async fn test_dflow_swap(
     };
 
     let summary = client
-        .swap_with_route_config(input, output, amount, route_config)
+        .swap_with_route_config(input, output, amount, route_config, true)
         .await?;
 
     // Collect timing data
@@ -661,6 +663,7 @@ async fn test_dflow_swap(
             input,
             summary.swap_result.out_amount,
             route_config_back,
+            true,
         )
         .await?;
 
@@ -713,7 +716,7 @@ async fn test_best_price(
     };
 
     let summary = client
-        .swap_with_route_config(input, output, amount, route_config)
+        .swap_with_route_config(input, output, amount, route_config, true)
         .await?;
 
     // Collect timing data

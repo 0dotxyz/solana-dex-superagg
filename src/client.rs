@@ -11,9 +11,9 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
+    get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
 };
-use spl_token::state::Mint;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -117,21 +117,37 @@ impl DexSuperAggClient {
         let mint_pubkey =
             Pubkey::from_str(mint).map_err(|e| anyhow!("Invalid mint address: {}", e))?;
 
-        // Native SOL mint address - skip ATA creation for native SOL
-        // Native SOL doesn't use token accounts, it uses the native account balance
-        const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-        let native_sol_mint = Pubkey::from_str(NATIVE_SOL_MINT)
-            .map_err(|e| anyhow!("Failed to parse native SOL mint: {}", e))?;
-
-        if mint_pubkey == native_sol_mint {
-            // Native SOL doesn't need an ATA - it uses the native account balance
-            return Ok(());
-        }
-
         let owner_pubkey = self.signer.pubkey();
 
+        // Get the mint account to determine the token program ID
+        let mint_account = self
+            .rpc_client
+            .get_account(&mint_pubkey)
+            .map_err(|e| anyhow!("Failed to get mint account: {}", e))?;
+
+        let token_program_id = mint_account.owner;
+
+        // Parse the mint account to validate it's a valid mint (and get token program ID)
+        if token_program_id == spl_token::id() {
+            spl_token::state::Mint::unpack(&mint_account.data)
+                .map_err(|e| anyhow!("Failed to parse mint account: {}", e))?;
+        } else if token_program_id == spl_token_2022::id() {
+            spl_token_2022::state::Mint::unpack(&mint_account.data)
+                .map_err(|e| anyhow!("Failed to parse mint account: {}", e))?;
+        } else {
+            return Err(anyhow!(
+                "Unsupported token program owner for mint {}: {}",
+                mint_pubkey,
+                token_program_id
+            ));
+        }
+
         // Get the ATA address
-        let ata_address = get_associated_token_address(&owner_pubkey, &mint_pubkey);
+        let ata_address = get_associated_token_address_with_program_id(
+            &owner_pubkey,
+            &mint_pubkey,
+            &token_program_id,
+        );
 
         // Check if the ATA already exists
         match self.rpc_client.get_account(&ata_address) {
@@ -143,17 +159,6 @@ impl DexSuperAggClient {
                 // ATA doesn't exist, need to create it
             }
         }
-
-        // Get the mint account to determine the token program ID
-        let mint_account = self
-            .rpc_client
-            .get_account(&mint_pubkey)
-            .map_err(|e| anyhow!("Failed to get mint account: {}", e))?;
-
-        // Parse the mint account to validate it's a valid mint (and get token program ID)
-        let _mint_data = Mint::unpack(&mint_account.data)
-            .map_err(|e| anyhow!("Failed to parse mint account: {}", e))?;
-        let token_program_id = mint_account.owner;
 
         // Create the ATA instruction (idempotent - safe to call even if it exists)
         let create_ata_ix = create_associated_token_account_idempotent(
@@ -201,13 +206,21 @@ impl DexSuperAggClient {
     /// * `input` - Input token mint address (as string)
     /// * `output` - Output token mint address (as string)
     /// * `amount` - Input amount in lamports/base units
+    /// * `wrap_and_unwrap_sol` - Whether to wrap and unwrap SOL in the swap
     ///
     /// # Returns
     /// `SwapSummary` containing the swap result and all quote results
     ///
     /// Uses the default routing strategy from the client configuration.
-    pub async fn swap(&self, input: &str, output: &str, amount: u64) -> Result<SwapSummary> {
-        let route_config = self.config.default_route_config();
+    pub async fn swap(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        wrap_and_unwrap_sol: bool,
+    ) -> Result<SwapSummary> {
+        let mut route_config = self.config.default_route_config();
+        route_config.wrap_and_unwrap_sol = wrap_and_unwrap_sol;
         self.swap_with_route_config(input, output, amount, route_config)
             .await
     }
@@ -313,6 +326,7 @@ impl DexSuperAggClient {
                         amount,
                         slippage_bps,
                         route_config.commitment_level,
+                        route_config.wrap_and_unwrap_sol,
                     )
                     .await?
             }
@@ -326,6 +340,7 @@ impl DexSuperAggClient {
                         amount,
                         slippage_bps,
                         route_config.commitment_level,
+                        route_config.wrap_and_unwrap_sol,
                     )
                     .await?
             }
@@ -342,6 +357,7 @@ impl DexSuperAggClient {
                         amount,
                         slippage_bps,
                         route_config.commitment_level,
+                        route_config.wrap_and_unwrap_sol,
                     )
                     .await?
             }

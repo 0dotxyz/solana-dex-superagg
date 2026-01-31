@@ -116,7 +116,7 @@ async fn test_dflow_swap() -> Result<()> {
     };
 
     let summary = client
-        .swap_with_route_config(SOL_TOKEN, USDC_TOKEN, sol_amount, route_config)
+        .swap_with_route_config(SOL_TOKEN, USDC_TOKEN, sol_amount, route_config, true)
         .await?;
 
     println!("  ✓ Swap successful!");
@@ -187,6 +187,7 @@ async fn test_dflow_swap() -> Result<()> {
             SOL_TOKEN,
             summary.swap_result.out_amount,
             route_config_back,
+            true,
         )
         .await?;
 

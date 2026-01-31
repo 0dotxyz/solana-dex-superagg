@@ -74,6 +74,7 @@ pub trait DexAggregator: Send + Sync {
     /// * `amount` - Input amount in lamports/base units
     /// * `slippage_bps` - Slippage tolerance in basis points (e.g., 25 = 0.25%)
     /// * `commitment_level` - Commitment level for transaction confirmation
+    /// * `wrap_and_unwrap_sol` - Whether to wrap and unwrap SOL in the swap
     ///
     /// # Returns
     /// `SwapSummary` containing the swap result and (at minimum) the quote used by the aggregator
@@ -84,6 +85,7 @@ pub trait DexAggregator: Send + Sync {
         amount: u64,
         slippage_bps: u16,
         commitment_level: CommitmentLevel,
+        wrap_and_unwrap_sol: bool,
     ) -> Result<SwapSummary>;
 
     /// Quote a swap to get quote information without executing

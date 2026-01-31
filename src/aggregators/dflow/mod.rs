@@ -374,6 +374,7 @@ impl DexAggregator for DflowAggregator {
         amount: u64,
         slippage_bps: u16,
         commitment_level: CommitmentLevel,
+        _wrap_and_unwrap_sol: bool,
     ) -> Result<SwapSummary> {
         let start = Instant::now();
 

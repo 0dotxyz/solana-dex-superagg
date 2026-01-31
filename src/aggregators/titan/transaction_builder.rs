@@ -83,7 +83,7 @@ async fn fetch_lookup_table_accounts(
 
         // Extract account data
         if let Some(data_array) = json["result"]["value"]["data"].as_array() {
-            if let Some(data_str) = data_array.get(0).and_then(|v| v.as_str()) {
+            if let Some(data_str) = data_array.first().and_then(|v| v.as_str()) {
                 use base64::Engine;
                 let data = base64::engine::general_purpose::STANDARD
                     .decode(data_str)

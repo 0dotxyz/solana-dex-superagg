@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     // Example 1: Simple swap (uses default strategy from config - usually BestPrice)
     // This is the easiest way to swap - no configuration needed!
     tracing::info!("Example 1: Simple Swap (Default Strategy)");
-    let summary = client.swap(sol, usdc, amount).await?;
+    let summary = client.swap(sol, usdc, amount, true).await?;
     tracing::info!(
         transaction = %summary.swap_result.signature,
         output_amount = summary.swap_result.out_amount,
@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let summary = client
-        .swap_with_route_config(sol, usdc, amount, route_config)
+        .swap_with_route_config(sol, usdc, amount, route_config, true)
         .await?;
     tracing::info!(
         transaction = %summary.swap_result.signature,
@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let summary = client
-        .swap_with_route_config(sol, usdc, amount, route_config)
+        .swap_with_route_config(sol, usdc, amount, route_config, true)
         .await?;
     tracing::info!(
         transaction = %summary.swap_result.signature,
@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
         let summary = client
-            .swap_with_route_config(sol, usdc, amount, route_config)
+            .swap_with_route_config(sol, usdc, amount, route_config, true)
             .await?;
         tracing::info!(
             transaction = %summary.swap_result.signature,
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
         let summary = client
-            .swap_with_route_config(sol, usdc, amount, route_config)
+            .swap_with_route_config(sol, usdc, amount, route_config, true)
             .await?;
         tracing::info!(
             transaction = %summary.swap_result.signature,
@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let summary = client
-        .swap_with_route_config(sol, usdc, amount, route_config)
+        .swap_with_route_config(sol, usdc, amount, route_config, true)
         .await?;
     tracing::info!(
         transaction = %summary.swap_result.signature,
@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let summary = client
-        .swap_with_route_config(sol, usdc, amount, route_config)
+        .swap_with_route_config(sol, usdc, amount, route_config, true)
         .await?;
     tracing::info!(
         transaction = %summary.swap_result.signature,
