@@ -1,10 +1,8 @@
 use figment::{providers::Env, Figment};
 use serde::{Deserialize, Deserializer, Serialize};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    commitment_config::{CommitmentConfig, CommitmentLevel},
-    signature::Keypair,
-};
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_sdk::signature::Keypair;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -712,7 +710,7 @@ impl ClientConfig {
         }
 
         // Match eva01 exactly: Keypair::from_bytes expects full 64-byte keypair (32 secret + 32 public)
-        let keypair = Keypair::from_bytes(&bytes)
+        let keypair = Keypair::try_from(bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("Failed to create keypair from bytes: {}", e))?;
         Ok(Some(keypair))
     }

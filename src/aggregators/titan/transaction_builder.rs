@@ -4,9 +4,9 @@
 use reqwest::Client;
 use serde_json::{json, Value};
 use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount,
     hash::Hash,
     instruction::{AccountMeta as SolanaAccountMeta, Instruction as SolanaInstruction},
+    message::AddressLookupTableAccount,
     message::{v0, VersionedMessage},
     pubkey::Pubkey as SolanaPubkey,
     signature::Signature as SolanaSignature,

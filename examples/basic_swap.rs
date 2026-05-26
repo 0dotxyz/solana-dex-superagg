@@ -23,11 +23,11 @@
 //! ```
 
 use anyhow::Result;
+use solana_commitment_config::CommitmentLevel;
 use solana_dex_superagg::{
     client::DexSuperAggClient,
     config::{Aggregator, ClientConfig, RouteConfig, RoutingStrategy},
 };
-use solana_sdk::commitment_config::CommitmentLevel;
 use tracing;
 
 /// Token addresses

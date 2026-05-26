@@ -14,8 +14,8 @@ use solana_client::{
     nonblocking::rpc_client::RpcClient as AsyncRpcClient, rpc_client::RpcClient,
     rpc_config::RpcSendTransactionConfig,
 };
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
@@ -137,7 +137,7 @@ impl DexAggregator for TitanAggregator {
         output: &str,
         amount: u64,
         slippage_bps: u16,
-        commitment_level: solana_sdk::commitment_config::CommitmentLevel,
+        commitment_level: CommitmentLevel,
         _wrap_and_unwrap_sol: bool,
     ) -> Result<SwapSummary> {
         let start_time = Instant::now();
@@ -209,9 +209,7 @@ impl DexAggregator for TitanAggregator {
                 commitment_config,
                 RpcSendTransactionConfig {
                     skip_preflight: false,
-                    preflight_commitment: Some(
-                        solana_sdk::commitment_config::CommitmentLevel::Processed,
-                    ),
+                    preflight_commitment: Some(CommitmentLevel::Processed),
                     ..Default::default()
                 },
             )

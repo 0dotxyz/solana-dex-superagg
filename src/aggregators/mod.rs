@@ -6,7 +6,7 @@
 use crate::config::Aggregator;
 use anyhow::Result;
 use async_trait::async_trait;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use std::time::Duration;
 
 /// Result of a swap operation

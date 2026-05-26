@@ -10,13 +10,13 @@ use jupiter_swap_api_client::{
     JupiterSwapApiClient,
 };
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
-use solana_program::pubkey::Pubkey;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
+use std::sync::Arc;
 use std::time::Instant;
-use std::{str::FromStr, sync::Arc};
 
 pub struct JupiterAggregator {
     jupiter_client: JupiterSwapApiClient,
@@ -39,10 +39,8 @@ impl JupiterAggregator {
         signer: Arc<Keypair>,
         compute_unit_price_micro_lamports: u64,
     ) -> Result<Self> {
-        let rpc_client = RpcClient::new_with_commitment(
-            &config.shared.rpc_url,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-        );
+        let rpc_client =
+            RpcClient::new_with_commitment(&config.shared.rpc_url, CommitmentConfig::confirmed());
 
         let api_key = config
             .jupiter
@@ -67,10 +65,7 @@ impl JupiterAggregator {
         compute_unit_price_micro_lamports: u64,
         api_key: Option<String>,
     ) -> Result<Self> {
-        let rpc_client = RpcClient::new_with_commitment(
-            rpc_url,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-        );
+        let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
         let jupiter_client = JupiterSwapApiClient::new(
             jupiter_api_url.to_string(),
             api_key.ok_or_else(|| anyhow!("Jupiter API key is required when using with_config"))?,
@@ -93,17 +88,12 @@ impl DexAggregator for JupiterAggregator {
         output: &str,
         amount: u64,
         slippage_bps: u16,
-        commitment_level: solana_sdk::commitment_config::CommitmentLevel,
+        commitment_level: CommitmentLevel,
         wrap_and_unwrap_sol: bool,
     ) -> Result<SwapSummary> {
         let start_time = Instant::now();
 
-        let input_mint =
-            Pubkey::from_str(input).map_err(|e| anyhow!("Invalid input mint: {}", e))?;
-        let output_mint =
-            Pubkey::from_str(output).map_err(|e| anyhow!("Invalid output mint: {}", e))?;
-
-        if input_mint == output_mint {
+        if input == output {
             return Err(anyhow!("Input and output mints cannot be the same"));
         }
 
@@ -111,8 +101,12 @@ impl DexAggregator for JupiterAggregator {
         let quote_response = self
             .jupiter_client
             .quote(&QuoteRequest {
-                input_mint,
-                output_mint,
+                input_mint: input
+                    .try_into()
+                    .map_err(|e| anyhow!("Invalid input mint: {}", e))?,
+                output_mint: output
+                    .try_into()
+                    .map_err(|e| anyhow!("Invalid output mint: {}", e))?,
                 amount,
                 slippage_bps,
                 ..Default::default()
@@ -150,13 +144,11 @@ impl DexAggregator for JupiterAggregator {
             ..Default::default()
         };
 
-        let user_pubkey = self.signer.pubkey();
-
         let swap_response = self
             .jupiter_client
             .swap(
                 &SwapRequest {
-                    user_public_key: user_pubkey,
+                    user_public_key: self.signer.pubkey().to_bytes().into(),
                     quote_response,
                     config: swap_config,
                 },
@@ -175,14 +167,12 @@ impl DexAggregator for JupiterAggregator {
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
                 &tx,
-                solana_sdk::commitment_config::CommitmentConfig {
+                CommitmentConfig {
                     commitment: commitment_level,
                 },
                 RpcSendTransactionConfig {
                     skip_preflight: false,
-                    preflight_commitment: Some(
-                        solana_sdk::commitment_config::CommitmentLevel::Processed,
-                    ),
+                    preflight_commitment: Some(CommitmentLevel::Processed),
                     ..Default::default()
                 },
             )
@@ -213,20 +203,19 @@ impl DexAggregator for JupiterAggregator {
     ) -> Result<QuoteResult> {
         let start_time = Instant::now();
 
-        let input_mint =
-            Pubkey::from_str(input).map_err(|e| anyhow!("Invalid input mint: {}", e))?;
-        let output_mint =
-            Pubkey::from_str(output).map_err(|e| anyhow!("Invalid output mint: {}", e))?;
-
-        if input_mint == output_mint {
+        if input == output {
             return Err(anyhow!("Input and output mints cannot be the same"));
         }
 
         let quote_response = self
             .jupiter_client
             .quote(&QuoteRequest {
-                input_mint,
-                output_mint,
+                input_mint: input
+                    .try_into()
+                    .map_err(|e| anyhow!("Invalid input mint: {}", e))?,
+                output_mint: output
+                    .try_into()
+                    .map_err(|e| anyhow!("Invalid output mint: {}", e))?,
                 amount,
                 slippage_bps,
                 ..Default::default()

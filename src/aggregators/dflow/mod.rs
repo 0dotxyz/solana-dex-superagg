@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
-    commitment_config::CommitmentLevel,
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
@@ -186,10 +186,8 @@ impl DflowAggregator {
             .as_ref()
             .ok_or_else(|| anyhow!("DFlow configuration not found"))?;
 
-        let rpc_client = RpcClient::new_with_commitment(
-            &config.shared.rpc_url,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-        );
+        let rpc_client =
+            RpcClient::new_with_commitment(&config.shared.rpc_url, CommitmentConfig::confirmed());
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -214,10 +212,7 @@ impl DflowAggregator {
         compute_unit_price_micro_lamports: u64,
         api_key: Option<String>,
     ) -> Result<Self> {
-        let rpc_client = RpcClient::new_with_commitment(
-            &rpc_url,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-        );
+        let rpc_client = RpcClient::new_with_commitment(&rpc_url, CommitmentConfig::confirmed());
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -427,7 +422,7 @@ impl DexAggregator for DflowAggregator {
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
                 &transaction,
-                solana_sdk::commitment_config::CommitmentConfig {
+                CommitmentConfig {
                     commitment: commitment_level,
                 },
                 solana_client::rpc_config::RpcSendTransactionConfig {
