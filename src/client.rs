@@ -1,6 +1,6 @@
 use crate::aggregators::{
     dflow::DflowAggregator, jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator,
-    SwapSummary,
+    SwapSummary, SwapTransaction,
 };
 use crate::config::{Aggregator, ClientConfig, OutputAtaBehavior, RouteConfig, RoutingStrategy};
 use anyhow::{anyhow, Result};
@@ -282,6 +282,150 @@ impl DexSuperAggClient {
         }
     }
 
+    /// Build a signed exact-in swap transaction using the default route configuration, without
+    /// submitting it.
+    pub async fn build_swap_transaction(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        wrap_and_unwrap_sol: bool,
+    ) -> Result<SwapTransaction> {
+        let mut route_config = self.config.default_route_config();
+        route_config.wrap_and_unwrap_sol = wrap_and_unwrap_sol;
+        self.build_swap_transaction_with_route_config(input, output, amount, route_config)
+            .await
+    }
+
+    /// Build a signed exact-in swap transaction with a custom route configuration, without
+    /// submitting it.
+    pub async fn build_swap_transaction_with_route_config(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        route_config: RouteConfig,
+    ) -> Result<SwapTransaction> {
+        let slippage_bps = route_config
+            .slippage_bps
+            .unwrap_or(self.config.shared.slippage_bps);
+
+        match &route_config.routing_strategy {
+            Some(RoutingStrategy::BestPrice) | None => {
+                self.build_swap_transaction_best_price(
+                    input,
+                    output,
+                    amount,
+                    slippage_bps,
+                    &route_config,
+                )
+                .await
+            }
+            Some(RoutingStrategy::PreferredAggregator { aggregator }) => {
+                self.build_swap_transaction_direct(
+                    input,
+                    output,
+                    amount,
+                    slippage_bps,
+                    aggregator,
+                    &route_config,
+                )
+                .await
+            }
+            Some(RoutingStrategy::LowestSlippageClimber {
+                floor_slippage_bps,
+                max_slippage_bps,
+                step_bps,
+            }) => {
+                self.build_swap_transaction_lowest_slippage_climber(
+                    input,
+                    output,
+                    amount,
+                    *floor_slippage_bps,
+                    *max_slippage_bps,
+                    *step_bps,
+                    &route_config,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Build a signed exact-in swap transaction that is expected to yield at least `min_out`.
+    ///
+    /// The caller provides an initial input amount estimate. If the first route under-delivers,
+    /// the input is bumped once by the shortfall ratio plus a small margin and re-routed.
+    pub async fn build_swap_transaction_for_min_out(
+        &self,
+        input: &str,
+        output: &str,
+        initial_amount: u64,
+        min_out: u64,
+        wrap_and_unwrap_sol: bool,
+    ) -> Result<SwapTransaction> {
+        let mut route_config = self.config.default_route_config();
+        route_config.wrap_and_unwrap_sol = wrap_and_unwrap_sol;
+        self.build_swap_transaction_for_min_out_with_route_config(
+            input,
+            output,
+            initial_amount,
+            min_out,
+            route_config,
+        )
+        .await
+    }
+
+    /// Build a signed exact-in swap transaction that is expected to yield at least `min_out`, using
+    /// a custom route configuration.
+    pub async fn build_swap_transaction_for_min_out_with_route_config(
+        &self,
+        input: &str,
+        output: &str,
+        initial_amount: u64,
+        min_out: u64,
+        route_config: RouteConfig,
+    ) -> Result<SwapTransaction> {
+        if initial_amount == 0 {
+            return Err(anyhow!(
+                "initial input amount cannot be zero when building min-out swap"
+            ));
+        }
+
+        let mut input_amount = initial_amount;
+        let mut quoted_out = self
+            .quote_out_amount_with_route_config(input, output, input_amount, &route_config)
+            .await?;
+
+        if quoted_out < min_out {
+            let ratio = (min_out as f64 / quoted_out.max(1) as f64) * 1.02;
+            input_amount = ((input_amount as f64) * ratio).ceil() as u64;
+            quoted_out = self
+                .quote_out_amount_with_route_config(input, output, input_amount, &route_config)
+                .await?;
+
+            if quoted_out < min_out {
+                return Err(anyhow!(
+                    "ExactIn quote still short after re-route: out {} < needed {}",
+                    quoted_out,
+                    min_out,
+                ));
+            }
+        }
+
+        let prepared = self
+            .build_swap_transaction_with_route_config(input, output, input_amount, route_config)
+            .await?;
+        if prepared.out_amount < min_out {
+            return Err(anyhow!(
+                "ExactIn transaction quote short after build: out {} < needed {}",
+                prepared.out_amount,
+                min_out,
+            ));
+        }
+
+        Ok(prepared)
+    }
+
     /// Execute a direct swap with a specific aggregator
     async fn swap_direct(
         &self,
@@ -349,6 +493,213 @@ impl DexSuperAggClient {
         }
 
         Ok(summary)
+    }
+
+    /// Build a signed transaction directly with a specific aggregator.
+    async fn build_swap_transaction_direct(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        aggregator: &Aggregator,
+        route_config: &RouteConfig,
+    ) -> Result<SwapTransaction> {
+        let mut prepared = match aggregator {
+            Aggregator::Jupiter => {
+                let jupiter = JupiterAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                jupiter
+                    .build_swap_transaction(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        route_config.wrap_and_unwrap_sol,
+                    )
+                    .await?
+            }
+            Aggregator::Titan => {
+                let titan = self.get_titan_aggregator().await?;
+                titan
+                    .build_swap_transaction(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        route_config.wrap_and_unwrap_sol,
+                    )
+                    .await?
+            }
+            Aggregator::Dflow => {
+                let dflow = DflowAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                dflow
+                    .build_swap_transaction(
+                        input,
+                        output,
+                        amount,
+                        slippage_bps,
+                        route_config.wrap_and_unwrap_sol,
+                    )
+                    .await?
+            }
+        };
+
+        if prepared.aggregator_used.is_none() {
+            prepared.aggregator_used = Some(*aggregator);
+        }
+
+        Ok(prepared)
+    }
+
+    /// Quote an exact-in swap directly with a specific aggregator and return only its output.
+    async fn quote_out_amount_direct(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        aggregator: &Aggregator,
+        route_config: &RouteConfig,
+    ) -> Result<u64> {
+        let quote_result = match aggregator {
+            Aggregator::Jupiter => {
+                let jupiter = JupiterAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                jupiter.quote(input, output, amount, slippage_bps).await?
+            }
+            Aggregator::Titan => {
+                let titan = self.get_titan_aggregator().await?;
+                titan.quote(input, output, amount, slippage_bps).await?
+            }
+            Aggregator::Dflow => {
+                let dflow = DflowAggregator::new_with_compute_price(
+                    &self.config,
+                    Arc::clone(&self.signer),
+                    route_config.compute_unit_price_micro_lamports,
+                )?;
+                dflow.quote(input, output, amount, slippage_bps).await?
+            }
+        };
+
+        Ok(quote_result.out_amount)
+    }
+
+    /// Quote an exact-in swap using the provided route configuration and return only its output.
+    async fn quote_out_amount_with_route_config(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        route_config: &RouteConfig,
+    ) -> Result<u64> {
+        let slippage_bps = route_config
+            .slippage_bps
+            .unwrap_or(self.config.shared.slippage_bps);
+
+        match &route_config.routing_strategy {
+            Some(RoutingStrategy::BestPrice) | None => {
+                self.quote_out_amount_best_price(input, output, amount, slippage_bps, route_config)
+                    .await
+            }
+            Some(RoutingStrategy::PreferredAggregator { aggregator }) => {
+                self.quote_out_amount_direct(
+                    input,
+                    output,
+                    amount,
+                    slippage_bps,
+                    aggregator,
+                    route_config,
+                )
+                .await
+            }
+            Some(RoutingStrategy::LowestSlippageClimber {
+                floor_slippage_bps,
+                max_slippage_bps,
+                step_bps,
+            }) => {
+                let mut current_slippage = *floor_slippage_bps;
+                let mut last_error = None;
+                while current_slippage <= *max_slippage_bps {
+                    match self
+                        .quote_out_amount_best_price(
+                            input,
+                            output,
+                            amount,
+                            current_slippage,
+                            route_config,
+                        )
+                        .await
+                    {
+                        Ok(out_amount) => return Ok(out_amount),
+                        Err(e) => {
+                            last_error = Some(e);
+                            current_slippage += *step_bps;
+                        }
+                    }
+                }
+                Err(last_error
+                    .unwrap_or_else(|| anyhow!("Failed to quote swap with any slippage level")))
+            }
+        }
+    }
+
+    /// Build a signed transaction using the lowest slippage climber strategy.
+    async fn build_swap_transaction_lowest_slippage_climber(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        floor_slippage_bps: u16,
+        max_slippage_bps: u16,
+        step_bps: u16,
+        route_config: &RouteConfig,
+    ) -> Result<SwapTransaction> {
+        let mut current_slippage = floor_slippage_bps;
+        let mut last_error = None;
+        let mut attempt_count = 0;
+
+        while current_slippage <= max_slippage_bps {
+            attempt_count += 1;
+            match self
+                .build_swap_transaction_best_price(
+                    input,
+                    output,
+                    amount,
+                    current_slippage,
+                    route_config,
+                )
+                .await
+            {
+                Ok(mut prepared) => {
+                    if prepared.slippage_bps_used.is_none() {
+                        prepared.slippage_bps_used = Some(current_slippage);
+                    }
+                    return Ok(prepared);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    current_slippage += step_bps;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!(
+                "Failed to build swap transaction with any slippage level (tried {} attempts)",
+                attempt_count
+            )
+        }))
     }
 
     /// Execute swap using lowest slippage climber strategy
@@ -565,6 +916,126 @@ impl DexSuperAggClient {
             swap_result: executed_summary.swap_result,
             quote_results,
         })
+    }
+
+    /// Build a signed transaction using best price routing.
+    async fn build_swap_transaction_best_price(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        route_config: &RouteConfig,
+    ) -> Result<SwapTransaction> {
+        let mut comparison_results = Vec::new();
+
+        if let Ok(jupiter) = JupiterAggregator::new_with_compute_price(
+            &self.config,
+            Arc::clone(&self.signer),
+            route_config.compute_unit_price_micro_lamports,
+        ) {
+            if let Ok(quote_result) = jupiter.quote(input, output, amount, slippage_bps).await {
+                comparison_results.push((Aggregator::Jupiter, quote_result.out_amount));
+            }
+        }
+
+        if self.config.is_titan_configured() {
+            if let Ok(titan) = self.get_titan_aggregator().await {
+                if let Ok(quote_result) = titan.quote(input, output, amount, slippage_bps).await {
+                    comparison_results.push((Aggregator::Titan, quote_result.out_amount));
+                }
+            }
+        }
+
+        if self.config.is_dflow_configured() {
+            if let Ok(dflow) = DflowAggregator::new_with_compute_price(
+                &self.config,
+                Arc::clone(&self.signer),
+                route_config.compute_unit_price_micro_lamports,
+            ) {
+                if let Ok(quote_result) = dflow.quote(input, output, amount, slippage_bps).await {
+                    comparison_results.push((Aggregator::Dflow, quote_result.out_amount));
+                }
+            }
+        }
+
+        if comparison_results.is_empty() {
+            return Err(anyhow!("No aggregators available for swap transaction"));
+        }
+
+        let (best_aggregator, best_out_amount) = comparison_results
+            .iter()
+            .max_by_key(|(_, out_amount)| out_amount)
+            .ok_or_else(|| anyhow!("Failed to determine best aggregator"))?;
+
+        let best_name = match best_aggregator {
+            Aggregator::Jupiter => "Jupiter",
+            Aggregator::Titan => "Titan",
+            Aggregator::Dflow => "DFlow",
+        };
+        tracing::info!(
+            aggregator = best_name,
+            output_amount = best_out_amount,
+            "Selected aggregator for prepared swap transaction"
+        );
+
+        self.build_swap_transaction_direct(
+            input,
+            output,
+            amount,
+            slippage_bps,
+            best_aggregator,
+            route_config,
+        )
+        .await
+    }
+
+    /// Quote an exact-in swap using best price routing and return only its output amount.
+    async fn quote_out_amount_best_price(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        route_config: &RouteConfig,
+    ) -> Result<u64> {
+        let mut comparison_results = Vec::new();
+
+        if let Ok(jupiter) = JupiterAggregator::new_with_compute_price(
+            &self.config,
+            Arc::clone(&self.signer),
+            route_config.compute_unit_price_micro_lamports,
+        ) {
+            if let Ok(quote_result) = jupiter.quote(input, output, amount, slippage_bps).await {
+                comparison_results.push((Aggregator::Jupiter, quote_result.out_amount));
+            }
+        }
+
+        if self.config.is_titan_configured() {
+            if let Ok(titan) = self.get_titan_aggregator().await {
+                if let Ok(quote_result) = titan.quote(input, output, amount, slippage_bps).await {
+                    comparison_results.push((Aggregator::Titan, quote_result.out_amount));
+                }
+            }
+        }
+
+        if self.config.is_dflow_configured() {
+            if let Ok(dflow) = DflowAggregator::new_with_compute_price(
+                &self.config,
+                Arc::clone(&self.signer),
+                route_config.compute_unit_price_micro_lamports,
+            ) {
+                if let Ok(quote_result) = dflow.quote(input, output, amount, slippage_bps).await {
+                    comparison_results.push((Aggregator::Dflow, quote_result.out_amount));
+                }
+            }
+        }
+
+        comparison_results
+            .iter()
+            .max_by_key(|(_, out_amount)| out_amount)
+            .map(|(_, out_amount)| *out_amount)
+            .ok_or_else(|| anyhow!("No aggregators available for swap quote"))
     }
 }
 

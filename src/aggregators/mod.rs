@@ -7,6 +7,7 @@ use crate::config::Aggregator;
 use anyhow::Result;
 use async_trait::async_trait;
 use solana_commitment_config::CommitmentLevel;
+use solana_sdk::transaction::VersionedTransaction;
 use std::time::Duration;
 
 /// Result of a swap operation
@@ -60,12 +61,42 @@ pub struct SwapSummary {
     pub quote_results: Vec<(Aggregator, QuoteResult)>,
 }
 
+/// A signed swap transaction prepared by an aggregator but not yet submitted.
+#[derive(Debug, Clone)]
+pub struct SwapTransaction {
+    /// Signed transaction ready to submit, bundle, or simulate.
+    pub transaction: VersionedTransaction,
+    /// Input amount used to build this exact-in transaction.
+    pub in_amount: u64,
+    /// Expected output amount from the quote used to build this transaction.
+    pub out_amount: u64,
+    /// Slippage tolerance used in basis points.
+    pub slippage_bps_used: Option<u16>,
+    /// Aggregator used to build this transaction.
+    pub aggregator_used: Option<Aggregator>,
+    /// Quote result used to build this transaction.
+    pub quote_result: QuoteResult,
+}
+
 /// Trait that all DEX aggregators must implement
 ///
 /// This trait provides a unified interface for interacting with different DEX aggregators,
 /// allowing routing strategies to work with any aggregator implementation.
 #[async_trait]
 pub trait DexAggregator: Send + Sync {
+    /// Build a signed swap transaction without submitting it.
+    ///
+    /// This is useful when the caller needs to put the swap into a larger transaction plan or
+    /// bundle and handle submission externally.
+    async fn build_swap_transaction(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        wrap_and_unwrap_sol: bool,
+    ) -> Result<SwapTransaction>;
+
     /// Execute a swap transaction
     ///
     /// # Arguments

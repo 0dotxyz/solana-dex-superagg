@@ -7,7 +7,9 @@ mod codec;
 mod transaction_builder;
 mod types;
 
-use crate::aggregators::{DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary};
+use crate::aggregators::{
+    DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary, SwapTransaction,
+};
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, Result};
 use solana_client::{
@@ -131,17 +133,14 @@ impl TitanAggregator {
 
 #[async_trait::async_trait]
 impl DexAggregator for TitanAggregator {
-    async fn swap(
+    async fn build_swap_transaction(
         &self,
         input: &str,
         output: &str,
         amount: u64,
         slippage_bps: u16,
-        commitment_level: CommitmentLevel,
         _wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapSummary> {
-        let start_time = Instant::now();
-
+    ) -> Result<SwapTransaction> {
         let user_pubkey = self.signer.as_ref().pubkey().to_string();
 
         // Request swap quotes with slippage
@@ -198,6 +197,30 @@ impl DexAggregator for TitanAggregator {
         let signature = self.signer.as_ref().sign_message(&message);
         transaction.signatures[0] = signature;
 
+        Ok(SwapTransaction {
+            transaction,
+            in_amount: amount,
+            out_amount: route.out_amount,
+            slippage_bps_used: Some(slippage_bps),
+            aggregator_used: Some(Aggregator::Titan),
+            quote_result,
+        })
+    }
+
+    async fn swap(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        commitment_level: CommitmentLevel,
+        _wrap_and_unwrap_sol: bool,
+    ) -> Result<SwapSummary> {
+        let start_time = Instant::now();
+        let prepared = self
+            .build_swap_transaction(input, output, amount, slippage_bps, _wrap_and_unwrap_sol)
+            .await?;
+
         // Send transaction with specified commitment level
         let commitment_config = CommitmentConfig {
             commitment: commitment_level,
@@ -205,7 +228,7 @@ impl DexAggregator for TitanAggregator {
         let tx_signature = self
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
-                &transaction,
+                &prepared.transaction,
                 commitment_config,
                 RpcSendTransactionConfig {
                     skip_preflight: false,
@@ -219,15 +242,15 @@ impl DexAggregator for TitanAggregator {
 
         let swap_result = SwapResult {
             signature: tx_signature.to_string(),
-            out_amount: route.out_amount,
-            slippage_bps_used: Some(slippage_bps),
-            aggregator_used: Some(Aggregator::Titan),
+            out_amount: prepared.out_amount,
+            slippage_bps_used: prepared.slippage_bps_used,
+            aggregator_used: prepared.aggregator_used,
             execution_time: Some(execution_time),
         };
 
         Ok(SwapSummary {
             swap_result,
-            quote_results: vec![(Aggregator::Titan, quote_result)],
+            quote_results: vec![(Aggregator::Titan, prepared.quote_result)],
         })
     }
 

@@ -1,4 +1,6 @@
-use crate::aggregators::{DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary};
+use crate::aggregators::{
+    DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary, SwapTransaction,
+};
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -286,7 +288,10 @@ impl DflowAggregator {
     }
 
     /// Build a swap transaction from DFlow API
-    async fn build_swap_transaction(&self, quote: QuoteResponse) -> Result<VersionedTransaction> {
+    async fn build_transaction_from_quote(
+        &self,
+        quote: QuoteResponse,
+    ) -> Result<VersionedTransaction> {
         let url = format!("{}/swap", self.api_url);
 
         // Convert QuoteResponse to QuoteResponseForSwap (priceImpactPct as string)
@@ -362,17 +367,14 @@ impl DflowAggregator {
 
 #[async_trait]
 impl DexAggregator for DflowAggregator {
-    async fn swap(
+    async fn build_swap_transaction(
         &self,
         input: &str,
         output: &str,
         amount: u64,
         slippage_bps: u16,
-        commitment_level: CommitmentLevel,
         _wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapSummary> {
-        let start = Instant::now();
-
+    ) -> Result<SwapTransaction> {
         // Validate inputs
         let input_mint = solana_sdk::pubkey::Pubkey::from_str(input)
             .map_err(|e| anyhow!("Invalid input mint: {}", e))?;
@@ -388,7 +390,7 @@ impl DexAggregator for DflowAggregator {
         let quote = self.get_quote(input, output, amount, slippage_bps).await?;
         let quote_time = quote_start.elapsed();
 
-        // Parse output amountfrom
+        // Parse output amount
         let out_amount: u64 = quote
             .out_amount
             .parse()
@@ -410,18 +412,42 @@ impl DexAggregator for DflowAggregator {
         };
 
         // Build transaction
-        let mut transaction = self.build_swap_transaction(quote).await?;
+        let transaction = self.build_transaction_from_quote(quote).await?;
 
         // Sign transaction with user's keypair
-        // DFlow returns unsigned transaction, so we need to sign it
-        transaction = VersionedTransaction::try_new(transaction.message, &[self.signer.as_ref()])
-            .map_err(|e| anyhow!("Failed to sign transaction: {}", e))?;
+        let transaction =
+            VersionedTransaction::try_new(transaction.message, &[self.signer.as_ref()])
+                .map_err(|e| anyhow!("Failed to sign transaction: {}", e))?;
+
+        Ok(SwapTransaction {
+            transaction,
+            in_amount: amount,
+            out_amount,
+            slippage_bps_used: Some(slippage_bps),
+            aggregator_used: Some(Aggregator::Dflow),
+            quote_result,
+        })
+    }
+
+    async fn swap(
+        &self,
+        input: &str,
+        output: &str,
+        amount: u64,
+        slippage_bps: u16,
+        commitment_level: CommitmentLevel,
+        _wrap_and_unwrap_sol: bool,
+    ) -> Result<SwapSummary> {
+        let start = Instant::now();
+        let prepared = self
+            .build_swap_transaction(input, output, amount, slippage_bps, _wrap_and_unwrap_sol)
+            .await?;
 
         // Submit transaction
         let sig = self
             .rpc_client
             .send_and_confirm_transaction_with_spinner_and_config(
-                &transaction,
+                &prepared.transaction,
                 CommitmentConfig {
                     commitment: commitment_level,
                 },
@@ -437,15 +463,15 @@ impl DexAggregator for DflowAggregator {
 
         let swap_result = SwapResult {
             signature: sig.to_string(),
-            out_amount,
-            slippage_bps_used: Some(slippage_bps),
-            aggregator_used: Some(Aggregator::Dflow),
+            out_amount: prepared.out_amount,
+            slippage_bps_used: prepared.slippage_bps_used,
+            aggregator_used: prepared.aggregator_used,
             execution_time: Some(execution_time),
         };
 
         Ok(SwapSummary {
             swap_result,
-            quote_results: vec![(Aggregator::Dflow, quote_result)],
+            quote_results: vec![(Aggregator::Dflow, prepared.quote_result)],
         })
     }
 
