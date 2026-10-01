@@ -1,14 +1,24 @@
 //! DEX Aggregator trait and implementations
 //!
-//! This module provides a trait-based interface for DEX aggregators (Jupiter, Titan, etc.)
-//! and their implementations.
+//! Every venue works in two phases: [`DexAggregator::quote`] fetches an executable quote, and
+//! [`DexAggregator::build_transaction`] turns *that same quote* into a signed transaction. Keeping
+//! the quote around means the venue chosen on price is exactly the route that gets built — there is
+//! no second, possibly different, quote between comparison and build.
 
 use crate::config::Aggregator;
 use anyhow::Result;
 use async_trait::async_trait;
-use solana_commitment_config::CommitmentLevel;
-use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 use std::time::Duration;
+
+pub mod dflow;
+pub mod jupiter;
+pub(crate) mod sol;
+pub mod titan;
+
+pub use dflow::DflowAggregator;
+pub use jupiter::JupiterAggregator;
+pub use titan::TitanAggregator;
 
 /// Result of a swap operation
 #[derive(Debug, Clone)]
@@ -20,8 +30,7 @@ pub struct SwapResult {
     /// Slippage tolerance actually used in basis points (e.g., 25 = 0.25%)
     /// This is particularly useful for LowestSlippageClimber strategy to know which slippage level succeeded
     pub slippage_bps_used: Option<u16>,
-    /// Aggregator that was used for this swap (Jupiter or Titan)
-    /// This is particularly useful for BestPrice and LowestSlippageClimber strategies to see which aggregator was selected
+    /// Aggregator that was used for this swap
     pub aggregator_used: Option<Aggregator>,
     /// Time taken to execute the swap
     pub execution_time: Option<Duration>,
@@ -32,7 +41,7 @@ pub struct SwapResult {
 pub struct QuoteResult {
     /// Expected output amount (in lamports/base units)
     pub out_amount: u64,
-    /// Price impact as a percentage (e.g., 0.5 = 0.5% impact)
+    /// Price impact as a percentage (e.g., 0.5 = 0.5% impact); 0 when the venue doesn't report it
     pub price_impact: f64,
     /// Other quote metadata (can be extended with more fields)
     pub metadata: QuoteMetadata,
@@ -56,8 +65,7 @@ pub struct QuoteMetadata {
 pub struct SwapSummary {
     /// The swap result (always present when a swap was executed)
     pub swap_result: SwapResult,
-    /// Quote results that were performed, keyed by aggregator
-    /// This allows capturing quotes for all aggregators (e.g., in BestPrice strategy)
+    /// Every quote gathered for the executed attempt, keyed by aggregator
     pub quote_results: Vec<(Aggregator, QuoteResult)>,
 }
 
@@ -78,70 +86,56 @@ pub struct SwapTransaction {
     pub quote_result: QuoteResult,
 }
 
-/// Trait that all DEX aggregators must implement
-///
-/// This trait provides a unified interface for interacting with different DEX aggregators,
-/// allowing routing strategies to work with any aggregator implementation.
-#[async_trait]
-pub trait DexAggregator: Send + Sync {
-    /// Build a signed swap transaction without submitting it.
+/// One exact-in swap, as quoted and built by every venue.
+#[derive(Debug, Clone)]
+pub struct SwapRequest {
+    pub input_mint: Pubkey,
+    pub output_mint: Pubkey,
+    /// Exact input amount in base units.
+    pub amount: u64,
+    pub slippage_bps: u16,
+    /// SOL handling, identical on every venue:
     ///
-    /// This is useful when the caller needs to put the swap into a larger transaction plan or
-    /// bundle and handle submission externally.
-    async fn build_swap_transaction(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapTransaction>;
-
-    /// Execute a swap transaction
-    ///
-    /// # Arguments
-    /// * `input` - Input token mint address (as string)
-    /// * `output` - Output token mint address (as string)
-    /// * `amount` - Input amount in lamports/base units
-    /// * `slippage_bps` - Slippage tolerance in basis points (e.g., 25 = 0.25%)
-    /// * `commitment_level` - Commitment level for transaction confirmation
-    /// * `wrap_and_unwrap_sol` - Whether to wrap and unwrap SOL in the swap
-    ///
-    /// # Returns
-    /// `SwapSummary` containing the swap result and (at minimum) the quote used by the aggregator
-    async fn swap(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        commitment_level: CommitmentLevel,
-        wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapSummary>;
-
-    /// Quote a swap to get quote information without executing
-    ///
-    /// # Arguments
-    /// * `input` - Input token mint address (as string)
-    /// * `output` - Output token mint address (as string)
-    /// * `amount` - Input amount in lamports/base units
-    /// * `slippage_bps` - Slippage tolerance in basis points (e.g., 25 = 0.25%)
-    ///
-    /// # Returns
-    /// `QuoteResult` containing expected output amount, price impact, and metadata
-    async fn quote(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<QuoteResult>;
+    /// * `false` — wSOL is an ordinary SPL token: a wSOL input is spent from the wallet's wSOL ATA
+    ///   (which must already exist), a wSOL output is left in it, and the ATA is never closed.
+    /// * `true` — native SOL: a SOL input is wrapped from the wallet's lamports, a SOL output is
+    ///   unwrapped to lamports, and the wSOL ATA is closed afterwards (which also unwraps any wSOL
+    ///   that was already sitting in it).
+    pub wrap_and_unwrap_sol: bool,
+    /// Priority fee price; 0 leaves the venue's default.
+    pub compute_unit_price_micro_lamports: u64,
 }
 
-pub mod dflow;
-pub mod jupiter;
-pub mod titan;
+/// An executable quote from one venue, kept so the same route can be built later.
+#[derive(Debug)]
+pub struct Quote {
+    pub aggregator: Aggregator,
+    pub out_amount: u64,
+    pub result: QuoteResult,
+    pub(crate) payload: QuotePayload,
+}
 
-pub use dflow::DflowAggregator;
-pub use jupiter::JupiterAggregator;
-pub use titan::TitanAggregator;
+/// The venue-specific data needed to build a transaction from a quote.
+#[derive(Debug)]
+pub(crate) enum QuotePayload {
+    Jupiter(Box<jupiter_swap_api_client::quote::QuoteResponse>),
+    Titan(Box<titan::SwapRoute>),
+    Dflow(Box<dflow::DflowQuote>),
+}
+
+/// A DEX aggregator venue.
+#[async_trait]
+pub trait DexAggregator: Send + Sync {
+    /// Which venue this is.
+    fn kind(&self) -> Aggregator;
+
+    /// Fetch an executable exact-in quote for `request`.
+    async fn quote(&self, request: &SwapRequest) -> Result<Quote>;
+
+    /// Build and sign a transaction executing `quote`, which this venue produced for `request`.
+    async fn build_transaction(
+        &self,
+        request: &SwapRequest,
+        quote: &Quote,
+    ) -> Result<VersionedTransaction>;
+}

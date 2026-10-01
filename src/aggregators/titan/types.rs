@@ -117,6 +117,10 @@ pub struct TransactionParams {
     pub fee_from_input_mint: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_account: Option<Pubkey>,
+    /// Leave a wSOL output as wSOL instead of unwrapping it to native SOL (Titan unwraps by
+    /// default). Only has an effect when the output mint is wSOL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_wsol: Option<bool>,
 }
 
 /// Quote update parameters for streaming

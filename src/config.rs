@@ -164,7 +164,7 @@ where
 }
 
 /// Shared configuration used by both Jupiter and Titan
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SharedConfig {
     /// Solana RPC endpoint URL
@@ -188,6 +188,13 @@ pub struct SharedConfig {
     /// - Finalized: Slowest (~15s), cannot be rolled back
     #[serde(default, deserialize_with = "deserialize_commitment_level")]
     pub commitment_level: CommitmentLevel,
+    /// Deadline for one venue's quote, in milliseconds. Venues are quoted in parallel; one that
+    /// misses the deadline is left out of the comparison instead of stalling it.
+    pub quote_timeout_ms: u64,
+    /// Deadline for building one venue's transaction from its quote, in milliseconds.
+    pub build_timeout_ms: u64,
+    /// How long `swap` waits for its transaction to reach the commitment level, in seconds.
+    pub confirm_timeout_secs: u64,
 }
 
 impl Default for SharedConfig {
@@ -200,12 +207,15 @@ impl Default for SharedConfig {
             routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
             retry_tx_landing: 3, // Default to 3 retries for transaction landing
             commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed for good balance
+            quote_timeout_ms: 5_000,
+            build_timeout_ms: 10_000,
+            confirm_timeout_secs: 90,
         }
     }
 }
 
 /// Jupiter-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JupiterConfig {
     /// Jupiter Swap API URL
@@ -232,7 +242,7 @@ impl Default for JupiterConfig {
 }
 
 /// Titan-specific configuration
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TitanConfig {
     /// Titan WebSocket endpoint (e.g., "us1.api.demo.titan.exchange")
@@ -242,7 +252,7 @@ pub struct TitanConfig {
 }
 
 /// DFlow-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DflowConfig {
     /// DFlow API URL (e.g., "https://d.quote-api.dflow.net")
@@ -258,6 +268,75 @@ impl Default for DflowConfig {
             api_url: "https://d.quote-api.dflow.net".to_string(),
             api_key: None,
         }
+    }
+}
+
+/// `Debug` output for credentials: whether one is set, never its value.
+fn redacted<T>(value: &Option<T>) -> &'static str {
+    if value.is_some() {
+        "<redacted>"
+    } else {
+        "<unset>"
+    }
+}
+
+/// An endpoint reduced to scheme and host: RPC URLs commonly embed an API token.
+fn redact_url(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = rest[..host_end].rsplit('@').next().unwrap_or_default();
+    let suffix = if host_end < rest.len() { "/…" } else { "" };
+    if scheme.is_empty() {
+        format!("{host}{suffix}")
+    } else {
+        format!("{scheme}://{host}{suffix}")
+    }
+}
+
+impl std::fmt::Debug for SharedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedConfig")
+            .field("rpc_url", &redact_url(&self.rpc_url))
+            .field("slippage_bps", &self.slippage_bps)
+            .field("wallet_keypair", &redacted(&self.wallet_keypair))
+            .field(
+                "compute_unit_price_micro_lamports",
+                &self.compute_unit_price_micro_lamports,
+            )
+            .field("routing_strategy", &self.routing_strategy)
+            .field("retry_tx_landing", &self.retry_tx_landing)
+            .field("commitment_level", &self.commitment_level)
+            .field("quote_timeout_ms", &self.quote_timeout_ms)
+            .field("build_timeout_ms", &self.build_timeout_ms)
+            .field("confirm_timeout_secs", &self.confirm_timeout_secs)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for JupiterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JupiterConfig")
+            .field("jup_swap_api_url", &self.jup_swap_api_url)
+            .field("api_key", &redacted(&self.api_key))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for TitanConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TitanConfig")
+            .field("titan_ws_endpoint", &self.titan_ws_endpoint)
+            .field("titan_api_key", &redacted(&self.titan_api_key))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DflowConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DflowConfig")
+            .field("api_url", &self.api_url)
+            .field("api_key", &redacted(&self.api_key))
+            .finish()
     }
 }
 
@@ -350,6 +429,16 @@ impl ClientConfig {
             .extract()?;
 
         Ok(config)
+    }
+
+    /// Check if Jupiter is configured (it needs an API key)
+    pub fn is_jupiter_configured(&self) -> bool {
+        !self.jupiter.jup_swap_api_url.is_empty()
+            && self
+                .jupiter
+                .api_key
+                .as_ref()
+                .is_some_and(|key| !key.is_empty())
     }
 
     /// Check if Titan is configured
@@ -718,6 +807,45 @@ impl ClientConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_output_redacts_credentials() {
+        let config = ClientConfig {
+            shared: SharedConfig {
+                rpc_url: "https://rpc.example.com/secret-rpc-token".to_string(),
+                wallet_keypair: Some("[1,2,3]".to_string()),
+                ..Default::default()
+            },
+            jupiter: JupiterConfig {
+                api_key: Some("secret-jup".to_string()),
+                ..Default::default()
+            },
+            titan: Some(TitanConfig {
+                titan_ws_endpoint: "us1.api.titan.exchange".to_string(),
+                titan_api_key: Some("secret-titan".to_string()),
+            }),
+            dflow: Some(DflowConfig {
+                api_key: Some("secret-dflow".to_string()),
+                ..Default::default()
+            }),
+        };
+        let printed = format!("{:?}", config);
+        for secret in [
+            "secret-rpc-token",
+            "[1,2,3]",
+            "secret-jup",
+            "secret-titan",
+            "secret-dflow",
+        ] {
+            assert!(
+                !printed.contains(secret),
+                "{} leaked in {}",
+                secret,
+                printed
+            );
+        }
+        assert!(printed.contains("https://rpc.example.com/…"));
+    }
+
     use super::*;
     use solana_sdk::signature::Signer;
 

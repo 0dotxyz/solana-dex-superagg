@@ -75,15 +75,20 @@ cargo run --example basic_swap
 ### Core Components
 
 1. **DexSuperAggClient** (`src/client.rs`)
-   - Main entry point for users
-   - Manages aggregator connections and routing logic
-   - Lazily initializes and reuses Titan WebSocket connection to avoid reconnection overhead
-   - Implements three routing strategies: BestPrice, PreferredAggregator, LowestSlippageClimber
+   - Main entry point for users; owns one instance of each configured venue
+   - Quotes all venues of a strategy in parallel (`collect_quotes`, per-venue `quote_timeout_ms`),
+     logs failures, sorts by output, then `build_best` builds the best quote (falling back to the
+     next best on a build failure, under `build_timeout_ms`)
+   - Min-out swaps raise the input by the shortfall ratio and re-quote, capped by the caller's
+     `max_in_amount` (default 1.10x the initial amount)
+   - `swap*` submits with the nonblocking RPC client and polls for the commitment level,
+     rebroadcasting while the blockhash is valid
 
 2. **DexAggregator Trait** (`src/aggregators/mod.rs`)
-   - Unified interface for all DEX aggregators
-   - Two main operations: `swap()` and `quote()`
-   - Implemented by `JupiterAggregator` and `TitanAggregator`
+   - Two phases: `quote(&SwapRequest) -> Quote` and `build_transaction(&SwapRequest, &Quote)`;
+     a `Quote` carries the venue payload so the compared quote is exactly what gets built
+   - `SwapRequest::wrap_and_unwrap_sol` has one meaning on every venue (see its doc comment)
+   - Implemented by `JupiterAggregator`, `TitanAggregator`, `DflowAggregator`
 
 3. **Configuration System** (`src/config.rs`)
    - Uses `figment` for flexible config loading from environment variables
@@ -92,8 +97,12 @@ cargo run --example basic_swap
    - Includes async validation methods that test actual connectivity to RPC/API endpoints
 
 4. **Aggregator Implementations**
-   - **Jupiter** (`src/aggregators/jupiter/mod.rs`): HTTP-based API client using `jupiter-swap-api-client`
-   - **Titan** (`src/aggregators/titan/`): WebSocket-based client with custom MessagePack codec
+   - **Jupiter** (`src/aggregators/jupiter/mod.rs`): HTTP via `jupiter-swap-api-client`;
+     `dynamicComputeUnitLimit` on, simulation errors rejected
+   - **Titan** (`src/aggregators/titan/`): WebSocket + MessagePack. Routes come back as bare
+     instructions; we add the compute budget and native-SOL wrap (`sol.rs`) and compile the tx
+   - **DFlow** (`src/aggregators/dflow/mod.rs`): HTTP; passes `wrapAndUnwrapSol` and
+     `computeUnitPriceMicroLamports`
 
 ### Routing Strategies
 
@@ -117,9 +126,13 @@ The library supports three distinct routing strategies defined in `config.rs`:
 
 ### Key Design Patterns
 
-1. **Connection Reuse**: Titan WebSocket is initialized once and reused via `Arc<Mutex<Option<Arc<TitanAggregator>>>>` to avoid reconnection overhead
+1. **Titan connection**: one WebSocket shared by all callers, opened lazily. A reader task routes
+   server messages by request id / stream id, so concurrent quotes can't consume each other's
+   replies. Every request has a deadline; a dropped or timed-out connection is retired and replaced
+   on the next request, and a request that hits a dropped connection is retried once.
 
-2. **ATA Management**: The client can automatically create Associated Token Accounts before swaps via `RouteConfig.output_ata` (defaults to `Create`)
+2. **ATA Management**: `swap*` can create the output ATA first via `RouteConfig.output_ata`
+   (defaults to `Create`)
 
 3. **Commitment Levels**: Supports three Solana commitment levels with different speed/finality tradeoffs:
    - `Processed`: ~400ms, can be rolled back
@@ -136,10 +149,11 @@ The library supports three distinct routing strategies defined in `config.rs`:
 - Custom deserializer (`deserialize_wallet_keypair`) handles figment parsing JSON arrays from env vars
 
 ### Titan WebSocket
-- Uses persistent connection initialized in `get_titan_aggregator()`
-- Must call `client.close().await?` when done to clean up WebSocket
-- Custom MessagePack codec in `src/aggregators/titan/codec.rs` for binary framing
-- Transaction builder in `src/aggregators/titan/transaction_builder.rs` handles Titan-specific serialization
+- `TitanClient` (`src/aggregators/titan/client.rs`) owns the connection; see Key Design Patterns
+- Call `client.close().await?` when done to close the socket
+- `transaction_builder.rs` assembles compute budget + optional wrap + route instructions and fetches
+  lookup tables (a missing table is an error)
+- Routes delivered only as a prebuilt `transaction` (no instructions) are skipped
 
 ### Token Amounts
 - All amounts are in lamports/base units (not human-readable)
@@ -152,8 +166,11 @@ The library supports three distinct routing strategies defined in `config.rs`:
 
 ### Native SOL Handling
 - Native SOL mint: `So11111111111111111111111111111111111111112`
-- Does NOT create ATA for native SOL (uses native account balance)
-- See `create_ata_if_needed()` in `src/client.rs:115-195`
+- `wrap_and_unwrap_sol = false`: wSOL stays in the wallet's wSOL ATA, which is never closed (the ATA
+  must exist for a wSOL input). `true`: native SOL in/out; the wSOL ATA is closed afterwards.
+- Titan has no input-side flag, so for `true` with a SOL input we prepend `sol::wrap_sol_instructions`
+  and ask Titan to close the input account; `outputWsol` controls the output side.
+- `swap*` doesn't create an ATA for a native-SOL output
 
 ## File Organization
 
@@ -164,14 +181,16 @@ src/
 ├── config.rs                       # Configuration types and loading
 └── aggregators/
     ├── mod.rs                      # DexAggregator trait and shared types
+    ├── sol.rs                      # Compute-budget and SOL-wrap instruction helpers
     ├── jupiter/
     │   └── mod.rs                  # Jupiter HTTP client
+    ├── dflow/
+    │   └── mod.rs                  # DFlow HTTP client
     └── titan/
-        ├── mod.rs                  # Public Titan exports
-        ├── client.rs               # Titan WebSocket client
+        ├── mod.rs                  # Titan venue (quote params, build)
+        ├── client.rs               # Titan WebSocket client (routing, deadlines, reconnect)
         ├── types.rs                # Titan request/response types
-        ├── codec.rs                # MessagePack framing codec
-        └── transaction_builder.rs # Titan transaction serialization
+        └── transaction_builder.rs # Titan instruction assembly and lookup tables
 
 examples/
 └── basic_swap.rs                   # Comprehensive usage examples
@@ -182,8 +201,8 @@ tests/
 
 ## Dependencies
 
-- **solana-sdk** / **solana-client** / **solana-program**: v2.1.20 (pinned for compatibility)
-- **jupiter-swap-api-client**: From GitHub (rev: 6e209786084a4344538a1aa695f126169fa95022)
+- **solana-sdk** / **solana-program** 3.0 and **solana-client** 3.1 (pinned in Cargo.toml)
+- **jupiter-swap-api-client**: From GitHub (IliaZyrin fork, rev pinned in Cargo.toml)
 - **tokio-tungstenite**: For Titan WebSocket connection
 - **figment**: For flexible configuration loading
 - **rmp-serde**: MessagePack serialization for Titan

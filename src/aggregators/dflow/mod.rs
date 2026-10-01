@@ -1,25 +1,22 @@
 use crate::aggregators::{
-    DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary, SwapTransaction,
+    DexAggregator, Quote, QuoteMetadata, QuotePayload, QuoteResult, SwapRequest,
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use solana_client::rpc_client::RpcClient;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
 /// Quote response from DFlow API
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct QuoteResponse {
+pub(crate) struct DflowQuote {
     input_mint: String,
     output_mint: String,
     in_amount: String,
@@ -94,12 +91,12 @@ where
 /// Swap request body for DFlow API
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SwapRequest {
+struct SwapRequestBody {
     user_public_key: String,
+    wrap_and_unwrap_sol: bool,
+    dynamic_compute_unit_limit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dynamic_compute_unit_limit: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prioritization_fee_lamports: Option<u64>,
+    compute_unit_price_micro_lamports: Option<u64>,
     quote_response: QuoteResponseForSwap,
 }
 
@@ -155,12 +152,8 @@ struct SwapResponse {
 pub struct DflowAggregator {
     /// HTTP client for DFlow API
     http_client: reqwest::Client,
-    /// Solana RPC client
-    rpc_client: RpcClient,
     /// Wallet keypair for signing transactions
     signer: Arc<Keypair>,
-    /// Compute unit price in micro lamports
-    compute_unit_price_micro_lamports: u64,
     /// DFlow API URL
     api_url: String,
     /// Optional API key
@@ -170,52 +163,23 @@ pub struct DflowAggregator {
 impl DflowAggregator {
     /// Create a new DflowAggregator from ClientConfig
     pub fn new(config: &ClientConfig, signer: Arc<Keypair>) -> Result<Self> {
-        Self::new_with_compute_price(
-            config,
-            signer,
-            config.shared.compute_unit_price_micro_lamports,
-        )
-    }
-
-    /// Create a new DflowAggregator with custom compute unit price
-    pub fn new_with_compute_price(
-        config: &ClientConfig,
-        signer: Arc<Keypair>,
-        compute_unit_price_micro_lamports: u64,
-    ) -> Result<Self> {
         let dflow_config = config
             .dflow
             .as_ref()
             .ok_or_else(|| anyhow!("DFlow configuration not found"))?;
-
-        let rpc_client =
-            RpcClient::new_with_commitment(&config.shared.rpc_url, CommitmentConfig::confirmed());
-
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
-
-        Ok(Self {
-            http_client,
-            rpc_client,
+        Self::with_config(
+            dflow_config.api_url.clone(),
             signer,
-            compute_unit_price_micro_lamports,
-            api_url: dflow_config.api_url.clone(),
-            api_key: dflow_config.api_key.clone(),
-        })
+            dflow_config.api_key.clone(),
+        )
     }
 
     /// Create a DflowAggregator with direct configuration
     pub fn with_config(
         api_url: String,
-        rpc_url: String,
         signer: Arc<Keypair>,
-        compute_unit_price_micro_lamports: u64,
         api_key: Option<String>,
     ) -> Result<Self> {
-        let rpc_client = RpcClient::new_with_commitment(&rpc_url, CommitmentConfig::confirmed());
-
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -223,37 +187,27 @@ impl DflowAggregator {
 
         Ok(Self {
             http_client,
-            rpc_client,
             signer,
-            compute_unit_price_micro_lamports,
             api_url,
             api_key,
         })
     }
 
     /// Get a quote from DFlow API
-    async fn get_quote(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<QuoteResponse> {
+    async fn get_quote(&self, request: &SwapRequest) -> Result<DflowQuote> {
         let url = format!("{}/quote", self.api_url);
 
-        let mut request = self.http_client.get(&url).query(&[
-            ("inputMint", input),
-            ("outputMint", output),
-            ("amount", &amount.to_string()),
-            ("slippageBps", &slippage_bps.to_string()),
+        let mut http_request = self.http_client.get(&url).query(&[
+            ("inputMint", request.input_mint.to_string()),
+            ("outputMint", request.output_mint.to_string()),
+            ("amount", request.amount.to_string()),
+            ("slippageBps", request.slippage_bps.to_string()),
         ]);
-
-        // Add API key if configured
         if let Some(ref api_key) = self.api_key {
-            request = request.header("x-api-key", api_key);
+            http_request = http_request.header("x-api-key", api_key);
         }
 
-        let response = request
+        let response = http_request
             .send()
             .await
             .map_err(|e| anyhow!("DFlow quote request failed: {}", e))?;
@@ -271,14 +225,12 @@ impl DflowAggregator {
             ));
         }
 
-        // Get response body as text first to help debug parsing errors
+        // Read the body as text first so parse errors can include it
         let response_text = response
             .text()
             .await
             .map_err(|e| anyhow!("Failed to read DFlow response body: {}", e))?;
-
-        // Try to parse as JSON
-        serde_json::from_str::<QuoteResponse>(&response_text).map_err(|e| {
+        serde_json::from_str::<DflowQuote>(&response_text).map_err(|e| {
             anyhow!(
                 "Failed to parse DFlow quote response: {}. Response body: {}",
                 e,
@@ -290,11 +242,12 @@ impl DflowAggregator {
     /// Build a swap transaction from DFlow API
     async fn build_transaction_from_quote(
         &self,
-        quote: QuoteResponse,
+        request: &SwapRequest,
+        quote: DflowQuote,
     ) -> Result<VersionedTransaction> {
         let url = format!("{}/swap", self.api_url);
 
-        // Convert QuoteResponse to QuoteResponseForSwap (priceImpactPct as string)
+        // Convert DflowQuote to QuoteResponseForSwap (priceImpactPct as string)
         let quote_for_swap = QuoteResponseForSwap {
             input_mint: quote.input_mint,
             output_mint: quote.output_mint,
@@ -313,25 +266,24 @@ impl DflowAggregator {
             for_jito_bundle: quote.for_jito_bundle,
         };
 
-        let swap_request = SwapRequest {
+        let body = SwapRequestBody {
             user_public_key: self.signer.pubkey().to_string(),
-            dynamic_compute_unit_limit: None, // Use DFlow's defaults
-            prioritization_fee_lamports: if self.compute_unit_price_micro_lamports > 0 {
-                Some(self.compute_unit_price_micro_lamports)
-            } else {
-                None
-            },
+            wrap_and_unwrap_sol: request.wrap_and_unwrap_sol,
+            // DFlow simulates and sizes the CU limit, so the priority fee isn't paid on the default.
+            dynamic_compute_unit_limit: true,
+            // A per-CU price, not a total fee: DFlow's `prioritizationFeeLamports` is a different
+            // unit and is left to its default when no price is configured.
+            compute_unit_price_micro_lamports: (request.compute_unit_price_micro_lamports > 0)
+                .then_some(request.compute_unit_price_micro_lamports),
             quote_response: quote_for_swap,
         };
 
-        let mut request = self.http_client.post(&url).json(&swap_request);
-
-        // Add API key if configured
+        let mut http_request = self.http_client.post(&url).json(&body);
         if let Some(ref api_key) = self.api_key {
-            request = request.header("x-api-key", api_key);
+            http_request = http_request.header("x-api-key", api_key);
         }
 
-        let response = request
+        let response = http_request
             .send()
             .await
             .map_err(|e| anyhow!("DFlow swap request failed: {}", e))?;
@@ -354,12 +306,9 @@ impl DflowAggregator {
             .await
             .map_err(|e| anyhow!("Failed to parse DFlow swap response: {}", e))?;
 
-        // Decode base64-encoded transaction
         let tx_bytes = STANDARD
             .decode(&swap_response.swap_transaction)
             .map_err(|e| anyhow!("Failed to decode swap transaction: {}", e))?;
-
-        // Deserialize into VersionedTransaction
         bincode::deserialize::<VersionedTransaction>(&tx_bytes)
             .map_err(|e| anyhow!("Failed to deserialize transaction: {}", e))
     }
@@ -367,36 +316,23 @@ impl DflowAggregator {
 
 #[async_trait]
 impl DexAggregator for DflowAggregator {
-    async fn build_swap_transaction(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        _wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapTransaction> {
-        // Validate inputs
-        let input_mint = solana_sdk::pubkey::Pubkey::from_str(input)
-            .map_err(|e| anyhow!("Invalid input mint: {}", e))?;
-        let output_mint = solana_sdk::pubkey::Pubkey::from_str(output)
-            .map_err(|e| anyhow!("Invalid output mint: {}", e))?;
+    fn kind(&self) -> Aggregator {
+        Aggregator::Dflow
+    }
 
-        if input_mint == output_mint {
+    async fn quote(&self, request: &SwapRequest) -> Result<Quote> {
+        if request.input_mint == request.output_mint {
             return Err(anyhow!("Input and output mints must be different"));
         }
 
-        // Get quote
-        let quote_start = Instant::now();
-        let quote = self.get_quote(input, output, amount, slippage_bps).await?;
-        let quote_time = quote_start.elapsed();
-
-        // Parse output amount
+        let start = Instant::now();
+        let quote = self.get_quote(request).await?;
         let out_amount: u64 = quote
             .out_amount
             .parse()
             .map_err(|e| anyhow!("Failed to parse output amount: {}", e))?;
 
-        let quote_result = QuoteResult {
+        let result = QuoteResult {
             out_amount,
             price_impact: quote.price_impact_pct,
             metadata: QuoteMetadata {
@@ -408,115 +344,29 @@ impl DexAggregator for DflowAggregator {
                 fees: None, // DFlow doesn't provide separate fee information
                 extra: quote.route_plan.clone(),
             },
-            quote_time: Some(quote_time),
+            quote_time: Some(start.elapsed()),
         };
 
-        // Build transaction
-        let transaction = self.build_transaction_from_quote(quote).await?;
-
-        // Sign transaction with user's keypair
-        let transaction =
-            VersionedTransaction::try_new(transaction.message, &[self.signer.as_ref()])
-                .map_err(|e| anyhow!("Failed to sign transaction: {}", e))?;
-
-        Ok(SwapTransaction {
-            transaction,
-            in_amount: amount,
+        Ok(Quote {
+            aggregator: Aggregator::Dflow,
             out_amount,
-            slippage_bps_used: Some(slippage_bps),
-            aggregator_used: Some(Aggregator::Dflow),
-            quote_result,
+            result,
+            payload: QuotePayload::Dflow(Box::new(quote)),
         })
     }
 
-    async fn swap(
+    async fn build_transaction(
         &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        commitment_level: CommitmentLevel,
-        _wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapSummary> {
-        let start = Instant::now();
-        let prepared = self
-            .build_swap_transaction(input, output, amount, slippage_bps, _wrap_and_unwrap_sol)
+        request: &SwapRequest,
+        quote: &Quote,
+    ) -> Result<VersionedTransaction> {
+        let QuotePayload::Dflow(dflow_quote) = &quote.payload else {
+            return Err(anyhow!("DFlow cannot build a {:?} quote", quote.aggregator));
+        };
+        let transaction = self
+            .build_transaction_from_quote(request, (**dflow_quote).clone())
             .await?;
-
-        // Submit transaction
-        let sig = self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &prepared.transaction,
-                CommitmentConfig {
-                    commitment: commitment_level,
-                },
-                solana_client::rpc_config::RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| anyhow!("Failed to send transaction: {}", e))?;
-
-        let execution_time = start.elapsed();
-
-        let swap_result = SwapResult {
-            signature: sig.to_string(),
-            out_amount: prepared.out_amount,
-            slippage_bps_used: prepared.slippage_bps_used,
-            aggregator_used: prepared.aggregator_used,
-            execution_time: Some(execution_time),
-        };
-
-        Ok(SwapSummary {
-            swap_result,
-            quote_results: vec![(Aggregator::Dflow, prepared.quote_result)],
-        })
-    }
-
-    async fn quote(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<QuoteResult> {
-        let start = Instant::now();
-
-        // Get quote (quote is just getting a quote without executing)
-        let quote = self.get_quote(input, output, amount, slippage_bps).await?;
-
-        // Parse output amount
-        let out_amount: u64 = quote
-            .out_amount
-            .parse()
-            .map_err(|e| anyhow!("Failed to parse output amount: {}", e))?;
-
-        let quote_time = start.elapsed();
-
-        Ok(QuoteResult {
-            out_amount,
-            price_impact: quote.price_impact_pct,
-            metadata: QuoteMetadata {
-                route: quote.route_plan.as_ref().and_then(|r| {
-                    serde_json::to_string(r)
-                        .ok()
-                        .map(|s| format!("DFlow: {}", s))
-                }),
-                fees: None, // DFlow doesn't provide separate fee information
-                extra: quote.route_plan,
-            },
-            quote_time: Some(quote_time),
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_dflow_aggregator_creation() {
-        // This test would require a valid config and keypair
-        // Skipping for now
+        VersionedTransaction::try_new(transaction.message, &[self.signer.as_ref()])
+            .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
     }
 }

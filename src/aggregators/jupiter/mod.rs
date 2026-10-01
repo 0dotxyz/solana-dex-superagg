@@ -1,18 +1,16 @@
 //! Jupiter aggregator implementation
 
 use crate::aggregators::{
-    DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary, SwapTransaction,
+    DexAggregator, Quote, QuoteMetadata, QuotePayload, QuoteResult, SwapRequest,
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
-    quote::{QuoteRequest, QuoteResponse},
-    swap::SwapRequest,
+    quote::QuoteRequest,
+    swap::SwapRequest as JupiterSwapRequest,
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
 };
-use solana_client::{rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
@@ -22,73 +20,40 @@ use std::time::Instant;
 
 pub struct JupiterAggregator {
     jupiter_client: JupiterSwapApiClient,
-    rpc_client: RpcClient,
     signer: Arc<Keypair>,
-    compute_unit_price_micro_lamports: u64,
 }
 
 impl JupiterAggregator {
     pub fn new(config: &ClientConfig, signer: Arc<Keypair>) -> Result<Self> {
-        Self::new_with_compute_price(
-            config,
-            signer,
-            config.shared.compute_unit_price_micro_lamports,
-        )
-    }
-
-    pub fn new_with_compute_price(
-        config: &ClientConfig,
-        signer: Arc<Keypair>,
-        compute_unit_price_micro_lamports: u64,
-    ) -> Result<Self> {
-        let rpc_client =
-            RpcClient::new_with_commitment(&config.shared.rpc_url, CommitmentConfig::confirmed());
-
         let api_key = config
             .jupiter
             .api_key
             .clone()
             .ok_or_else(|| anyhow!("Jupiter API key is not configured"))?;
-        let jupiter_client =
-            JupiterSwapApiClient::new(config.jupiter.jup_swap_api_url.clone(), api_key)?;
-
-        Ok(Self {
-            jupiter_client,
-            rpc_client,
-            signer,
-            compute_unit_price_micro_lamports,
-        })
+        Self::with_config(&config.jupiter.jup_swap_api_url, signer, api_key)
     }
 
     pub fn with_config(
         jupiter_api_url: &str,
-        rpc_url: &str,
         signer: Arc<Keypair>,
-        compute_unit_price_micro_lamports: u64,
-        api_key: Option<String>,
+        api_key: String,
     ) -> Result<Self> {
-        let rpc_client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-        let jupiter_client = JupiterSwapApiClient::new(
-            jupiter_api_url.to_string(),
-            api_key.ok_or_else(|| anyhow!("Jupiter API key is required when using with_config"))?,
-        )?;
-
+        let jupiter_client = JupiterSwapApiClient::new(jupiter_api_url.to_string(), api_key)?;
         Ok(Self {
             jupiter_client,
-            rpc_client,
             signer,
-            compute_unit_price_micro_lamports,
         })
     }
+}
 
-    async fn quote_response(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<(QuoteResponse, QuoteResult)> {
-        if input == output {
+#[async_trait::async_trait]
+impl DexAggregator for JupiterAggregator {
+    fn kind(&self) -> Aggregator {
+        Aggregator::Jupiter
+    }
+
+    async fn quote(&self, request: &SwapRequest) -> Result<Quote> {
+        if request.input_mint == request.output_mint {
             return Err(anyhow!("Input and output mints cannot be the same"));
         }
 
@@ -96,153 +61,82 @@ impl JupiterAggregator {
         let quote_response = self
             .jupiter_client
             .quote(&QuoteRequest {
-                input_mint: input
-                    .try_into()
-                    .map_err(|e| anyhow!("Invalid input mint: {}", e))?,
-                output_mint: output
-                    .try_into()
-                    .map_err(|e| anyhow!("Invalid output mint: {}", e))?,
-                amount,
-                slippage_bps,
+                input_mint: request.input_mint.to_bytes().into(),
+                output_mint: request.output_mint.to_bytes().into(),
+                amount: request.amount,
+                slippage_bps: request.slippage_bps,
                 ..Default::default()
             })
             .await
             .map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
-        let quote_time = quote_start.elapsed();
 
-        let price_impact = quote_response
-            .price_impact_pct
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(0.0);
-        let quote_result = QuoteResult {
+        let result = QuoteResult {
             out_amount: quote_response.out_amount,
-            price_impact,
+            price_impact: quote_response
+                .price_impact_pct
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0),
             metadata: QuoteMetadata {
                 route: None,
                 fees: quote_response.platform_fee.as_ref().map(|f| f.amount),
                 extra: None,
             },
-            quote_time: Some(quote_time),
+            quote_time: Some(quote_start.elapsed()),
         };
 
-        Ok((quote_response, quote_result))
+        Ok(Quote {
+            aggregator: Aggregator::Jupiter,
+            out_amount: quote_response.out_amount,
+            result,
+            payload: QuotePayload::Jupiter(Box::new(quote_response)),
+        })
     }
 
-    fn transaction_config(&self, wrap_and_unwrap_sol: bool) -> TransactionConfig {
-        TransactionConfig {
-            wrap_and_unwrap_sol,
-            compute_unit_price_micro_lamports: if self.compute_unit_price_micro_lamports > 0 {
-                Some(ComputeUnitPriceMicroLamports::MicroLamports(
-                    self.compute_unit_price_micro_lamports,
-                ))
-            } else {
-                None
-            },
-            ..Default::default()
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl DexAggregator for JupiterAggregator {
-    async fn build_swap_transaction(
+    async fn build_transaction(
         &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapTransaction> {
-        let (quote_response, quote_result) = self
-            .quote_response(input, output, amount, slippage_bps)
-            .await?;
-        let out_amount = quote_response.out_amount;
+        request: &SwapRequest,
+        quote: &Quote,
+    ) -> Result<VersionedTransaction> {
+        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
+            return Err(anyhow!(
+                "Jupiter cannot build a {:?} quote",
+                quote.aggregator
+            ));
+        };
 
         let swap_response = self
             .jupiter_client
             .swap(
-                &SwapRequest {
+                &JupiterSwapRequest {
                     user_public_key: self.signer.pubkey().to_bytes().into(),
-                    quote_response,
-                    config: self.transaction_config(wrap_and_unwrap_sol),
+                    quote_response: (**quote_response).clone(),
+                    config: TransactionConfig {
+                        wrap_and_unwrap_sol: request.wrap_and_unwrap_sol,
+                        // Jupiter simulates the swap and sizes the CU limit to it, so the priority
+                        // fee is paid on what the route uses rather than on the 1.4M default.
+                        dynamic_compute_unit_limit: true,
+                        compute_unit_price_micro_lamports: (request
+                            .compute_unit_price_micro_lamports
+                            > 0)
+                        .then_some(ComputeUnitPriceMicroLamports::MicroLamports(
+                            request.compute_unit_price_micro_lamports,
+                        )),
+                        ..Default::default()
+                    },
                 },
                 None,
             )
             .await
             .map_err(|e| anyhow!("Jupiter swap failed: {}", e))?;
 
+        if let Some(error) = swap_response.simulation_error {
+            return Err(anyhow!("Jupiter swap simulation failed: {:?}", error));
+        }
+
         let tx = bincode::deserialize::<VersionedTransaction>(&swap_response.swap_transaction)
-            .map_err(|e| anyhow!("Failed to deserialize transaction: {}", e))?;
-
-        let transaction = VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
-            .map_err(|e| anyhow!("Failed to sign transaction: {}", e))?;
-
-        Ok(SwapTransaction {
-            transaction,
-            in_amount: amount,
-            out_amount,
-            slippage_bps_used: Some(slippage_bps),
-            aggregator_used: Some(Aggregator::Jupiter),
-            quote_result,
-        })
-    }
-
-    async fn swap(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        commitment_level: CommitmentLevel,
-        wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapSummary> {
-        let start_time = Instant::now();
-        let prepared = self
-            .build_swap_transaction(input, output, amount, slippage_bps, wrap_and_unwrap_sol)
-            .await?;
-
-        let sig = self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &prepared.transaction,
-                CommitmentConfig {
-                    commitment: commitment_level,
-                },
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| anyhow!("Failed to send transaction: {}", e))?;
-
-        let execution_time = start_time.elapsed();
-
-        let swap_result = SwapResult {
-            signature: sig.to_string(),
-            out_amount: prepared.out_amount,
-            slippage_bps_used: prepared.slippage_bps_used,
-            aggregator_used: prepared.aggregator_used,
-            execution_time: Some(execution_time),
-        };
-
-        Ok(SwapSummary {
-            swap_result,
-            quote_results: vec![(Aggregator::Jupiter, prepared.quote_result)],
-        })
-    }
-
-    async fn quote(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<QuoteResult> {
-        let (_, quote_result) = self
-            .quote_response(input, output, amount, slippage_bps)
-            .await?;
-        Ok(quote_result)
+            .map_err(|e| anyhow!("Failed to deserialize Jupiter transaction: {}", e))?;
+        VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
+            .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
     }
 }

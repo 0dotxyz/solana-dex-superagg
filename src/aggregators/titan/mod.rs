@@ -3,297 +3,256 @@
 //! This module implements the `DexAggregator` trait for Titan protocol.
 
 mod client;
-mod codec;
 mod transaction_builder;
 mod types;
 
 use crate::aggregators::{
-    DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary, SwapTransaction,
+    sol, DexAggregator, Quote, QuoteMetadata, QuotePayload, QuoteResult, SwapRequest,
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, Result};
-use solana_client::{
-    nonblocking::rpc_client::RpcClient as AsyncRpcClient, rpc_client::RpcClient,
-    rpc_config::RpcSendTransactionConfig,
-};
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use client::TitanClient;
 pub use types::SwapRoute;
 
-use self::transaction_builder::build_transaction_from_route;
+use self::types::{QuoteUpdateParams, SwapMode, SwapParams, SwapQuoteRequest, TransactionParams};
 
 /// Titan aggregator implementation
 pub struct TitanAggregator {
-    /// Titan WebSocket client (keeps connection open)
+    /// Titan WebSocket client (one shared connection, reconnected on demand)
     titan_client: TitanClient,
-    /// Solana RPC client for transaction submission
-    rpc_client: RpcClient,
-    /// Async RPC client for blockhash fetching
-    async_rpc_client: AsyncRpcClient,
+    /// RPC client for blockhashes and lookup tables
+    rpc_client: Arc<RpcClient>,
     /// Wallet keypair for signing transactions
     signer: Arc<Keypair>,
-    /// RPC URL for transaction building
-    rpc_url: String,
 }
 
 impl TitanAggregator {
-    /// Create a new Titan aggregator from ClientConfig
-    pub async fn new(config: &ClientConfig, signer: Arc<Keypair>) -> Result<Self> {
+    /// Create a new Titan aggregator from ClientConfig. Connects lazily, on the first quote.
+    pub fn new(
+        config: &ClientConfig,
+        signer: Arc<Keypair>,
+        rpc_client: Arc<RpcClient>,
+    ) -> Result<Self> {
         let titan_config = config
             .titan
             .as_ref()
             .ok_or_else(|| anyhow!("Titan configuration not provided"))?;
-
-        // Determine Titan endpoint configuration
         let titan_api_key = titan_config
             .titan_api_key
             .as_ref()
             .ok_or_else(|| anyhow!("Titan API key must be provided"))?;
-
         if titan_api_key.is_empty() {
             return Err(anyhow!("TITAN_API_KEY is set but empty"));
         }
 
-        let titan_ws_endpoint = titan_config.titan_ws_endpoint.clone();
-
-        // Create RPC clients
-        let rpc_client = RpcClient::new(&config.shared.rpc_url);
-        let async_rpc_client = AsyncRpcClient::new(config.shared.rpc_url.clone());
-
-        // Create Titan client and connect
-        let titan_client = TitanClient::new(titan_ws_endpoint, titan_api_key.clone());
-        titan_client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect to Titan: {}", e))?;
+        let titan_client = TitanClient::new(
+            titan_config.titan_ws_endpoint.clone(),
+            titan_api_key.clone(),
+        )
+        .with_request_timeout(Duration::from_millis(config.shared.quote_timeout_ms));
 
         Ok(Self {
             titan_client,
             rpc_client,
-            async_rpc_client,
             signer,
-            rpc_url: config.shared.rpc_url.clone(),
-        })
-    }
-
-    /// Create a new Titan aggregator with explicit configuration
-    pub async fn with_config(
-        titan_ws_endpoint: String,
-        titan_api_key: Option<String>,
-        rpc_url: String,
-        signer: Arc<Keypair>,
-    ) -> Result<Self> {
-        // Determine Titan endpoint configuration
-        let api_key = titan_api_key.ok_or_else(|| anyhow!("Titan API key must be provided"))?;
-
-        if api_key.is_empty() {
-            return Err(anyhow!("TITAN_API_KEY is set but empty"));
-        }
-
-        let ws_endpoint = titan_ws_endpoint;
-
-        // Create RPC clients
-        let rpc_client = RpcClient::new(&rpc_url);
-        let async_rpc_client = AsyncRpcClient::new(rpc_url.clone());
-
-        // Create Titan client and connect
-        let titan_client = TitanClient::new(ws_endpoint, api_key);
-        titan_client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect to Titan: {}", e))?;
-
-        Ok(Self {
-            titan_client,
-            rpc_client,
-            async_rpc_client,
-            signer,
-            rpc_url,
         })
     }
 
     /// Close the WebSocket connection
-    ///
-    /// Call this when you're done with the aggregator to clean up resources.
     pub async fn close(&self) -> Result<()> {
         self.titan_client
             .close()
             .await
-            .map_err(|e| anyhow!("Failed to close Titan connection: {}", e))?;
-        Ok(())
+            .map_err(|e| anyhow!("Failed to close Titan connection: {}", e))
+    }
+}
+
+/// Whether we wrap the input ourselves: Titan swaps a wSOL input out of the wSOL ATA as-is.
+fn wraps_input(request: &SwapRequest) -> bool {
+    request.wrap_and_unwrap_sol && request.input_mint == sol::WSOL_MINT
+}
+
+fn quote_request(request: &SwapRequest, user: &solana_sdk::pubkey::Pubkey) -> SwapQuoteRequest {
+    SwapQuoteRequest {
+        swap: SwapParams {
+            input_mint: request.input_mint.to_bytes(),
+            output_mint: request.output_mint.to_bytes(),
+            amount: request.amount,
+            swap_mode: Some(SwapMode::ExactIn),
+            slippage_bps: Some(request.slippage_bps),
+            dexes: None,
+            exclude_dexes: None,
+            only_direct_routes: None,
+            add_size_constraint: None,
+            size_constraint: None,
+            providers: None,
+            accounts_limit_total: None,
+            accounts_limit_writable: None,
+        },
+        transaction: TransactionParams {
+            user_public_key: user.to_bytes(),
+            // Only when we wrapped the input: closing the ATA returns the lamports.
+            close_input_token_account: Some(wraps_input(request)),
+            create_output_token_account: Some(true),
+            fee_account: None,
+            fee_bps: None,
+            fee_from_input_mint: None,
+            output_account: None,
+            // Titan unwraps a wSOL output by default; keep it as wSOL unless asked to unwrap.
+            output_wsol: Some(!request.wrap_and_unwrap_sol),
+        },
+        update: Some(QuoteUpdateParams {
+            interval_ms: Some(1000),
+            num_quotes: Some(5),
+        }),
     }
 }
 
 #[async_trait::async_trait]
 impl DexAggregator for TitanAggregator {
-    async fn build_swap_transaction(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        _wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapTransaction> {
-        let user_pubkey = self.signer.as_ref().pubkey().to_string();
+    fn kind(&self) -> Aggregator {
+        Aggregator::Titan
+    }
 
-        // Request swap quotes with slippage
-        let quote_start = Instant::now();
-        let (_provider, route) = self
+    async fn quote(&self, request: &SwapRequest) -> Result<Quote> {
+        if request.input_mint == request.output_mint {
+            return Err(anyhow!("Input and output mints cannot be the same"));
+        }
+
+        let start_time = Instant::now();
+        let (provider, route) = self
             .titan_client
-            .request_swap_quotes(input, output, amount, &user_pubkey, Some(slippage_bps))
+            .request_swap_quotes(quote_request(request, &self.signer.pubkey()))
             .await
-            .map_err(|e| anyhow!("Failed to get swap quotes: {}", e))?;
-        let quote_time = quote_start.elapsed();
+            .map_err(|e| anyhow!("Titan quote failed: {}", e))?;
 
-        // Build a QuoteResult from the route we actually used
-        let price_impact = if route.in_amount > 0 {
-            let ratio = route.out_amount as f64 / route.in_amount as f64;
-            (1.0 - ratio).abs() * 100.0
-        } else {
-            0.0
-        };
-        let quote_result = QuoteResult {
+        let result = QuoteResult {
             out_amount: route.out_amount,
-            price_impact,
+            // Titan doesn't report price impact.
+            price_impact: 0.0,
             metadata: QuoteMetadata {
-                route: Some(format!("Titan route with {} steps", route.steps.len())),
+                route: Some(format!(
+                    "Titan/{} route with {} steps",
+                    provider,
+                    route.steps.len()
+                )),
                 fees: route.platform_fee.as_ref().map(|f| f.amount),
                 extra: None,
             },
-            quote_time: Some(quote_time),
+            quote_time: Some(start_time.elapsed()),
         };
 
-        // Get recent blockhash
-        let recent_blockhash = self
-            .async_rpc_client
-            .get_latest_blockhash()
-            .await
-            .map_err(|e| anyhow!("Failed to get blockhash: {}", e))?;
-
-        // Build transaction
-        let transaction_bytes = build_transaction_from_route(
-            &route,
-            self.signer.as_ref().pubkey(),
-            recent_blockhash,
-            &self.rpc_url,
-            None, // No Jito tip for now
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to build transaction: {}", e))?;
-
-        // Deserialize transaction
-        let mut transaction: VersionedTransaction = bincode::deserialize(&transaction_bytes)
-            .map_err(|e| anyhow!("Failed to deserialize transaction: {}", e))?;
-
-        // Sign transaction
-        let message = transaction.message.serialize();
-        let signature = self.signer.as_ref().sign_message(&message);
-        transaction.signatures[0] = signature;
-
-        Ok(SwapTransaction {
-            transaction,
-            in_amount: amount,
+        Ok(Quote {
+            aggregator: Aggregator::Titan,
             out_amount: route.out_amount,
-            slippage_bps_used: Some(slippage_bps),
-            aggregator_used: Some(Aggregator::Titan),
-            quote_result,
+            result,
+            payload: QuotePayload::Titan(Box::new(route)),
         })
     }
 
-    async fn swap(
+    async fn build_transaction(
         &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        commitment_level: CommitmentLevel,
-        _wrap_and_unwrap_sol: bool,
-    ) -> Result<SwapSummary> {
-        let start_time = Instant::now();
-        let prepared = self
-            .build_swap_transaction(input, output, amount, slippage_bps, _wrap_and_unwrap_sol)
-            .await?;
-
-        // Send transaction with specified commitment level
-        let commitment_config = CommitmentConfig {
-            commitment: commitment_level,
-        };
-        let tx_signature = self
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                &prepared.transaction,
-                commitment_config,
-                RpcSendTransactionConfig {
-                    skip_preflight: false,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| anyhow!("Failed to send transaction: {}", e))?;
-
-        let execution_time = start_time.elapsed();
-
-        let swap_result = SwapResult {
-            signature: tx_signature.to_string(),
-            out_amount: prepared.out_amount,
-            slippage_bps_used: prepared.slippage_bps_used,
-            aggregator_used: prepared.aggregator_used,
-            execution_time: Some(execution_time),
+        request: &SwapRequest,
+        quote: &Quote,
+    ) -> Result<VersionedTransaction> {
+        let QuotePayload::Titan(route) = &quote.payload else {
+            return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
         };
 
-        Ok(SwapSummary {
-            swap_result,
-            quote_results: vec![(Aggregator::Titan, prepared.quote_result)],
-        })
+        if let Some(expires_at_ms) = route.expires_at_ms {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if now_ms >= expires_at_ms {
+                return Err(anyhow!("Titan route expired before it could be built"));
+            }
+        }
+
+        let payer = self.signer.pubkey();
+        let instructions = transaction_builder::route_instructions(
+            route,
+            &payer,
+            request.compute_unit_price_micro_lamports,
+            wraps_input(request).then_some(request.amount),
+        );
+        let (lookup_tables, blockhash) = tokio::try_join!(
+            transaction_builder::fetch_lookup_tables(&self.rpc_client, route),
+            async {
+                self.rpc_client
+                    .get_latest_blockhash()
+                    .await
+                    .map_err(|e| anyhow!("Failed to get blockhash: {}", e))
+            }
+        )?;
+        let message =
+            transaction_builder::compile_message(&payer, &instructions, &lookup_tables, blockhash)?;
+
+        VersionedTransaction::try_new(message, &[self.signer.as_ref()])
+            .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+
+    fn request(input_mint: Pubkey, output_mint: Pubkey, wrap: bool) -> SwapRequest {
+        SwapRequest {
+            input_mint,
+            output_mint,
+            amount: 1_000,
+            slippage_bps: 50,
+            wrap_and_unwrap_sol: wrap,
+            compute_unit_price_micro_lamports: 0,
+        }
     }
 
-    async fn quote(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<QuoteResult> {
-        let start_time = Instant::now();
+    #[test]
+    fn wsol_stays_in_the_ata_without_wrap() {
+        let usdc = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
 
-        let user_pubkey = self.signer.as_ref().pubkey().to_string();
+        let sell = request(sol::WSOL_MINT, usdc, false);
+        assert!(!wraps_input(&sell));
+        let params = quote_request(&sell, &user).transaction;
+        assert_eq!(params.close_input_token_account, Some(false));
 
-        // Request swap quotes with slippage (quote doesn't execute)
-        let (_provider, route) = self
-            .titan_client
-            .request_swap_quotes(input, output, amount, &user_pubkey, Some(slippage_bps))
-            .await
-            .map_err(|e| anyhow!("Failed to get swap quotes: {}", e))?;
+        let buy = request(usdc, sol::WSOL_MINT, false);
+        assert_eq!(
+            quote_request(&buy, &user).transaction.output_wsol,
+            Some(true)
+        );
+    }
 
-        let quote_time = start_time.elapsed();
+    #[test]
+    fn wrap_uses_native_sol_on_both_sides() {
+        let usdc = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
 
-        // Calculate price impact (simplified: compare in_amount vs out_amount)
-        // This is a rough estimate - actual price impact would require more market data
-        let price_impact = if route.in_amount > 0 {
-            let ratio = route.out_amount as f64 / route.in_amount as f64;
-            // Assuming 1:1 would be no impact, calculate deviation
-            // This is a simplified calculation
-            (1.0 - ratio).abs() * 100.0
-        } else {
-            0.0
-        };
+        let sell = request(sol::WSOL_MINT, usdc, true);
+        assert!(wraps_input(&sell));
+        assert_eq!(
+            quote_request(&sell, &user)
+                .transaction
+                .close_input_token_account,
+            Some(true)
+        );
 
-        Ok(QuoteResult {
-            out_amount: route.out_amount,
-            price_impact,
-            metadata: QuoteMetadata {
-                route: Some(format!("Titan route with {} steps", route.steps.len())),
-                fees: route.platform_fee.as_ref().map(|f| f.amount),
-                extra: None,
-            },
-            quote_time: Some(quote_time),
-        })
+        let buy = request(usdc, sol::WSOL_MINT, true);
+        assert!(!wraps_input(&buy));
+        assert_eq!(
+            quote_request(&buy, &user).transaction.output_wsol,
+            Some(false)
+        );
     }
 }

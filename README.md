@@ -14,7 +14,7 @@ solana-dex-superagg = { git = "https://github.com/0dotxyz/solana-dex-superagg" }
 ## Features
 
 - **Multi-aggregator support**: Access Jupiter, Titan, and DFlow from a single interface
-- **Smart routing**: Automatically compare aggregators and use the one with the best price
+- **Smart routing**: Quotes every configured aggregator in parallel and builds the best quote; if that venue fails to build, falls back to the next best
 - **Flexible strategies**: Choose from multiple routing strategies including best price, preferred aggregator, or lowest slippage climber
 - **Slippage tracking**: Know exactly what slippage was used for your swaps (especially useful for staircase strategy)
 - **Aggregator tracking**: See which aggregator was selected for each swap
@@ -68,6 +68,15 @@ export DEX_SUPERAGG_SHARED__COMPUTE_UNIT_PRICE_MICRO_LAMPORTS="5000"
 # - finalized: Slowest (~15s), cannot be rolled back
 export DEX_SUPERAGG_SHARED__COMMITMENT_LEVEL="confirmed"
 
+# Per-venue quote deadline in ms (default: 5000). A venue that misses it is left out of the comparison.
+export DEX_SUPERAGG_SHARED__QUOTE_TIMEOUT_MS="5000"
+
+# Per-venue transaction build deadline in ms (default: 10000)
+export DEX_SUPERAGG_SHARED__BUILD_TIMEOUT_MS="10000"
+
+# How long `swap` waits for confirmation, in seconds (default: 90)
+export DEX_SUPERAGG_SHARED__CONFIRM_TIMEOUT_SECS="90"
+
 # Default routing strategy (default: best_price)
 # Options: best_price, preferred_aggregator, lowest_slippage_climber
 export DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE="best_price"
@@ -101,7 +110,7 @@ See `examples/basic_swap.rs` for the complete code.
 The library supports three routing strategies:
 
 - **BestPrice** (default): Automatically compares all available aggregators and uses the one that gives you the most tokens
-- **PreferredAggregator**: Use a specific aggregator (Jupiter or Titan)
+- **PreferredAggregator**: Use a specific aggregator (Jupiter, Titan or DFlow)
 - **LowestSlippageClimber**: Tests multiple slippage levels starting from a floor value and incrementing until a swap succeeds
 
 ## Notes
@@ -113,7 +122,11 @@ The library supports three routing strategies:
   - `Confirmed`: Good balance (~1-2s), very unlikely to roll back (default)
   - `Finalized`: Slowest (~15s), cannot be rolled back
   Default is `Confirmed` for a good balance of speed and reliability. Use `Finalized` only for critical swaps that require absolute guarantees.
-- **Titan WebSocket**: The Titan aggregator maintains a persistent WebSocket connection that is reused across swaps for efficiency. Make sure to call `client.close().await?` when you're done to clean up resources.
+- **SOL handling** (`wrap_and_unwrap_sol`, identical on every venue):
+  - `false`: wSOL is an ordinary SPL token. A wSOL input is spent from the wallet's wSOL ATA (which must already exist), a wSOL output is left in it, and the ATA is never closed. Use this when your program keeps SOL as wSOL.
+  - `true`: native SOL. A SOL input is wrapped from the wallet's lamports, a SOL output is unwrapped to lamports, and the wSOL ATA is closed afterwards — which also unwraps any wSOL already sitting in it.
+- **Min-out swaps**: `build_swap_transaction_for_min_out*` quotes your initial input and, if no venue yields `min_out`, raises the input by the shortfall and re-quotes (at most twice) — never above `max_in_amount`. Pass the most you can afford to spend (e.g. from an oracle price); `None` caps it at 1.10x the initial amount.
+- **Titan WebSocket**: One connection is shared by all callers and opened on first use. Concurrent quotes are routed by request/stream id, every request has a deadline, and a dropped or timed-out connection is replaced on the next request (a request that hits a dropped connection is retried once). Titan routes get a compute budget (`computeUnitsSafe` limit plus your CU price). Call `client.close().await?` when you're done.
 - **ATA Creation**: By default, the client will create Associated Token Accounts (ATAs) for output tokens if they don't exist. You can control this behavior via `RouteConfig::output_ata`.
 - **Timing Information**: Both `SwapResult` and `QuoteResult` include timing information (`execution_time` and `quote_time` respectively) to help you monitor performance. The `SwapSummary` includes all quote results, allowing you to see timing for all aggregators that were tried (useful for BestPrice strategy).
 

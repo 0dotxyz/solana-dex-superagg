@@ -1,670 +1,193 @@
 # Aggregator Integration Guide
 
-This document provides a complete, step-by-step guide for integrating new DEX aggregators into the `solana-dex-superagg` library.
+How to add a new DEX aggregator (Raydium, Orca, OKX, …) to `solana-dex-superagg`.
 
-## Overview
+## How a venue fits in
 
-The library currently supports Jupiter (HTTP-based) and Titan (WebSocket-based). This guide will help you add additional aggregators following the same architectural patterns.
+Every venue implements the two-phase `DexAggregator` trait (`src/aggregators/mod.rs`):
 
-## Architecture Context
-
-### DexAggregator Trait
-All aggregators implement the `DexAggregator` async trait with two core methods:
-- `swap()` - Execute a swap and return transaction signature + output amount
-- `quote()` - Quote a swap without executing (for price comparison)
-
-### Key Components
-1. **Aggregator Implementation** - Your custom aggregator struct that implements `DexAggregator`
-2. **Configuration** - Aggregator-specific settings (API URLs, keys, etc.)
-3. **Client Integration** - Wiring your aggregator into the routing system
-4. **Validation** - Testing connectivity and configuration
-
----
-
-## Step-by-Step Integration Guide
-
-### Step 1: Create Aggregator Implementation
-
-**File:** `src/aggregators/{your_aggregator}/mod.rs` (create new directory and file)
-
-**1.1 Define the Aggregator Struct**
 ```rust
-use crate::aggregators::{DexAggregator, QuoteMetadata, QuoteResult, SwapResult, SwapSummary};
-use crate::config::{Aggregator, ClientConfig};
-use anyhow::{anyhow, Result};
-use async_trait::async_trait;
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    commitment_config::CommitmentLevel,
-    signature::{Keypair, Signer},
-};
-use std::sync::Arc;
-use std::time::Instant;
-
-pub struct YourAggregator {
-    // Your API client (HTTP or WebSocket)
-    client: YourApiClient,
-
-    // Always needed for Solana RPC calls
-    rpc_client: RpcClient,
-
-    // Wallet for signing transactions
-    signer: Arc<Keypair>,
-
-    // Additional fields (compute unit price, fees, etc.)
-    compute_unit_price_micro_lamports: u64,
+#[async_trait]
+pub trait DexAggregator: Send + Sync {
+    fn kind(&self) -> Aggregator;
+    async fn quote(&self, request: &SwapRequest) -> Result<Quote>;
+    async fn build_transaction(&self, request: &SwapRequest, quote: &Quote)
+        -> Result<VersionedTransaction>;
 }
 ```
 
-**1.2 Add Initialization Methods**
+`DexSuperAggClient` (`src/client.rs`) does the rest, for every venue alike:
+
+- quotes all configured venues **in parallel**, each under `shared.quote_timeout_ms`;
+- logs and drops venues that fail or time out, sorts the rest by `out_amount`;
+- builds the best quote under `shared.build_timeout_ms`, falling back to the next best if a build
+  fails;
+- for min-out swaps, raises the input (capped) and re-quotes;
+- submits and confirms (`swap*`), or hands back the signed transaction (`build_swap_transaction*`).
+
+So a venue only has to answer two questions: *what would this swap yield?* and *give me a signed
+transaction for exactly that quote*. It must not retry, sleep, submit, or swallow errors itself.
+
+### Rules every venue must follow
+
+1. **Build what you quoted.** `build_transaction` receives the `Quote` your `quote` returned. Build
+   from its payload; don't re-quote (the client compared venues on that number).
+2. **Honour `SwapRequest::wrap_and_unwrap_sol` exactly** (see its doc comment). `false` means a wSOL
+   input/output stays in the wallet's wSOL ATA and the ATA is never closed; `true` means native SOL
+   in and out. If the venue's API has a flag for this, map it; if it returns raw instructions, use
+   the helpers in `src/aggregators/sol.rs` (see Titan).
+3. **Apply `compute_unit_price_micro_lamports`** as a per-CU price (not a total fee). If the venue
+   returns raw instructions, also set a CU limit (`sol::set_compute_unit_limit`) — without one the
+   transaction runs under the 200k default.
+4. **Reuse connections.** Create HTTP/WebSocket clients once in the constructor. The client
+   applies timeouts around your calls, but long-lived sockets need their own reconnect logic (see
+   `src/aggregators/titan/client.rs`).
+5. **Return errors, don't log-and-continue.** The client logs per-venue failures with context.
+
+## Step 1: Implement the venue
+
+Create `src/aggregators/your_aggregator/mod.rs`:
+
 ```rust
+use crate::aggregators::{
+    DexAggregator, Quote, QuoteMetadata, QuotePayload, QuoteResult, SwapRequest,
+};
+use crate::config::{Aggregator, ClientConfig};
+use anyhow::{anyhow, Result};
+use solana_sdk::{signature::Keypair, transaction::VersionedTransaction};
+use std::{sync::Arc, time::Instant};
+
+/// Whatever the venue's quote endpoint returns; kept to build from later.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct YourQuote { /* ... */ }
+
+pub struct YourAggregator {
+    http_client: reqwest::Client,
+    signer: Arc<Keypair>,
+    api_url: String,
+}
+
 impl YourAggregator {
-    /// Create from ClientConfig (standard initialization)
-    pub async fn new(config: &ClientConfig, signer: Arc<Keypair>) -> Result<Self> {
+    pub fn new(config: &ClientConfig, signer: Arc<Keypair>) -> Result<Self> {
         let your_config = config
             .your_aggregator
             .as_ref()
-            .ok_or_else(|| anyhow!("YourAggregator not configured"))?;
-
-        let rpc_client = RpcClient::new_with_commitment(
-            &config.shared.rpc_url,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-        );
-
-        // Initialize your API client
-        let client = YourApiClient::new(&your_config.api_url, your_config.api_key.clone())?;
-
-        // If WebSocket, call connect() here
-        // client.connect().await?;
-
+            .ok_or_else(|| anyhow!("YourAggregator configuration not found"))?;
         Ok(Self {
-            client,
-            rpc_client,
+            http_client: reqwest::Client::new(),
             signer,
-            compute_unit_price_micro_lamports: config.shared.compute_unit_price_micro_lamports,
+            api_url: your_config.api_url.clone(),
         })
     }
-
-    /// Optional: Create with custom compute unit price
-    pub fn new_with_compute_price(
-        config: &ClientConfig,
-        signer: Arc<Keypair>,
-        compute_unit_price_micro_lamports: u64,
-    ) -> Result<Self> {
-        // Similar to new() but override compute unit price
-    }
-
-    /// Optional: Cleanup method if using persistent connections (like WebSocket)
-    pub async fn close(&self) -> Result<()> {
-        // Close connections if needed
-        // self.client.close().await?;
-        Ok(())
-    }
 }
-```
 
-**1.3 Implement DexAggregator Trait**
-```rust
-#[async_trait]
+#[async_trait::async_trait]
 impl DexAggregator for YourAggregator {
-    async fn swap(
-        &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-        commitment_level: CommitmentLevel,
-    ) -> Result<SwapSummary> {
+    fn kind(&self) -> Aggregator {
+        Aggregator::YourAggregator
+    }
+
+    async fn quote(&self, request: &SwapRequest) -> Result<Quote> {
         let start = Instant::now();
-
-        // 1. Validate inputs
-        let input_mint = solana_sdk::pubkey::Pubkey::from_str(input)
-            .map_err(|e| anyhow!("Invalid input mint: {}", e))?;
-        let output_mint = solana_sdk::pubkey::Pubkey::from_str(output)
-            .map_err(|e| anyhow!("Invalid output mint: {}", e))?;
-
-        if input_mint == output_mint {
-            return Err(anyhow!("Input and output mints must be different"));
-        }
-
-        // 2. Get quote from your API
-        let quote_start = Instant::now();
-        let quote = self.client.get_quote(input, output, amount, slippage_bps).await?;
-        let quote_time = quote_start.elapsed();
-
-        // Capture quote result used for the swap
-        let quote_result = QuoteResult {
-            out_amount: quote.out_amount,
-            price_impact: quote.price_impact_pct,
-            metadata: QuoteMetadata {
-                route: quote.route_info,
-                fees: quote.fees,
-                extra: None,
+        let quote: YourQuote = /* GET {api_url}/quote with request.input_mint, output_mint,
+                                  amount, slippage_bps */ todo!();
+        let out_amount = /* expected (not minimum) output */ todo!();
+        Ok(Quote {
+            aggregator: Aggregator::YourAggregator,
+            out_amount,
+            result: QuoteResult {
+                out_amount,
+                price_impact: 0.0,
+                metadata: QuoteMetadata::default(),
+                quote_time: Some(start.elapsed()),
             },
-            quote_time: Some(quote_time),
-        };
-
-        // 3. Build transaction (method varies by aggregator)
-        let transaction = self.client.build_swap_transaction(quote, self.signer.pubkey()).await?;
-
-        // 4. Sign transaction
-        let signed_tx = self.sign_transaction(transaction)?;
-
-        // 5. Submit and confirm
-        let sig = self.rpc_client.send_and_confirm_transaction_with_spinner_and_config(
-            &signed_tx,
-            solana_sdk::commitment_config::CommitmentConfig { commitment: commitment_level },
-            solana_client::rpc_config::RpcSendTransactionConfig {
-                skip_preflight: false,
-                preflight_commitment: Some(CommitmentLevel::Processed),
-                ..Default::default()
-            },
-        )?;
-
-        let execution_time = start.elapsed();
-
-        let swap_result = SwapResult {
-            signature: sig.to_string(),
-            out_amount: quote.out_amount,
-            slippage_bps_used: Some(slippage_bps),
-            aggregator_used: Some(Aggregator::YourAggregator),
-            execution_time: Some(execution_time),
-        };
-
-        Ok(SwapSummary {
-            swap_result,
-            quote_results: vec![(Aggregator::YourAggregator, quote_result)],
+            payload: QuotePayload::YourAggregator(Box::new(quote)),
         })
     }
 
-    async fn quote(
+    async fn build_transaction(
         &self,
-        input: &str,
-        output: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<QuoteResult> {
-        let start = Instant::now();
-
-        // Get quote (same as swap, but don't execute)
-        let quote = self.client.get_quote(input, output, amount, slippage_bps).await?;
-
-        let quote_time = start.elapsed();
-
-        Ok(QuoteResult {
-            out_amount: quote.out_amount,
-            price_impact: quote.price_impact_pct,
-            metadata: QuoteMetadata {
-                route: quote.route_info,
-                fees: quote.fees,
-                extra: None,
-            },
-            quote_time: Some(quote_time),
-        })
+        request: &SwapRequest,
+        quote: &Quote,
+    ) -> Result<VersionedTransaction> {
+        let QuotePayload::YourAggregator(your_quote) = &quote.payload else {
+            return Err(anyhow!("YourAggregator cannot build a {:?} quote", quote.aggregator));
+        };
+        // POST the quote back with request.wrap_and_unwrap_sol and
+        // request.compute_unit_price_micro_lamports, deserialize the transaction, then sign:
+        let unsigned: VersionedTransaction = todo!();
+        VersionedTransaction::try_new(unsigned.message, &[self.signer.as_ref()])
+            .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
     }
 }
 ```
 
----
+`out_amount` must mean the same thing on every venue — the **expected** output, not the
+slippage-adjusted minimum — or the best-price comparison is biased.
 
-### Step 2: Add Configuration
+## Step 2: Register the quote payload and module
 
-**File:** `src/config.rs`
+In `src/aggregators/mod.rs`:
 
-**2.1 Add to Aggregator Enum (lines 12-19)**
 ```rust
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Aggregator {
-    Jupiter,
-    Titan,
-    YourAggregator,  // ADD THIS
+pub mod your_aggregator;
+pub use your_aggregator::YourAggregator;
+
+pub(crate) enum QuotePayload {
+    // ...
+    YourAggregator(Box<your_aggregator::YourQuote>),
 }
 ```
 
-**2.2 Create Config Struct (after line 255)**
-```rust
-/// YourAggregator-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct YourAggregatorConfig {
-    /// API endpoint URL
-    pub api_url: String,
-    /// Optional API key
-    pub api_key: Option<String>,
-    // Add other aggregator-specific settings
-}
+## Step 3: Add configuration
 
-impl Default for YourAggregatorConfig {
-    fn default() -> Self {
-        Self {
-            api_url: "https://api.youraggregator.com".to_string(),
-            api_key: None,
-        }
-    }
-}
-```
+In `src/config.rs`:
 
-**2.3 Update ClientConfig (lines 305-325)**
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientConfig {
-    #[serde(default)]
-    pub shared: SharedConfig,
-    #[serde(default)]
-    pub jupiter: JupiterConfig,
-    #[serde(default)]
-    pub titan: Option<TitanConfig>,
-    #[serde(default)]
-    pub your_aggregator: Option<YourAggregatorConfig>,  // ADD THIS
-}
-```
+1. Add `YourAggregator` to the `Aggregator` enum.
+2. Add a `YourAggregatorConfig` struct (`#[serde(default)]`, with a `Default` impl) and an
+   `pub your_aggregator: Option<YourAggregatorConfig>` field on `ClientConfig`
+   (`#[serde(default)]`). It loads from `DEX_SUPERAGG_YOUR_AGGREGATOR__*`.
+3. Add `is_your_aggregator_configured()`.
+4. Add a `validate_your_aggregator()` connectivity check and call it from `validate()` for
+   `BestPrice`, `LowestSlippageClimber`, and `PreferredAggregator { YourAggregator }`.
 
-**2.4 Update Default Implementation (lines 317-325)**
-```rust
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            shared: SharedConfig::default(),
-            jupiter: JupiterConfig::default(),
-            titan: None,
-            your_aggregator: None,  // ADD THIS
-        }
-    }
-}
-```
+## Step 4: Wire it into the client
 
-**2.5 Add Helper Method (after line 356)**
-```rust
-/// Check if YourAggregator is configured
-pub fn is_your_aggregator_configured(&self) -> bool {
-    self.your_aggregator
-        .as_ref()
-        .map(|y| !y.api_url.is_empty())
-        .unwrap_or(false)
-}
-```
+In `src/client.rs`:
 
-**2.6 Add Validation Method (after line 534)**
-```rust
-/// Validate YourAggregator configuration and connectivity
-async fn validate_your_aggregator(&self) -> Result<(), Vec<String>> {
-    let mut errors = Vec::new();
-
-    let your_agg = match &self.your_aggregator {
-        Some(y) => y,
-        None => {
-            errors.push("YourAggregator is not configured".to_string());
-            return Err(errors);
-        }
-    };
-
-    if your_agg.api_url.is_empty() {
-        errors.push("YourAggregator API URL is required".to_string());
-        return Err(errors);
-    }
-
-    // Test connectivity (implement validate_your_aggregator_endpoint)
-    if let Err(e) = self.validate_your_aggregator_endpoint(your_agg).await {
-        errors.push(format!(
-            "YourAggregator API validation failed ({}): {}",
-            your_agg.api_url, e
-        ));
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-async fn validate_your_aggregator_endpoint(&self, config: &YourAggregatorConfig) -> anyhow::Result<()> {
-    use tokio::time::timeout;
-    use std::time::Duration;
-
-    // Test API connectivity with a simple HTTP request or WebSocket connection
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-
-    timeout(
-        Duration::from_secs(5),
-        client.get(&config.api_url).send(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("API request timeout"))?
-    .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
-
-    Ok(())
-}
-```
-
-**2.7 Update validate() Method (lines 392-449)**
-
-Add to BestPrice strategy section (around line 395-406):
-```rust
-RoutingStrategy::BestPrice => {
-    if let Err(errs) = self.validate_jupiter().await {
-        errors.extend(errs);
-    }
-    if self.titan.is_some() {
-        if let Err(errs) = self.validate_titan().await {
-            errors.extend(errs);
-        }
-    }
-    // ADD THIS:
-    if self.your_aggregator.is_some() {
-        if let Err(errs) = self.validate_your_aggregator().await {
-            errors.extend(errs);
-        }
-    }
-}
-```
-
-Add to PreferredAggregator match (around line 407-418):
-```rust
-RoutingStrategy::PreferredAggregator { aggregator, .. } => match aggregator {
-    Aggregator::Jupiter => { /* existing */ }
-    Aggregator::Titan => { /* existing */ }
-    // ADD THIS:
-    Aggregator::YourAggregator => {
-        if let Err(errs) = self.validate_your_aggregator().await {
-            errors.extend(errs);
-        }
-    }
-}
-```
-
----
-
-### Step 3: Export Aggregator Module
-
-**File:** `src/aggregators/mod.rs` (lines 108-112)
-
-```rust
-pub mod jupiter;
-pub mod titan;
-pub mod your_aggregator;  // ADD THIS
-
-pub use jupiter::JupiterAggregator;
-pub use titan::TitanAggregator;
-pub use your_aggregator::YourAggregator;  // ADD THIS
-```
-
----
-
-### Step 4: Integrate into DexSuperAggClient
-
-**File:** `src/client.rs`
-
-**4.1 Add Cached Aggregator Field (if persistent connection needed, after line 31)**
-```rust
-pub struct DexSuperAggClient {
-    signer: Arc<Keypair>,
-    rpc_client: RpcClient,
-    config: ClientConfig,
-    titan_aggregator: Arc<Mutex<Option<Arc<TitanAggregator>>>>,
-    your_aggregator: Arc<Mutex<Option<Arc<YourAggregator>>>>,  // ADD THIS if needed
-}
-```
-
-**4.2 Initialize in new() (update line 49)**
-```rust
-Ok(Self {
-    signer: Arc::new(signer),
-    rpc_client,
-    config,
-    titan_aggregator: Arc::new(Mutex::new(None)),
-    your_aggregator: Arc::new(Mutex::new(None)),  // ADD THIS if needed
-})
-```
-
-**4.3 Add Getter Method (after line 92, if persistent connection needed)**
-```rust
-async fn get_your_aggregator(&self) -> Result<Arc<YourAggregator>> {
-    let mut your_agg_opt = self.your_aggregator.lock().await;
-
-    if your_agg_opt.is_none() {
-        let your_agg = YourAggregator::new(&self.config, Arc::clone(&self.signer)).await?;
-        *your_agg_opt = Some(Arc::new(your_agg));
-    }
-
-    Ok(your_agg_opt.as_ref().unwrap().clone())
-}
-```
-
-**4.4 Update close() Method (lines 96-102)**
-```rust
-pub async fn close(&self) -> Result<()> {
-    let mut titan_opt = self.titan_aggregator.lock().await;
-    if let Some(titan) = titan_opt.take() {
-        titan.close().await?;
-    }
-    // ADD THIS:
-    let mut your_agg_opt = self.your_aggregator.lock().await;
-    if let Some(your_agg) = your_agg_opt.take() {
-        your_agg.close().await?;
-    }
-    Ok(())
-}
-```
-
-**4.5 Update swap_direct() (lines 314-361)**
-```rust
-async fn swap_direct(
-    &self,
-    input: &str,
-    output: &str,
-    amount: u64,
-    slippage_bps: u16,
-    aggregator: &Aggregator,
-    route_config: &RouteConfig,
-) -> Result<SwapResult> {
-    let mut result = match aggregator {
-        Aggregator::Jupiter => { /* existing */ },
-        Aggregator::Titan => { /* existing */ },
-        // ADD THIS:
-        Aggregator::YourAggregator => {
-            let your_agg = YourAggregator::new_with_compute_price(
-                &self.config,
-                Arc::clone(&self.signer),
-                route_config.compute_unit_price_micro_lamports,
-            )?;
-            // Or if using cached connection:
-            // let your_agg = self.get_your_aggregator().await?;
-            your_agg
-                .swap(
-                    input,
-                    output,
-                    amount,
-                    slippage_bps,
-                    route_config.commitment_level,
-                )
-                .await?
-        }
-    };
-
-    // Ensure aggregator_used is set
-    if result.swap_result.aggregator_used.is_none() {
-        result.swap_result.aggregator_used = Some(*aggregator);
-    }
-
-    Ok(result)
-}
-```
-
-**4.6 Update swap_best_price() (lines 525-607)**
-
-Add quote logic (around lines 549-557):
-```rust
-// YourAggregator quote (if configured)
-if self.config.is_your_aggregator_configured() {
-    if let Ok(your_agg) = YourAggregator::new_with_compute_price(
-        &self.config,
-        Arc::clone(&self.signer),
-        route_config.compute_unit_price_micro_lamports,
-    ) {
-        if let Ok(quote_result) = your_agg.quote(input, output, amount, slippage_bps).await {
-            quote_results.push((Aggregator::YourAggregator, quote_result.clone()));
-            comparison_results.push((Aggregator::YourAggregator, quote_result.out_amount));
-        }
-    }
-}
-```
-
-**4.8 Update Logging (lines 467-471, 571-574, 581-584)**
-```rust
-let agg_name = match agg {
-    Aggregator::Jupiter => "Jupiter",
-    Aggregator::Titan => "Titan",
-    Aggregator::YourAggregator => "YourAggregator",  // ADD THIS
-};
-```
-
----
-
-### Step 5: Environment Variables
-
-Users will configure your aggregator via environment variables:
-```bash
-DEX_SUPERAGG_YOUR_AGGREGATOR__API_URL='https://api.youraggregator.com'
-DEX_SUPERAGG_YOUR_AGGREGATOR__API_KEY='your_api_key'
-```
-
-Pattern: `DEX_SUPERAGG_{SECTION}__{FIELD}` where `{SECTION}` is uppercase snake_case
-
----
-
-### Step 6: Add Dependencies (if needed)
-
-**File:** `Cargo.toml`
-
-```toml
-[dependencies]
-your-aggregator-client = "1.0"
-# or from git:
-your-aggregator-client = { git = "https://github.com/...", rev = "..." }
-```
-
----
-
-### Step 7: Testing
-
-**Create tests in your aggregator module:**
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_your_aggregator_initialization() {
-        // Test config loading and initialization
-    }
-
-    #[tokio::test]
-    #[ignore]  // Requires API credentials
-    async fn test_swap() {
-        // Test actual swap execution
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_quote() {
-        // Test quote
-    }
-}
-```
-
----
-
-## Reference: Two Implementation Patterns
-
-### Pattern 1: HTTP-Based (like Jupiter)
-- Simple HTTP client
-- No persistent connection
-- Create new instance per swap or reuse across calls
-- Simpler initialization
-
-### Pattern 2: WebSocket-Based (like Titan)
-- Persistent WebSocket connection
-- Requires async initialization
-- Must implement close() for cleanup
-- Cache and reuse connection via `Arc<Mutex<Option<Arc<YourAgg>>>>`
-- More complex but efficient for multiple swaps
-
-Choose the pattern that matches your aggregator's API design.
-
----
-
-## Complete Integration Checklist
-
-- [ ] Step 1: Create aggregator implementation in `src/aggregators/your_aggregator/mod.rs`
-- [ ] Step 2.1: Add enum variant to `Aggregator` in `src/config.rs`
-- [ ] Step 2.2: Create `YourAggregatorConfig` struct in `src/config.rs`
-- [ ] Step 2.3: Add field to `ClientConfig` in `src/config.rs`
-- [ ] Step 2.4: Update `ClientConfig::default()`
-- [ ] Step 2.5: Add `is_your_aggregator_configured()` helper
-- [ ] Step 2.6: Add `validate_your_aggregator()` and endpoint validation
-- [ ] Step 2.7: Update `validate()` method for routing strategies
-- [ ] Step 3: Export module in `src/aggregators/mod.rs`
-- [ ] Step 4.1: Add cached aggregator field (if needed)
-- [ ] Step 4.2: Initialize in `DexSuperAggClient::new()`
-- [ ] Step 4.3: Add getter method (if persistent connection)
-- [ ] Step 4.4: Update `close()` method
-- [ ] Step 4.5: Update `swap_direct()` with match arm
-- [ ] Step 4.6: Update `swap_best_price()` to include in comparison
-- [ ] Step 4.8: Update all logging statements with aggregator name
-- [ ] Step 5: Document environment variables in README
-- [ ] Step 6: Add dependencies to `Cargo.toml`
-- [ ] Step 7: Write tests for your aggregator
-- [ ] Update `.env` file with test credentials
-- [ ] Update `examples/basic_swap.rs` to demonstrate your aggregator
-- [ ] Update `CLAUDE.md` to mention new aggregator
-
----
-
-## Verification
-
-After integration, verify with:
-
-1. **Build**: `cargo build`
-2. **Tests**: `cargo test`
-3. **Example with your aggregator**:
-   ```bash
-   source .env
-   cargo run --example basic_swap
+1. Add `your_aggregator: Option<YourAggregator>` to `DexSuperAggClient` and construct it in `new()`
+   when `config.is_your_aggregator_configured()`, like the existing venues.
+2. Add the arm to `venue()`:
+   ```rust
+   Aggregator::YourAggregator => self.your_aggregator.as_ref().map(|v| v as &dyn DexAggregator),
    ```
-4. **Test all routing strategies**:
-   - BestPrice (should compare your aggregator too)
-   - PreferredAggregator with `YourAggregator`
-   - LowestSlippageClimber (includes your aggregator)
+3. Add `Aggregator::YourAggregator` to the list in `venues()`. Its position breaks exact ties in
+   output amount.
+4. If the venue holds a connection, close it in `close()`.
 
----
+That's all — quoting, comparison, fallback, min-out handling and submission come for free.
 
-## Files Modified Summary
+## Step 5: Test
 
-Total: **3 main files + 1 new file**
+- Unit-test the request/response mapping and, especially, the SOL flags: for both values of
+  `wrap_and_unwrap_sol`, check what the venue is asked to do with a wSOL input and a wSOL output
+  (see the tests in `src/aggregators/titan/mod.rs`).
+- If the venue returns raw instructions, test the assembled instruction list (compute budget, wrap,
+  route) like `src/aggregators/titan/transaction_builder.rs`.
+- A WebSocket venue should get mock-server tests for concurrent requests, an unanswered request
+  (must time out, not hang), and a server-side disconnect (must reconnect) — see
+  `src/aggregators/titan/client.rs`.
+- Run the ignored end-to-end test with real credentials:
+  `cargo test test_all_swap -- --nocapture --ignored`.
 
-1. **NEW**: `src/aggregators/your_aggregator/mod.rs` - Your implementation
-2. `src/config.rs` - Configuration (~8 locations)
-3. `src/client.rs` - Client integration (~6 locations)
-4. `src/aggregators/mod.rs` - Exports (~2 lines)
+## Checklist
 
-Plus optional: `Cargo.toml`, `.env`, `README.md`, `CLAUDE.md`, tests, examples
-
----
-
-## Example Aggregators to Consider
-
-Popular Solana DEX aggregators you might want to integrate:
-- **Raydium** - One of the largest AMMs on Solana
-- **Orca** - Popular concentrated liquidity protocol
-- **Phoenix** - Order book-based DEX
-- **Lifinity** - Proactive market maker
-- **Meteora** - Dynamic liquidity marketplace
-- **Drift** - Perpetuals and spot trading
-
----
-
-This guide provides a complete blueprint for integrating any new DEX aggregator into the solana-dex-superagg library.
+- [ ] `src/aggregators/your_aggregator/mod.rs` implements `kind`, `quote`, `build_transaction`
+- [ ] `quote` returns the expected output; `build_transaction` builds that exact quote
+- [ ] `wrap_and_unwrap_sol` and the CU price are honoured
+- [ ] HTTP/WebSocket clients are created once
+- [ ] `QuotePayload` variant and module export added
+- [ ] `Aggregator` variant, config struct, `is_*_configured`, validation added
+- [ ] Client field, `new()`, `venue()`, `venues()` and (if needed) `close()` updated
+- [ ] Unit tests for request mapping and SOL handling; mock tests for sockets
+- [ ] README environment variables documented

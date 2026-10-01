@@ -1,6 +1,6 @@
 [package]
 name = "solana-dex-superagg"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 description = "A Rust library for accessing Titan and Jupiter DEX aggregators on Solana with smart routing strategies"
 license = "MIT"
@@ -36,7 +36,7 @@ reqwest = { version = "0.12", features = ["json"] }
 rmp-serde = "1.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
