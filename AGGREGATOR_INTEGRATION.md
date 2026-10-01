@@ -34,11 +34,11 @@ transaction for exactly that quote*. It must not retry, sleep, submit, or swallo
    from its payload; don't re-quote (the client compared venues on that number).
 2. **Honour `SwapRequest::wrap_and_unwrap_sol` exactly** (see its doc comment). `false` means a wSOL
    input/output stays in the wallet's wSOL ATA and the ATA is never closed; `true` means native SOL
-   in and out. If the venue's API has a flag for this, map it; if it returns raw instructions, use
-   the helpers in `src/aggregators/sol.rs` (see Titan).
+   in and out. If the venue's API has a flag for this, map it; if it returns raw instructions, add
+   the wrap yourself (see `src/aggregators/titan/transaction_builder.rs`).
 3. **Apply `compute_unit_price_micro_lamports`** as a per-CU price (not a total fee). If the venue
-   returns raw instructions, also set a CU limit (`sol::set_compute_unit_limit`) — without one the
-   transaction runs under the 200k default.
+   returns raw instructions, also set a CU limit (`ComputeBudgetInstruction::set_compute_unit_limit`)
+   — without one the transaction runs under the 200k default.
 4. **Reuse connections.** Create HTTP/WebSocket clients once in the constructor. The client
    applies timeouts around your calls, but long-lived sockets need their own reconnect logic (see
    `src/aggregators/titan/client.rs`).
@@ -94,7 +94,6 @@ impl DexAggregator for YourAggregator {
         let out_amount = /* expected (not minimum) output */ todo!();
         Ok(Quote {
             aggregator: Aggregator::YourAggregator,
-            out_amount,
             result: QuoteResult {
                 out_amount,
                 price_impact: 0.0,
@@ -148,22 +147,21 @@ In `src/config.rs`:
    `pub your_aggregator: Option<YourAggregatorConfig>` field on `ClientConfig`
    (`#[serde(default)]`). It loads from `DEX_SUPERAGG_YOUR_AGGREGATOR__*`.
 3. Add `is_your_aggregator_configured()`.
-4. Add a `validate_your_aggregator()` connectivity check and call it from `validate()` for
-   `BestPrice`, `LowestSlippageClimber`, and `PreferredAggregator { YourAggregator }`.
+4. Add a `validate_your_aggregator()` connectivity check and call it from `validate()` next to the
+   other venues.
 
 ## Step 4: Wire it into the client
 
-In `src/client.rs`:
+In `DexSuperAggClient::new()` (`src/client.rs`), push the venue when it's configured:
 
-1. Add `your_aggregator: Option<YourAggregator>` to `DexSuperAggClient` and construct it in `new()`
-   when `config.is_your_aggregator_configured()`, like the existing venues.
-2. Add the arm to `venue()`:
-   ```rust
-   Aggregator::YourAggregator => self.your_aggregator.as_ref().map(|v| v as &dyn DexAggregator),
-   ```
-3. Add `Aggregator::YourAggregator` to the list in `venues()`. Its position breaks exact ties in
-   output amount.
-4. If the venue holds a connection, close it in `close()`.
+```rust
+if config.is_your_aggregator_configured() {
+    venues.push(Box::new(YourAggregator::new(&config, Arc::clone(&signer))?));
+}
+```
+
+Its position in `venues` breaks exact ties in output amount. If the venue holds a connection,
+override `DexAggregator::close`.
 
 That's all — quoting, comparison, fallback, min-out handling and submission come for free.
 
@@ -188,6 +186,6 @@ That's all — quoting, comparison, fallback, min-out handling and submission co
 - [ ] HTTP/WebSocket clients are created once
 - [ ] `QuotePayload` variant and module export added
 - [ ] `Aggregator` variant, config struct, `is_*_configured`, validation added
-- [ ] Client field, `new()`, `venue()`, `venues()` and (if needed) `close()` updated
+- [ ] Venue pushed in `DexSuperAggClient::new()`; `close()` overridden if it holds a connection
 - [ ] Unit tests for request mapping and SOL handling; mock tests for sockets
 - [ ] README environment variables documented

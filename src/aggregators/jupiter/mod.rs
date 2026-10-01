@@ -30,15 +30,8 @@ impl JupiterAggregator {
             .api_key
             .clone()
             .ok_or_else(|| anyhow!("Jupiter API key is not configured"))?;
-        Self::with_config(&config.jupiter.jup_swap_api_url, signer, api_key)
-    }
-
-    pub fn with_config(
-        jupiter_api_url: &str,
-        signer: Arc<Keypair>,
-        api_key: String,
-    ) -> Result<Self> {
-        let jupiter_client = JupiterSwapApiClient::new(jupiter_api_url.to_string(), api_key)?;
+        let jupiter_client =
+            JupiterSwapApiClient::new(config.jupiter.jup_swap_api_url.clone(), api_key)?;
         Ok(Self {
             jupiter_client,
             signer,
@@ -87,7 +80,6 @@ impl DexAggregator for JupiterAggregator {
 
         Ok(Quote {
             aggregator: Aggregator::Jupiter,
-            out_amount: quote_response.out_amount,
             result,
             payload: QuotePayload::Jupiter(Box::new(quote_response)),
         })
@@ -113,8 +105,7 @@ impl DexAggregator for JupiterAggregator {
                     quote_response: (**quote_response).clone(),
                     config: TransactionConfig {
                         wrap_and_unwrap_sol: request.wrap_and_unwrap_sol,
-                        // Jupiter simulates the swap and sizes the CU limit to it, so the priority
-                        // fee is paid on what the route uses rather than on the 1.4M default.
+                        // CU limit sized to the simulated route instead of the 1.4M default.
                         dynamic_compute_unit_limit: true,
                         compute_unit_price_micro_lamports: (request
                             .compute_unit_price_micro_lamports

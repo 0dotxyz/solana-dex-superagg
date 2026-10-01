@@ -19,8 +19,11 @@ solana-sdk = "=3.0.0"
 solana-program = "=3.0.0"
 solana-client = "=3.1.11"
 solana-commitment-config = "3.1.1"
+solana-address-lookup-table-interface = { version = "3.1.0", features = ["bincode", "bytemuck"] }
+solana-compute-budget-interface = "3.0.0"
+solana-system-interface = { version = "3.2.0", features = ["bincode"] }
 spl-associated-token-account = { version = "8.0.0", default-features = false, features = ["no-entrypoint"] }
-spl-token = "9.0.0"
+spl-token-interface = "2.0.0"
 
 anyhow = "1.0.102"
 async-trait = "0.1"
@@ -30,7 +33,6 @@ bs58 = "0.5"
 bytes = "1.7"
 dotenvy = "0.15.0"
 figment = { version = "0.10", features = ["env", "test"] }
-fixed = "=1.28.0"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 rmp-serde = "1.3"

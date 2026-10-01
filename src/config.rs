@@ -179,8 +179,6 @@ pub struct SharedConfig {
     pub compute_unit_price_micro_lamports: u64,
     /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
     pub routing_strategy: Option<RoutingStrategy>,
-    /// Number of times to retry transaction landing/submission for LowestSlippageClimber strategy
-    pub retry_tx_landing: u32,
     /// Commitment level for transaction confirmation (defaults to Confirmed)
     /// Options: "processed", "confirmed", "finalized"
     /// - Processed: Fastest (~400ms), but can be rolled back
@@ -205,7 +203,6 @@ impl Default for SharedConfig {
             wallet_keypair: None,
             compute_unit_price_micro_lamports: 0,
             routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
-            retry_tx_landing: 3, // Default to 3 retries for transaction landing
             commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed for good balance
             quote_timeout_ms: 5_000,
             build_timeout_ms: 10_000,
@@ -223,12 +220,7 @@ pub struct JupiterConfig {
     /// Jupiter API key (optional, but recommended for production use)
     /// Get your API key from https://portal.jup.ag/
     ///
-    /// **Note**: Currently stored but not yet used in requests. The jupiter-swap-api-client
-    /// crate doesn't support custom headers yet. To use API keys, you'll need to either:
-    /// 1. Wait for the crate to add API key support
-    /// 2. Fork/wrap the crate to add x-api-key header support
-    ///
-    /// Environment variable: `DEX_SUPERAGG_JUPITER__API_KEY`
+    /// Required for Jupiter to be used. Environment variable: `DEX_SUPERAGG_JUPITER__API_KEY`
     pub api_key: Option<String>,
 }
 
@@ -304,7 +296,6 @@ impl std::fmt::Debug for SharedConfig {
                 &self.compute_unit_price_micro_lamports,
             )
             .field("routing_strategy", &self.routing_strategy)
-            .field("retry_tx_landing", &self.retry_tx_landing)
             .field("commitment_level", &self.commitment_level)
             .field("quote_timeout_ms", &self.quote_timeout_ms)
             .field("build_timeout_ms", &self.build_timeout_ms)
@@ -350,8 +341,6 @@ pub struct RouteConfig {
     pub compute_unit_price_micro_lamports: u64,
     /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
     pub routing_strategy: Option<RoutingStrategy>,
-    /// Number of times to retry transaction landing/submission for LowestSlippageClimber strategy
-    pub retry_tx_landing: u32,
     /// Behavior for handling output Associated Token Account (ATA) creation
     #[serde(default)]
     pub output_ata: OutputAtaBehavior,
@@ -369,9 +358,8 @@ impl Default for RouteConfig {
         Self {
             compute_unit_price_micro_lamports: 0,
             routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
-            retry_tx_landing: 3,
-            output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
-            slippage_bps: None,                    // Use config default if not specified
+            output_ata: OutputAtaBehavior::Create,              // Default to creating the ATA
+            slippage_bps: None, // Use config default if not specified
             commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed
             wrap_and_unwrap_sol: false,
         }
@@ -383,7 +371,6 @@ impl From<&SharedConfig> for RouteConfig {
         Self {
             compute_unit_price_micro_lamports: shared.compute_unit_price_micro_lamports,
             routing_strategy: shared.routing_strategy.clone(),
-            retry_tx_landing: shared.retry_tx_landing,
             output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
             slippage_bps: None,                    // Use config default
             commitment_level: shared.commitment_level, // Copy from shared config
@@ -484,83 +471,30 @@ impl ClientConfig {
             if let Err(e) = self.validate_rpc_url().await {
                 errors.push(format!(
                     "RPC URL validation failed ({}): {}",
-                    self.shared.rpc_url, e
+                    redact_url(&self.shared.rpc_url),
+                    e
                 ));
             }
         } else {
             errors.push("RPC URL is required".to_string());
         }
 
-        // Validate aggregators based on routing strategy requirements
-        if let Some(ref strategy) = self.shared.routing_strategy {
-            match strategy {
-                RoutingStrategy::BestPrice => {
-                    // BestPrice strategy compares all available aggregators
-                    // Validate Jupiter (always required) and Titan/DFlow if configured
-                    if let Err(errs) = self.validate_jupiter().await {
-                        errors.extend(errs);
-                    }
-                    if self.titan.is_some() {
-                        if let Err(errs) = self.validate_titan().await {
-                            errors.extend(errs);
-                        }
-                    }
-                    if self.dflow.is_some() {
-                        if let Err(errs) = self.validate_dflow().await {
-                            errors.extend(errs);
-                        }
-                    }
-                }
-                RoutingStrategy::PreferredAggregator { aggregator, .. } => match aggregator {
-                    Aggregator::Jupiter => {
-                        if let Err(errs) = self.validate_jupiter().await {
-                            errors.extend(errs);
-                        }
-                    }
-                    Aggregator::Titan => {
-                        if let Err(errs) = self.validate_titan().await {
-                            errors.extend(errs);
-                        }
-                    }
-                    Aggregator::Dflow => {
-                        if let Err(errs) = self.validate_dflow().await {
-                            errors.extend(errs);
-                        }
-                    }
-                },
-                RoutingStrategy::LowestSlippageClimber { .. } => {
-                    // This strategy requires Jupiter and Titan/DFlow (if configured)
-                    if let Err(errs) = self.validate_jupiter().await {
-                        errors.extend(errs);
-                    }
-                    if self.titan.is_some() {
-                        if let Err(errs) = self.validate_titan().await {
-                            errors.extend(errs);
-                        }
-                    }
-                    if self.dflow.is_some() {
-                        if let Err(errs) = self.validate_dflow().await {
-                            errors.extend(errs);
-                        }
-                    }
-                }
-            }
-        } else {
-            // No routing strategy specified: validate Jupiter (always required) and Titan/DFlow if configured
-            // This should rarely happen now since BestPrice is the default
-            if let Err(errs) = self.validate_jupiter().await {
-                errors.extend(errs);
-            }
-            if self.titan.is_some() {
-                if let Err(errs) = self.validate_titan().await {
-                    errors.extend(errs);
-                }
-            }
-            if self.dflow.is_some() {
-                if let Err(errs) = self.validate_dflow().await {
-                    errors.extend(errs);
-                }
-            }
+        // Every configured venue (Jupiter always), or only the preferred one.
+        let preferred = match &self.shared.routing_strategy {
+            Some(RoutingStrategy::PreferredAggregator { aggregator }) => Some(*aggregator),
+            _ => None,
+        };
+        let check = |aggregator: Aggregator, configured: bool| {
+            preferred.map_or(configured, |preferred| preferred == aggregator)
+        };
+        if check(Aggregator::Jupiter, true) {
+            errors.extend(self.validate_jupiter().await.err().unwrap_or_default());
+        }
+        if check(Aggregator::Titan, self.titan.is_some()) {
+            errors.extend(self.validate_titan().await.err().unwrap_or_default());
+        }
+        if check(Aggregator::Dflow, self.dflow.is_some()) {
+            errors.extend(self.validate_dflow().await.err().unwrap_or_default());
         }
 
         if errors.is_empty() {

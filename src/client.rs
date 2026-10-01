@@ -1,5 +1,5 @@
 use crate::aggregators::{
-    dflow::DflowAggregator, jupiter::JupiterAggregator, sol, titan::TitanAggregator, DexAggregator,
+    dflow::DflowAggregator, jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator,
     Quote, QuoteResult, SwapRequest, SwapResult, SwapSummary, SwapTransaction,
 };
 use crate::config::{Aggregator, ClientConfig, OutputAtaBehavior, RouteConfig, RoutingStrategy};
@@ -17,6 +17,7 @@ use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
 };
+use spl_token_interface::native_mint;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,9 +47,8 @@ pub struct DexSuperAggClient {
     rpc_client: Arc<RpcClient>,
     /// Client configuration
     config: ClientConfig,
-    jupiter: Option<JupiterAggregator>,
-    titan: Option<TitanAggregator>,
-    dflow: Option<DflowAggregator>,
+    /// Configured venues; their order breaks ties in output amount.
+    venues: Vec<Box<dyn DexAggregator>>,
 }
 
 /// A built transaction plus every quote that was compared to choose it.
@@ -83,19 +83,27 @@ impl DexSuperAggClient {
             CommitmentConfig::confirmed(),
         ));
 
-        let jupiter = config
-            .is_jupiter_configured()
-            .then(|| JupiterAggregator::new(&config, Arc::clone(&signer)))
-            .transpose()?;
-        let titan = config
-            .is_titan_configured()
-            .then(|| TitanAggregator::new(&config, Arc::clone(&signer), Arc::clone(&rpc_client)))
-            .transpose()?;
-        let dflow = config
-            .is_dflow_configured()
-            .then(|| DflowAggregator::new(&config, Arc::clone(&signer)))
-            .transpose()?;
-        if jupiter.is_none() && titan.is_none() && dflow.is_none() {
+        let mut venues: Vec<Box<dyn DexAggregator>> = Vec::new();
+        if config.is_jupiter_configured() {
+            venues.push(Box::new(JupiterAggregator::new(
+                &config,
+                Arc::clone(&signer),
+            )?));
+        }
+        if config.is_titan_configured() {
+            venues.push(Box::new(TitanAggregator::new(
+                &config,
+                Arc::clone(&signer),
+                Arc::clone(&rpc_client),
+            )?));
+        }
+        if config.is_dflow_configured() {
+            venues.push(Box::new(DflowAggregator::new(
+                &config,
+                Arc::clone(&signer),
+            )?));
+        }
+        if venues.is_empty() {
             bail!("No DEX aggregator is configured");
         }
 
@@ -103,9 +111,7 @@ impl DexSuperAggClient {
             signer,
             rpc_client,
             config,
-            jupiter,
-            titan,
-            dflow,
+            venues,
         })
     }
 
@@ -135,22 +141,21 @@ impl DexSuperAggClient {
         &self.signer
     }
 
-    /// Close the Titan WebSocket connection
+    /// Close venue connections (Titan's WebSocket)
     /// Call this when you're done with the client to clean up resources
     pub async fn close(&self) -> Result<()> {
-        if let Some(titan) = &self.titan {
-            titan.close().await?;
+        for venue in &self.venues {
+            venue.close().await?;
         }
         Ok(())
     }
 
     fn venue(&self, aggregator: Aggregator) -> Result<&dyn DexAggregator> {
-        let venue: Option<&dyn DexAggregator> = match aggregator {
-            Aggregator::Jupiter => self.jupiter.as_ref().map(|v| v as &dyn DexAggregator),
-            Aggregator::Titan => self.titan.as_ref().map(|v| v as &dyn DexAggregator),
-            Aggregator::Dflow => self.dflow.as_ref().map(|v| v as &dyn DexAggregator),
-        };
-        venue.ok_or_else(|| anyhow!("{:?} is not configured", aggregator))
+        self.venues
+            .iter()
+            .find(|venue| venue.kind() == aggregator)
+            .map(|venue| venue.as_ref())
+            .ok_or_else(|| anyhow!("{:?} is not configured", aggregator))
     }
 
     /// The venues a strategy quotes.
@@ -159,10 +164,7 @@ impl DexSuperAggClient {
             Some(RoutingStrategy::PreferredAggregator { aggregator }) => {
                 Ok(vec![self.venue(*aggregator)?])
             }
-            _ => Ok([Aggregator::Jupiter, Aggregator::Titan, Aggregator::Dflow]
-                .into_iter()
-                .filter_map(|aggregator| self.venue(aggregator).ok())
-                .collect()),
+            _ => Ok(self.venues.iter().map(|venue| venue.as_ref()).collect()),
         }
     }
 
@@ -254,12 +256,12 @@ impl DexSuperAggClient {
         }
 
         // Stable: on a tie the configured order (Jupiter, Titan, DFlow) decides.
-        quotes.sort_by(|a, b| b.out_amount.cmp(&a.out_amount));
+        quotes.sort_by(|a, b| b.result.out_amount.cmp(&a.result.out_amount));
         tracing::debug!(
             input = %request.input_mint,
             output = %request.output_mint,
             amount = request.amount,
-            quotes = ?quotes.iter().map(|q| (q.aggregator, q.out_amount)).collect::<Vec<_>>(),
+            quotes = ?quotes.iter().map(|q| (q.aggregator, q.result.out_amount)).collect::<Vec<_>>(),
             "Collected quotes"
         );
         Ok(quotes)
@@ -280,7 +282,10 @@ impl DexSuperAggClient {
         let build_timeout = Duration::from_millis(self.config.shared.build_timeout_ms);
 
         let mut failures = Vec::new();
-        for quote in quotes.iter().filter(|quote| quote.out_amount >= min_out) {
+        for quote in quotes
+            .iter()
+            .filter(|quote| quote.result.out_amount >= min_out)
+        {
             let venue = self.venue(quote.aggregator)?;
             let built = match timeout(build_timeout, venue.build_transaction(request, quote)).await
             {
@@ -292,7 +297,7 @@ impl DexSuperAggClient {
                     tracing::info!(
                         aggregator = ?quote.aggregator,
                         in_amount = request.amount,
-                        out_amount = quote.out_amount,
+                        out_amount = quote.result.out_amount,
                         quotes = ?quote_results.iter().map(|(a, q)| (*a, q.out_amount)).collect::<Vec<_>>(),
                         "Selected aggregator"
                     );
@@ -300,7 +305,7 @@ impl DexSuperAggClient {
                         prepared: SwapTransaction {
                             transaction,
                             in_amount: request.amount,
-                            out_amount: quote.out_amount,
+                            out_amount: quote.result.out_amount,
                             slippage_bps_used: Some(request.slippage_bps),
                             aggregator_used: Some(quote.aggregator),
                             quote_result: quote.result.clone(),
@@ -319,7 +324,7 @@ impl DexSuperAggClient {
             bail!(
                 "No quote yields the required {} (best {})",
                 min_out,
-                quotes.first().map(|q| q.out_amount).unwrap_or(0)
+                quotes.first().map(|q| q.result.out_amount).unwrap_or(0)
             );
         }
         bail!(
@@ -343,7 +348,7 @@ impl DexSuperAggClient {
         self.build_best(&request, quotes, 0).await
     }
 
-    /// Quote every venue the default route configuration uses, best first, without building.
+    /// Quote every venue of `route_config`'s strategy, best first, without building.
     pub async fn quote(
         &self,
         input: &str,
@@ -399,7 +404,7 @@ impl DexSuperAggClient {
         if route_config.output_ata == OutputAtaBehavior::Create {
             let output_mint = parse_mint(output)?;
             // A native-SOL output has no token account to create.
-            if !(route_config.wrap_and_unwrap_sol && output_mint == sol::WSOL_MINT) {
+            if !(route_config.wrap_and_unwrap_sol && output_mint == native_mint::ID) {
                 self.create_ata_if_needed(&output_mint).await?;
             }
         }
@@ -509,15 +514,10 @@ impl DexSuperAggClient {
         .await
     }
 
-    /// Build a signed exact-in swap transaction that is expected to yield at least `min_out`, using
-    /// a custom route configuration.
-    ///
-    /// Quotes `initial_amount` first. If no venue yields `min_out`, the input is raised by the
-    /// observed shortfall ratio (plus a small margin) and re-quoted, at most
-    /// `MIN_OUT_MAX_REQUOTES` times — but never above `max_in_amount`. Pass the most the caller
-    /// can afford to spend (e.g. derived from an oracle price); `None` caps it at
-    /// [`DEFAULT_MAX_INPUT_BUMP`] × `initial_amount`. The returned transaction's quote always
-    /// yields at least `min_out` for at most the cap.
+    /// Build a signed exact-in swap transaction yielding at least `min_out`. If the quote for
+    /// `initial_amount` falls short, the input is raised by the shortfall and re-quoted (at most
+    /// `MIN_OUT_MAX_REQUOTES` times), never above `max_in_amount` (default:
+    /// [`DEFAULT_MAX_INPUT_BUMP`] × `initial_amount`).
     pub async fn build_swap_transaction_for_min_out_with_route_config(
         &self,
         input: &str,
@@ -549,7 +549,7 @@ impl DexSuperAggClient {
             let quotes = self
                 .collect_quotes(&request, route_config.routing_strategy.as_ref())
                 .await?;
-            let best_out = quotes[0].out_amount;
+            let best_out = quotes[0].result.out_amount;
             if best_out >= min_out {
                 return Ok(self.build_best(&request, quotes, min_out).await?.prepared);
             }

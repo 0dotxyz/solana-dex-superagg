@@ -100,7 +100,7 @@ cargo run --example basic_swap
    - **Jupiter** (`src/aggregators/jupiter/mod.rs`): HTTP via `jupiter-swap-api-client`;
      `dynamicComputeUnitLimit` on, simulation errors rejected
    - **Titan** (`src/aggregators/titan/`): WebSocket + MessagePack. Routes come back as bare
-     instructions; we add the compute budget and native-SOL wrap (`sol.rs`) and compile the tx
+     instructions; we add the compute budget and native-SOL wrap and compile the tx
    - **DFlow** (`src/aggregators/dflow/mod.rs`): HTTP; passes `wrapAndUnwrapSol` and
      `computeUnitPriceMicroLamports`
 
@@ -168,7 +168,7 @@ The library supports three distinct routing strategies defined in `config.rs`:
 - Native SOL mint: `So11111111111111111111111111111111111111112`
 - `wrap_and_unwrap_sol = false`: wSOL stays in the wallet's wSOL ATA, which is never closed (the ATA
   must exist for a wSOL input). `true`: native SOL in/out; the wSOL ATA is closed afterwards.
-- Titan has no input-side flag, so for `true` with a SOL input we prepend `sol::wrap_sol_instructions`
+- Titan has no input-side flag, so for `true` with a SOL input we prepend the wrap instructions
   and ask Titan to close the input account; `outputWsol` controls the output side.
 - `swap*` doesn't create an ATA for a native-SOL output
 
@@ -181,7 +181,6 @@ src/
 ├── config.rs                       # Configuration types and loading
 └── aggregators/
     ├── mod.rs                      # DexAggregator trait and shared types
-    ├── sol.rs                      # Compute-budget and SOL-wrap instruction helpers
     ├── jupiter/
     │   └── mod.rs                  # Jupiter HTTP client
     ├── dflow/

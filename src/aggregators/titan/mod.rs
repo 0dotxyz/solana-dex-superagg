@@ -7,15 +7,17 @@ mod transaction_builder;
 mod types;
 
 use crate::aggregators::{
-    sol, DexAggregator, Quote, QuoteMetadata, QuotePayload, QuoteResult, SwapRequest,
+    DexAggregator, Quote, QuoteMetadata, QuotePayload, QuoteResult, SwapRequest,
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
+    message::{v0, VersionedMessage},
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
 };
+use spl_token_interface::native_mint;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -65,19 +67,11 @@ impl TitanAggregator {
             signer,
         })
     }
-
-    /// Close the WebSocket connection
-    pub async fn close(&self) -> Result<()> {
-        self.titan_client
-            .close()
-            .await
-            .map_err(|e| anyhow!("Failed to close Titan connection: {}", e))
-    }
 }
 
 /// Whether we wrap the input ourselves: Titan swaps a wSOL input out of the wSOL ATA as-is.
 fn wraps_input(request: &SwapRequest) -> bool {
-    request.wrap_and_unwrap_sol && request.input_mint == sol::WSOL_MINT
+    request.wrap_and_unwrap_sol && request.input_mint == native_mint::ID
 }
 
 fn quote_request(request: &SwapRequest, user: &solana_sdk::pubkey::Pubkey) -> SwapQuoteRequest {
@@ -152,7 +146,6 @@ impl DexAggregator for TitanAggregator {
 
         Ok(Quote {
             aggregator: Aggregator::Titan,
-            out_amount: route.out_amount,
             result,
             payload: QuotePayload::Titan(Box::new(route)),
         })
@@ -183,7 +176,7 @@ impl DexAggregator for TitanAggregator {
             &payer,
             request.compute_unit_price_micro_lamports,
             wraps_input(request).then_some(request.amount),
-        );
+        )?;
         let (lookup_tables, blockhash) = tokio::try_join!(
             transaction_builder::fetch_lookup_tables(&self.rpc_client, route),
             async {
@@ -193,11 +186,18 @@ impl DexAggregator for TitanAggregator {
                     .map_err(|e| anyhow!("Failed to get blockhash: {}", e))
             }
         )?;
-        let message =
-            transaction_builder::compile_message(&payer, &instructions, &lookup_tables, blockhash)?;
+        let message = v0::Message::try_compile(&payer, &instructions, &lookup_tables, blockhash)
+            .map_err(|e| anyhow!("Failed to compile V0 message: {}", e))?;
 
-        VersionedTransaction::try_new(message, &[self.signer.as_ref()])
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[self.signer.as_ref()])
             .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.titan_client
+            .close()
+            .await
+            .map_err(|e| anyhow!("Failed to close Titan connection: {}", e))
     }
 }
 
@@ -222,12 +222,12 @@ mod tests {
         let usdc = Pubkey::new_unique();
         let user = Pubkey::new_unique();
 
-        let sell = request(sol::WSOL_MINT, usdc, false);
+        let sell = request(native_mint::ID, usdc, false);
         assert!(!wraps_input(&sell));
         let params = quote_request(&sell, &user).transaction;
         assert_eq!(params.close_input_token_account, Some(false));
 
-        let buy = request(usdc, sol::WSOL_MINT, false);
+        let buy = request(usdc, native_mint::ID, false);
         assert_eq!(
             quote_request(&buy, &user).transaction.output_wsol,
             Some(true)
@@ -239,7 +239,7 @@ mod tests {
         let usdc = Pubkey::new_unique();
         let user = Pubkey::new_unique();
 
-        let sell = request(sol::WSOL_MINT, usdc, true);
+        let sell = request(native_mint::ID, usdc, true);
         assert!(wraps_input(&sell));
         assert_eq!(
             quote_request(&sell, &user)
@@ -248,7 +248,7 @@ mod tests {
             Some(true)
         );
 
-        let buy = request(usdc, sol::WSOL_MINT, true);
+        let buy = request(usdc, native_mint::ID, true);
         assert!(!wraps_input(&buy));
         assert_eq!(
             quote_request(&buy, &user).transaction.output_wsol,

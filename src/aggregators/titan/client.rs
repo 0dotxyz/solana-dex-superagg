@@ -392,18 +392,6 @@ impl TitanClient {
         }
     }
 
-    /// Request server information
-    pub async fn get_info(&self) -> Result<ServerInfo, String> {
-        let deadline = Instant::now() + self.request_timeout;
-        let (_, response) = self
-            .request(RequestData::GetInfo(GetInfoRequest {}), None, deadline)
-            .await?;
-        match response.data {
-            ResponseData::GetInfo(info) => Ok(info),
-            _ => Err("Unexpected response type".to_string()),
-        }
-    }
-
     /// Open a quote stream for `request`, take the first update that contains an executable route,
     /// and stop the stream. Returns the best route (highest out amount) and its provider id.
     ///

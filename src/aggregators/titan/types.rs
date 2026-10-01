@@ -51,16 +51,9 @@ pub struct ClientRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum RequestData {
-    GetInfo(GetInfoRequest),
     NewSwapQuoteStream(SwapQuoteRequest),
     StopStream(StopStreamRequest),
-    GetVenues(GetVenuesRequest),
-    ListProviders(ListProvidersRequest),
 }
-
-/// Get server info request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetInfoRequest {}
 
 /// Swap quote request parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,22 +132,6 @@ pub struct StopStreamRequest {
     pub id: u32,
 }
 
-/// Get venues request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetVenuesRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_program_ids: Option<bool>,
-}
-
-/// List providers request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListProvidersRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_icons: Option<bool>,
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
 // Response Types
 // ══════════════════════════════════════════════════════════════════════════════
@@ -192,77 +169,8 @@ pub struct ResponseError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ResponseData {
-    GetInfo(ServerInfo),
     NewSwapQuoteStream(QuoteSwapStreamResponse),
     StreamStopped(StopStreamResponse),
-    GetVenues(VenueInfo),
-    ListProviders(Vec<ProviderInfo>),
-}
-
-/// Server information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerInfo {
-    pub protocol_version: VersionInfo,
-    pub settings: ServerSettings,
-}
-
-/// Version information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionInfo {
-    pub major: u16,
-    pub minor: u16,
-    pub patch: u16,
-}
-
-/// Server settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerSettings {
-    pub quote_update: QuoteUpdateSettings,
-    pub swap: SwapSettings,
-    pub transaction: TransactionSettings,
-    pub connection: ConnectionSettings,
-}
-
-/// Quote update settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuoteUpdateSettings {
-    pub interval_ms: BoundedValueWithDefault<u64>,
-    pub num_quotes: BoundedValueWithDefault<u32>,
-}
-
-/// Swap settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SwapSettings {
-    pub slippage_bps: BoundedValueWithDefault<u16>,
-    pub only_direct_routes: bool,
-    pub add_size_constraint: bool,
-}
-
-/// Transaction settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransactionSettings {
-    pub close_input_token_account: bool,
-    pub create_output_token_account: bool,
-}
-
-/// Connection settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectionSettings {
-    pub concurrent_streams: u32,
-}
-
-/// Bounded value with default
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundedValueWithDefault<T> {
-    pub min: T,
-    pub max: T,
-    pub default: T,
 }
 
 /// Quote swap stream response
@@ -276,33 +184,6 @@ pub struct QuoteSwapStreamResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopStreamResponse {
     pub id: u32,
-}
-
-/// Venue information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VenueInfo {
-    pub labels: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub program_ids: Option<Vec<Pubkey>>,
-}
-
-/// Provider information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderInfo {
-    pub id: String,
-    pub name: String,
-    pub kind: ProviderKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon_uri_48: Option<String>,
-}
-
-/// Provider kind
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProviderKind {
-    DexAggregator,
-    RFQ,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

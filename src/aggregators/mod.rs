@@ -1,9 +1,7 @@
 //! DEX Aggregator trait and implementations
 //!
-//! Every venue works in two phases: [`DexAggregator::quote`] fetches an executable quote, and
-//! [`DexAggregator::build_transaction`] turns *that same quote* into a signed transaction. Keeping
-//! the quote around means the venue chosen on price is exactly the route that gets built — there is
-//! no second, possibly different, quote between comparison and build.
+//! A venue quotes, and later builds a transaction from that same quote, so the route compared on
+//! price is the route that gets built.
 
 use crate::config::Aggregator;
 use anyhow::Result;
@@ -13,7 +11,6 @@ use std::time::Duration;
 
 pub mod dflow;
 pub mod jupiter;
-pub(crate) mod sol;
 pub mod titan;
 
 pub use dflow::DflowAggregator;
@@ -94,13 +91,9 @@ pub struct SwapRequest {
     /// Exact input amount in base units.
     pub amount: u64,
     pub slippage_bps: u16,
-    /// SOL handling, identical on every venue:
-    ///
-    /// * `false` — wSOL is an ordinary SPL token: a wSOL input is spent from the wallet's wSOL ATA
-    ///   (which must already exist), a wSOL output is left in it, and the ATA is never closed.
-    /// * `true` — native SOL: a SOL input is wrapped from the wallet's lamports, a SOL output is
-    ///   unwrapped to lamports, and the wSOL ATA is closed afterwards (which also unwraps any wSOL
-    ///   that was already sitting in it).
+    /// Same on every venue. `false`: wSOL is swapped from/into the wallet's wSOL ATA (which must
+    /// exist for a wSOL input) and the ATA is left open. `true`: native SOL is wrapped/unwrapped
+    /// around the swap and the wSOL ATA is closed, unwrapping anything already in it.
     pub wrap_and_unwrap_sol: bool,
     /// Priority fee price; 0 leaves the venue's default.
     pub compute_unit_price_micro_lamports: u64,
@@ -110,7 +103,6 @@ pub struct SwapRequest {
 #[derive(Debug)]
 pub struct Quote {
     pub aggregator: Aggregator,
-    pub out_amount: u64,
     pub result: QuoteResult,
     pub(crate) payload: QuotePayload,
 }
@@ -120,7 +112,8 @@ pub struct Quote {
 pub(crate) enum QuotePayload {
     Jupiter(Box<jupiter_swap_api_client::quote::QuoteResponse>),
     Titan(Box<titan::SwapRoute>),
-    Dflow(Box<dflow::DflowQuote>),
+    /// DFlow's quote JSON, passed back to its `/swap` unchanged.
+    Dflow(Box<serde_json::Value>),
 }
 
 /// A DEX aggregator venue.
@@ -138,4 +131,9 @@ pub trait DexAggregator: Send + Sync {
         request: &SwapRequest,
         quote: &Quote,
     ) -> Result<VersionedTransaction>;
+
+    /// Release long-lived connections.
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
 }
