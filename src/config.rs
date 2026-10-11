@@ -1,280 +1,73 @@
-use figment::{providers::Env, Figment};
-use serde::{Deserialize, Deserializer, Serialize};
-use solana_client::rpc_client::RpcClient;
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::signature::Keypair;
+use std::fmt;
 use std::time::Duration;
-use tokio::time::timeout;
 
-/// Aggregator selection for preferred routing
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+/// A DEX aggregator venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aggregator {
-    /// Use Jupiter aggregator
     Jupiter,
-    /// Use Titan aggregator
     Titan,
-    /// Use DFlow aggregator
-    Dflow,
 }
 
-/// Routing strategy for determining which aggregator to use
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Which venues to quote.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum RoutingStrategy {
-    /// Compare available aggregators and use the one that gives the most tokens (best price)
-    ///
-    /// This is the default strategy. It quotes swaps on all available aggregators
-    /// (Jupiter and Titan if configured) and selects the one with the highest output amount.
+    /// Quote every configured venue and build the one with the most output.
+    #[default]
     BestPrice,
-    /// Use a preferred aggregator
-    ///
-    /// # Fields
-    /// * `aggregator` - Which aggregator to use (Jupiter or Titan)
+    /// Quote and build only this venue.
     PreferredAggregator { aggregator: Aggregator },
-    /// Test multiple slippage levels and use the one with lowest slippage that succeeds
-    ///
-    /// # Fields
-    /// * `floor_slippage_bps` - Starting slippage in basis points (e.g., 10 = 0.1%)
-    /// * `max_slippage_bps` - Maximum slippage to test in basis points (e.g., 100 = 1%)
-    /// * `step_bps` - Step size for climbing slippage in basis points (e.g., 5 = 0.05%)
-    LowestSlippageClimber {
-        floor_slippage_bps: u16,
-        max_slippage_bps: u16,
-        step_bps: u16,
-    },
 }
 
-/// Behavior for handling output Associated Token Account (ATA) creation
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum OutputAtaBehavior {
-    /// Create the ATA if it doesn't exist before executing the swap
-    Create,
-    /// Ignore ATA creation (let the aggregator handle it)
-    Ignore,
+#[derive(Clone)]
+pub struct JupiterConfig {
+    /// e.g. `https://api.jup.ag/swap/v1`
+    pub jup_swap_api_url: String,
+    pub api_key: String,
 }
 
-impl Default for OutputAtaBehavior {
-    fn default() -> Self {
-        Self::Create
-    }
+#[derive(Clone)]
+pub struct TitanConfig {
+    /// A host (`us1.api.titan.exchange`) or a proxy URL (`http://localhost:8080/ws`)
+    pub titan_ws_endpoint: String,
+    pub titan_api_key: String,
 }
 
-/// Custom deserializer for wallet_keypair that accepts both strings and sequences
-///
-/// When figment parses a JSON array string like "[1,2,3,...]", it treats it as a sequence.
-/// This deserializer accepts both formats and converts sequences back to JSON strings.
-fn deserialize_wallet_keypair<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{self, Visitor};
-    use std::fmt;
-
-    struct WalletKeypairVisitor;
-
-    impl<'de> Visitor<'de> for WalletKeypairVisitor {
-        type Value = Option<String>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a string or a sequence of bytes")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(Some(value.to_string()))
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(Some(value))
-        }
-
-        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            deserializer.deserialize_any(WalletKeypairVisitor)
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: de::SeqAccess<'de>,
-        {
-            let mut bytes = Vec::new();
-            while let Some(byte) = seq.next_element::<u8>()? {
-                bytes.push(byte);
-            }
-            // Convert sequence back to JSON string
-            Ok(Some(
-                serde_json::to_string(&bytes).map_err(de::Error::custom)?,
-            ))
-        }
-    }
-
-    deserializer.deserialize_option(WalletKeypairVisitor)
-}
-
-/// Custom deserializer for CommitmentLevel that accepts string values
-fn deserialize_commitment_level<'de, D>(deserializer: D) -> Result<CommitmentLevel, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::{self, Visitor};
-    use std::fmt;
-
-    struct CommitmentLevelVisitor;
-
-    impl<'de> Visitor<'de> for CommitmentLevelVisitor {
-        type Value = CommitmentLevel;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a string: \"processed\", \"confirmed\", or \"finalized\"")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            match value.to_lowercase().as_str() {
-                "processed" => Ok(CommitmentLevel::Processed),
-                "confirmed" => Ok(CommitmentLevel::Confirmed),
-                "finalized" => Ok(CommitmentLevel::Finalized),
-                _ => Err(de::Error::custom(format!(
-                    "Invalid commitment level: {}. Must be one of: processed, confirmed, finalized",
-                    value
-                ))),
-            }
-        }
-    }
-
-    deserializer.deserialize_str(CommitmentLevelVisitor)
-}
-
-/// Shared configuration used by both Jupiter and Titan
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SharedConfig {
-    /// Solana RPC endpoint URL
+#[derive(Clone)]
+pub struct ClientConfig {
     pub rpc_url: String,
-    /// Slippage tolerance in basis points (e.g., 25 = 0.25%)
     pub slippage_bps: u16,
-    /// Wallet keypair (base58 encoded string, JSON array, or comma-separated bytes)
-    /// Optional - not required for quote-only operations
-    #[serde(deserialize_with = "deserialize_wallet_keypair")]
-    pub wallet_keypair: Option<String>,
-    /// Compute unit price in micro lamports
+    /// Priority fee per compute unit; 0 leaves each venue's default.
     pub compute_unit_price_micro_lamports: u64,
-    /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
-    pub routing_strategy: Option<RoutingStrategy>,
-    /// Commitment level for transaction confirmation (defaults to Confirmed)
-    /// Options: "processed", "confirmed", "finalized"
-    /// - Processed: Fastest (~400ms), but can be rolled back
-    /// - Confirmed: Good balance (~1-2s), very unlikely to roll back
-    /// - Finalized: Slowest (~15s), cannot be rolled back
-    #[serde(default, deserialize_with = "deserialize_commitment_level")]
-    pub commitment_level: CommitmentLevel,
-    /// Deadline for one venue's quote, in milliseconds. Venues are quoted in parallel; one that
-    /// misses the deadline is left out of the comparison instead of stalling it.
-    pub quote_timeout_ms: u64,
-    /// Deadline for building one venue's transaction from its quote, in milliseconds.
-    pub build_timeout_ms: u64,
-    /// How long `swap` waits for its transaction to reach the commitment level, in seconds.
-    pub confirm_timeout_secs: u64,
+    pub routing_strategy: RoutingStrategy,
+    /// Per-venue quote deadline; a venue that misses it is left out of the comparison.
+    pub quote_timeout: Duration,
+    /// Per-venue deadline for building a transaction from its quote.
+    pub build_timeout: Duration,
+    /// How long `send_and_confirm` waits for the transaction.
+    pub confirm_timeout: Duration,
+    pub jupiter: Option<JupiterConfig>,
+    pub titan: Option<TitanConfig>,
 }
 
-impl Default for SharedConfig {
+impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
-            slippage_bps: 50, // 0.5% default slippage
-            wallet_keypair: None,
+            slippage_bps: 50,
             compute_unit_price_micro_lamports: 0,
-            routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
-            commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed for good balance
-            quote_timeout_ms: 5_000,
-            build_timeout_ms: 10_000,
-            confirm_timeout_secs: 90,
+            routing_strategy: RoutingStrategy::BestPrice,
+            quote_timeout: Duration::from_secs(5),
+            build_timeout: Duration::from_secs(10),
+            confirm_timeout: Duration::from_secs(90),
+            jupiter: None,
+            titan: None,
         }
     }
 }
 
-/// Jupiter-specific configuration
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct JupiterConfig {
-    /// Jupiter Swap API URL
-    pub jup_swap_api_url: String,
-    /// Jupiter API key (optional, but recommended for production use)
-    /// Get your API key from https://portal.jup.ag/
-    ///
-    /// Required for Jupiter to be used. Environment variable: `DEX_SUPERAGG_JUPITER__API_KEY`
-    pub api_key: Option<String>,
-}
-
-impl Default for JupiterConfig {
-    fn default() -> Self {
-        Self {
-            jup_swap_api_url: "https://api.jup.ag/swap/v1".to_string(),
-            api_key: None,
-        }
-    }
-}
-
-/// Titan-specific configuration
-#[derive(Default, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct TitanConfig {
-    /// Titan WebSocket endpoint (e.g., "us1.api.demo.titan.exchange")
-    pub titan_ws_endpoint: String,
-    /// Titan API key (required)
-    pub titan_api_key: Option<String>,
-}
-
-/// DFlow-specific configuration
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct DflowConfig {
-    /// DFlow API URL (e.g., "https://d.quote-api.dflow.net")
-    pub api_url: String,
-    /// DFlow API key (optional, but recommended for production)
-    /// DFlow works without an API key but with rate limiting
-    pub api_key: Option<String>,
-}
-
-impl Default for DflowConfig {
-    fn default() -> Self {
-        Self {
-            api_url: "https://d.quote-api.dflow.net".to_string(),
-            api_key: None,
-        }
-    }
-}
-
-/// `Debug` output for credentials: whether one is set, never its value.
-fn redacted<T>(value: &Option<T>) -> &'static str {
-    if value.is_some() {
-        "<redacted>"
-    } else {
-        "<unset>"
-    }
-}
-
-/// An endpoint reduced to scheme and host: RPC URLs commonly embed an API token.
+/// Scheme and host only: RPC URLs commonly embed an API token.
 fn redact_url(url: &str) -> String {
-    let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
     let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host = rest[..host_end].rsplit('@').next().unwrap_or_default();
     let suffix = if host_end < rest.len() { "/…" } else { "" };
@@ -285,491 +78,61 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-impl std::fmt::Debug for SharedConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedConfig")
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientConfig")
             .field("rpc_url", &redact_url(&self.rpc_url))
             .field("slippage_bps", &self.slippage_bps)
-            .field("wallet_keypair", &redacted(&self.wallet_keypair))
             .field(
                 "compute_unit_price_micro_lamports",
                 &self.compute_unit_price_micro_lamports,
             )
             .field("routing_strategy", &self.routing_strategy)
-            .field("commitment_level", &self.commitment_level)
-            .field("quote_timeout_ms", &self.quote_timeout_ms)
-            .field("build_timeout_ms", &self.build_timeout_ms)
-            .field("confirm_timeout_secs", &self.confirm_timeout_secs)
+            .field("quote_timeout", &self.quote_timeout)
+            .field("build_timeout", &self.build_timeout)
+            .field("confirm_timeout", &self.confirm_timeout)
+            .field("jupiter", &self.jupiter)
+            .field("titan", &self.titan)
             .finish()
     }
 }
 
-impl std::fmt::Debug for JupiterConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for JupiterConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JupiterConfig")
             .field("jup_swap_api_url", &self.jup_swap_api_url)
-            .field("api_key", &redacted(&self.api_key))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-impl std::fmt::Debug for TitanConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TitanConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TitanConfig")
             .field("titan_ws_endpoint", &self.titan_ws_endpoint)
-            .field("titan_api_key", &redacted(&self.titan_api_key))
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for DflowConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DflowConfig")
-            .field("api_url", &self.api_url)
-            .field("api_key", &redacted(&self.api_key))
-            .finish()
-    }
-}
-
-/// Route configuration for individual swap operations
-///
-/// This configuration can be passed per-swap to override default routing behavior.
-/// If not provided, the client will use values from `SharedConfig`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteConfig {
-    /// Compute unit price in micro lamports
-    pub compute_unit_price_micro_lamports: u64,
-    /// Routing strategy for determining which aggregator to use (defaults to BestPrice)
-    pub routing_strategy: Option<RoutingStrategy>,
-    /// Behavior for handling output Associated Token Account (ATA) creation
-    #[serde(default)]
-    pub output_ata: OutputAtaBehavior,
-    /// Slippage tolerance in basis points (overrides config default if Some)
-    pub slippage_bps: Option<u16>,
-    /// Commitment level for transaction confirmation
-    #[serde(default)]
-    pub commitment_level: CommitmentLevel,
-    /// Whether to wrap and unwrap SOL in the swap
-    pub wrap_and_unwrap_sol: bool,
-}
-
-impl Default for RouteConfig {
-    fn default() -> Self {
-        Self {
-            compute_unit_price_micro_lamports: 0,
-            routing_strategy: Some(RoutingStrategy::BestPrice), // Default to best price strategy
-            output_ata: OutputAtaBehavior::Create,              // Default to creating the ATA
-            slippage_bps: None, // Use config default if not specified
-            commitment_level: CommitmentLevel::Confirmed, // Default to Confirmed
-            wrap_and_unwrap_sol: false,
-        }
-    }
-}
-
-impl From<&SharedConfig> for RouteConfig {
-    fn from(shared: &SharedConfig) -> Self {
-        Self {
-            compute_unit_price_micro_lamports: shared.compute_unit_price_micro_lamports,
-            routing_strategy: shared.routing_strategy.clone(),
-            output_ata: OutputAtaBehavior::Create, // Default to creating the ATA
-            slippage_bps: None,                    // Use config default
-            commitment_level: shared.commitment_level, // Copy from shared config
-            wrap_and_unwrap_sol: false,
-        }
-    }
-}
-
-/// Complete client configuration combining shared, Jupiter, Titan, and DFlow configs
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ClientConfig {
-    #[serde(default)]
-    pub shared: SharedConfig,
-    #[serde(default)]
-    pub jupiter: JupiterConfig,
-    /// Titan configuration (optional - if not provided, Titan will not be used)
-    #[serde(default)]
-    pub titan: Option<TitanConfig>,
-    /// DFlow configuration (optional - if not provided, DFlow will not be used)
-    #[serde(default)]
-    pub dflow: Option<DflowConfig>,
-}
-
-impl ClientConfig {
-    /// Load configuration from environment variables using figment
-    ///
-    /// Environment variables should be prefixed with `DEX_SUPERAGG_` and use `__` to separate nested keys.
-    /// Examples:
-    /// - `DEX_SUPERAGG_SHARED__RPC_URL` for `shared.rpc_url`
-    /// - `DEX_SUPERAGG_JUPITER__JUP_SWAP_API_URL` for `jupiter.jup_swap_api_url`
-    /// - `DEX_SUPERAGG_JUPITER__JUPITER_API_KEY` for `jupiter.jupiter_api_key` (optional, not yet used)
-    /// - `DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT` for `titan.titan_ws_endpoint`
-    ///
-    /// Note: `DEX_SUPERAGG_SHARED__WALLET_KEYPAIR` can be:
-    /// - A JSON array string (e.g., `"[1,2,3,...]"`) - will be parsed correctly via custom deserializer
-    /// - A base58 string
-    /// - Comma-separated bytes
-    #[allow(clippy::result_large_err)]
-    pub fn from_env() -> Result<Self, figment::Error> {
-        // Extract config from environment - custom deserializer handles WALLET_KEYPAIR parsing
-        let config: Self = Figment::new()
-            .merge(Env::prefixed("DEX_SUPERAGG_").split("__"))
-            .extract()?;
-
-        Ok(config)
-    }
-
-    /// Check if Jupiter is configured (it needs an API key)
-    pub fn is_jupiter_configured(&self) -> bool {
-        !self.jupiter.jup_swap_api_url.is_empty()
-            && self
-                .jupiter
-                .api_key
-                .as_ref()
-                .is_some_and(|key| !key.is_empty())
-    }
-
-    /// Check if Titan is configured
-    pub fn is_titan_configured(&self) -> bool {
-        self.titan
-            .as_ref()
-            .map(|t| !t.titan_ws_endpoint.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Check if DFlow is configured
-    pub fn is_dflow_configured(&self) -> bool {
-        self.dflow
-            .as_ref()
-            .map(|d| !d.api_url.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Validate the configuration by actually testing connectivity to endpoints
-    ///
-    /// Checks:
-    /// - Wallet keypair (if provided) can be parsed
-    /// - RPC URL is reachable and responds
-    /// - Jupiter API URL is reachable and responds
-    /// - Titan WebSocket endpoint (if configured) is reachable
-    /// - Routing strategy aggregator requirements are met
-    ///
-    /// Returns Ok(()) if valid, Err(Vec<String>) with validation errors if invalid
-    pub async fn validate(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate wallet keypair if provided
-        if let Some(ref wallet_keypair) = self.shared.wallet_keypair {
-            if wallet_keypair.is_empty() {
-                errors.push("Wallet keypair is set but empty".to_string());
-            } else if let Err(e) = self.get_keypair() {
-                errors.push(format!("Invalid wallet keypair format: {}", e));
-            }
-        }
-
-        // Validate RPC URL by making a test call
-        if !self.shared.rpc_url.is_empty() {
-            if let Err(e) = self.validate_rpc_url().await {
-                errors.push(format!(
-                    "RPC URL validation failed ({}): {}",
-                    redact_url(&self.shared.rpc_url),
-                    e
-                ));
-            }
-        } else {
-            errors.push("RPC URL is required".to_string());
-        }
-
-        // Every configured venue (Jupiter always), or only the preferred one.
-        let preferred = match &self.shared.routing_strategy {
-            Some(RoutingStrategy::PreferredAggregator { aggregator }) => Some(*aggregator),
-            _ => None,
-        };
-        let check = |aggregator: Aggregator, configured: bool| {
-            preferred.map_or(configured, |preferred| preferred == aggregator)
-        };
-        if check(Aggregator::Jupiter, true) {
-            errors.extend(self.validate_jupiter().await.err().unwrap_or_default());
-        }
-        if check(Aggregator::Titan, self.titan.is_some()) {
-            errors.extend(self.validate_titan().await.err().unwrap_or_default());
-        }
-        if check(Aggregator::Dflow, self.dflow.is_some()) {
-            errors.extend(self.validate_dflow().await.err().unwrap_or_default());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    async fn validate_rpc_url(&self) -> anyhow::Result<()> {
-        let rpc_url = self.shared.rpc_url.clone();
-
-        // RpcClient is blocking, so we need to run it in a blocking task
-        timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                let rpc_client =
-                    RpcClient::new_with_commitment(&rpc_url, CommitmentConfig::confirmed());
-                rpc_client
-                    .get_version()
-                    .map_err(|e| anyhow::anyhow!("Failed to connect to RPC: {}", e))?;
-                Ok::<(), anyhow::Error>(())
-            }),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("RPC connection timeout"))?
-        .map_err(|e| anyhow::anyhow!("RPC task error: {}", e))??;
-
-        Ok(())
-    }
-
-    /// Validate Jupiter configuration and connectivity
-    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
-    async fn validate_jupiter(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if self.jupiter.jup_swap_api_url.is_empty() {
-            errors.push("Jupiter API URL is required".to_string());
-            return Err(errors);
-        }
-
-        if let Err(e) = self.validate_jupiter_url().await {
-            errors.push(format!(
-                "Jupiter API URL validation failed ({}): {}",
-                self.jupiter.jup_swap_api_url, e
-            ));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Validate Titan configuration and connectivity
-    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
-    async fn validate_titan(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        let titan = match &self.titan {
-            Some(t) => t,
-            None => {
-                errors.push("Titan is not configured".to_string());
-                return Err(errors);
-            }
-        };
-
-        if titan.titan_ws_endpoint.is_empty() {
-            errors
-                .push("Titan WebSocket endpoint is required when Titan is configured".to_string());
-            return Err(errors);
-        }
-
-        // Test WebSocket connectivity
-        if let Err(e) = self.validate_titan_endpoint(titan).await {
-            errors.push(format!(
-                "Titan WebSocket endpoint validation failed ({}): {}",
-                titan.titan_ws_endpoint, e
-            ));
-        }
-
-        // Check that API key is provided
-        if titan.titan_api_key.is_none() {
-            errors.push("Titan API key must be provided when Titan is configured".to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Validate DFlow configuration and connectivity
-    /// Returns Ok(()) if valid, Err(Vec<String>) with errors if invalid
-    async fn validate_dflow(&self) -> Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        let dflow = match &self.dflow {
-            Some(d) => d,
-            None => {
-                errors.push("DFlow is not configured".to_string());
-                return Err(errors);
-            }
-        };
-
-        if dflow.api_url.is_empty() {
-            errors.push("DFlow API URL is required when DFlow is configured".to_string());
-            return Err(errors);
-        }
-
-        // Test API connectivity - DFlow works without an API key (just has rate limiting)
-        if let Err(e) = self.validate_dflow_endpoint(dflow).await {
-            errors.push(format!(
-                "DFlow API endpoint validation failed ({}): {}",
-                dflow.api_url, e
-            ));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    async fn validate_dflow_endpoint(&self, dflow: &DflowConfig) -> anyhow::Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
-
-        // Test connectivity by making a simple GET request to the base URL
-        let mut request = client.get(&dflow.api_url);
-
-        // Add API key if configured
-        if let Some(ref api_key) = dflow.api_key {
-            request = request.header("x-api-key", api_key);
-        }
-
-        timeout(Duration::from_secs(5), request.send())
-            .await
-            .map_err(|_| anyhow::anyhow!("DFlow API request timeout"))?
-            .map_err(|e| anyhow::anyhow!("Failed to connect to DFlow API: {}", e))?;
-
-        Ok(())
-    }
-
-    async fn validate_jupiter_url(&self) -> anyhow::Result<()> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
-
-        // Try to reach the Jupiter API - just check if it responds
-        timeout(
-            Duration::from_secs(5),
-            client.get(&self.jupiter.jup_swap_api_url).send(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Jupiter API request timeout"))?
-        .map_err(|e| anyhow::anyhow!("Failed to connect to Jupiter API: {}", e))?;
-
-        Ok(())
-    }
-
-    async fn validate_titan_endpoint(&self, titan: &TitanConfig) -> anyhow::Result<()> {
-        // Determine Titan endpoint configuration (same logic as TitanAggregator::new)
-        let titan_api_key = titan
-            .titan_api_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Titan API key must be provided"))?;
-
-        if titan_api_key.is_empty() {
-            return Err(anyhow::anyhow!("TITAN_API_KEY is set but empty"));
-        }
-
-        let titan_ws_endpoint = titan.titan_ws_endpoint.clone();
-
-        // Create TitanClient and try to connect (let TitanClient handle all URL building)
-        use crate::aggregators::titan::TitanClient;
-        let titan_client = TitanClient::new(titan_ws_endpoint, titan_api_key.clone());
-
-        // Try to connect with timeout
-        timeout(Duration::from_secs(5), titan_client.connect())
-            .await
-            .map_err(|_| anyhow::anyhow!("WebSocket connection timeout"))?
-            .map_err(|e| anyhow::anyhow!("Failed to connect to Titan: {}", e))?;
-
-        // Clean up connection
-        let _ = titan_client.close().await;
-
-        Ok(())
-    }
-
-    /// Get the default route configuration from shared config
-    pub fn default_route_config(&self) -> RouteConfig {
-        RouteConfig::from(&self.shared)
-    }
-
-    /// Get the wallet keypair from the configuration
-    /// Returns None if no keypair is configured (useful for quote-only operations)
-    pub fn get_keypair(&self) -> anyhow::Result<Option<Keypair>> {
-        let wallet_keypair = match &self.shared.wallet_keypair {
-            Some(kp) => kp,
-            None => return Ok(None),
-        };
-
-        // Match eva01 exactly: parse as JSON array (Vec<u8>), then use Keypair::from_bytes with full 64 bytes
-        let bytes: Vec<u8> = if wallet_keypair.starts_with('[') {
-            // JSON array format (like eva01 uses)
-            serde_json::from_str(wallet_keypair)
-                .map_err(|e| anyhow::anyhow!("Failed to parse wallet keypair as JSON: {}", e))?
-        } else if let Ok(decoded) = bs58::decode(wallet_keypair).into_vec() {
-            // Base58 format - convert to Vec<u8>
-            decoded
-        } else if wallet_keypair.contains(',') {
-            // Comma-separated format
-            wallet_keypair
-                .split(',')
-                .map(|s| s.trim().parse::<u8>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("Failed to parse wallet keypair bytes: {}", e))?
-        } else {
-            return Err(anyhow::anyhow!(
-                "Invalid wallet keypair format. Expected base58 string, JSON array, or comma-separated bytes"
-            ));
-        };
-
-        if bytes.len() != 64 {
-            return Err(anyhow::anyhow!(
-                "Invalid keypair length: expected 64 bytes, got {} bytes",
-                bytes.len()
-            ));
-        }
-
-        // Match eva01 exactly: Keypair::from_bytes expects full 64-byte keypair (32 secret + 32 public)
-        let keypair = Keypair::try_from(bytes.as_slice())
-            .map_err(|e| anyhow::anyhow!("Failed to create keypair from bytes: {}", e))?;
-        Ok(Some(keypair))
+            .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn debug_output_redacts_credentials() {
+    fn debug_output_hides_credentials() {
         let config = ClientConfig {
-            shared: SharedConfig {
-                rpc_url: "https://rpc.example.com/secret-rpc-token".to_string(),
-                wallet_keypair: Some("[1,2,3]".to_string()),
-                ..Default::default()
-            },
-            jupiter: JupiterConfig {
-                api_key: Some("secret-jup".to_string()),
-                ..Default::default()
-            },
+            rpc_url: "https://rpc.example.com/secret-rpc-token".to_string(),
+            jupiter: Some(JupiterConfig {
+                jup_swap_api_url: "https://api.jup.ag/swap/v1".to_string(),
+                api_key: "secret-jup".to_string(),
+            }),
             titan: Some(TitanConfig {
                 titan_ws_endpoint: "us1.api.titan.exchange".to_string(),
-                titan_api_key: Some("secret-titan".to_string()),
+                titan_api_key: "secret-titan".to_string(),
             }),
-            dflow: Some(DflowConfig {
-                api_key: Some("secret-dflow".to_string()),
-                ..Default::default()
-            }),
+            ..Default::default()
         };
         let printed = format!("{:?}", config);
-        for secret in [
-            "secret-rpc-token",
-            "[1,2,3]",
-            "secret-jup",
-            "secret-titan",
-            "secret-dflow",
-        ] {
+        for secret in ["secret-rpc-token", "secret-jup", "secret-titan"] {
             assert!(
                 !printed.contains(secret),
                 "{} leaked in {}",
@@ -778,513 +141,5 @@ mod tests {
             );
         }
         assert!(printed.contains("https://rpc.example.com/…"));
-    }
-
-    use super::*;
-    use solana_sdk::signature::Signer;
-
-    #[test]
-    fn test_config_defaults() {
-        let shared = SharedConfig::default();
-        assert_eq!(shared.slippage_bps, 50);
-        assert!(!shared.rpc_url.is_empty());
-        assert_eq!(shared.routing_strategy, Some(RoutingStrategy::BestPrice));
-
-        let jupiter = JupiterConfig::default();
-        assert!(!jupiter.jup_swap_api_url.is_empty());
-    }
-
-    #[test]
-    fn test_load_config_from_env() {
-        figment::Jail::expect_with(|jail| {
-            // Set shared config environment variables
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env("DEX_SUPERAGG_SHARED__SLIPPAGE_BPS", "100");
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__WALLET_KEYPAIR",
-                "5KQwrPtwYgXv3LvWy2YXL4LwzFjU4Lsa6Yc9t7veZmn8qJxVzN",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__COMPUTE_UNIT_PRICE_MICRO_LAMPORTS",
-                "5000",
-            );
-
-            // Set Jupiter config environment variables
-            jail.set_env(
-                "DEX_SUPERAGG_JUPITER__JUP_SWAP_API_URL",
-                "https://test-api.jup.ag/v6",
-            );
-
-            // Set Titan config environment variables
-            jail.set_env(
-                "DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT",
-                "us1.api.test.titan.exchange",
-            );
-            jail.set_env("DEX_SUPERAGG_TITAN__TITAN_API_KEY", "test_titan_api_key");
-
-            let config = ClientConfig::from_env()?;
-
-            // Verify shared config
-            assert_eq!(config.shared.rpc_url, "https://api.testnet.solana.com");
-            assert_eq!(config.shared.slippage_bps, 100);
-            assert_eq!(
-                config.shared.wallet_keypair,
-                Some("5KQwrPtwYgXv3LvWy2YXL4LwzFjU4Lsa6Yc9t7veZmn8qJxVzN".to_string())
-            );
-            assert_eq!(config.shared.compute_unit_price_micro_lamports, 5000);
-
-            // Verify Jupiter config
-            assert_eq!(
-                config.jupiter.jup_swap_api_url,
-                "https://test-api.jup.ag/v6"
-            );
-
-            // Verify Titan config
-            let titan = config
-                .titan
-                .as_ref()
-                .expect("Titan config should be present");
-            assert_eq!(titan.titan_ws_endpoint, "us1.api.test.titan.exchange");
-            assert_eq!(titan.titan_api_key, Some("test_titan_api_key".to_string()));
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_env_override_defaults() {
-        figment::Jail::expect_with(|jail| {
-            // Only set required fields, others should use defaults
-            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", "test_keypair");
-            jail.set_env(
-                "DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT",
-                "test.titan.exchange",
-            );
-            // Don't set Jupiter config - it should use defaults automatically
-
-            // Override one default value
-            jail.set_env("DEX_SUPERAGG_SHARED__SLIPPAGE_BPS", "75");
-
-            let config = ClientConfig::from_env()?;
-
-            // Verify overridden value
-            assert_eq!(config.shared.slippage_bps, 75);
-
-            // Verify defaults are used
-            assert_eq!(config.shared.rpc_url, SharedConfig::default().rpc_url);
-            assert_eq!(
-                config.jupiter.jup_swap_api_url,
-                JupiterConfig::default().jup_swap_api_url
-            );
-            assert_eq!(config.shared.compute_unit_price_micro_lamports, 0);
-
-            // Verify set values
-            assert_eq!(
-                config.shared.wallet_keypair,
-                Some("test_keypair".to_string())
-            );
-            let titan = config
-                .titan
-                .as_ref()
-                .expect("Titan config should be present");
-            assert_eq!(titan.titan_ws_endpoint, "test.titan.exchange");
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_titan_not_configured() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", "test_keypair");
-            // Don't set any Titan config - it should be None
-
-            let config = ClientConfig::from_env()?;
-
-            assert_eq!(config.titan, None);
-            assert!(!config.is_titan_configured());
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_wallet_keypair_not_configured() {
-        figment::Jail::expect_with(|jail| {
-            // Don't set wallet_keypair - it should be None (useful for simulations)
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-
-            let config = ClientConfig::from_env()?;
-
-            assert_eq!(config.shared.wallet_keypair, None);
-            assert!(config
-                .get_keypair()
-                .map_err(|e| figment::Error::from(e.to_string()))?
-                .is_none());
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_wallet_keypair_base58() {
-        figment::Jail::expect_with(|jail| {
-            // Create a test keypair and encode it as base58
-            let test_keypair = solana_sdk::signature::Keypair::new();
-            let base58_keypair = bs58::encode(test_keypair.to_bytes()).into_string();
-
-            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", &base58_keypair);
-
-            let config = ClientConfig::from_env()?;
-            let parsed_keypair = config
-                .get_keypair()
-                .map_err(|e| figment::Error::from(e.to_string()))?
-                .expect("Keypair should be parsed");
-
-            assert_eq!(parsed_keypair.pubkey(), test_keypair.pubkey());
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_wallet_keypair_json_array_parsing() {
-        // Test that JSON array format can be parsed (even though figment doesn't support it in env vars)
-        // This format is useful when loading config from files or other sources
-        let test_keypair = solana_sdk::signature::Keypair::new();
-        let json_keypair = serde_json::to_string(&test_keypair.to_bytes().to_vec()).unwrap();
-
-        // Create a config with JSON array format directly (bypassing figment)
-        let mut shared = SharedConfig::default();
-        shared.wallet_keypair = Some(json_keypair);
-
-        let config = ClientConfig {
-            shared,
-            ..Default::default()
-        };
-
-        let parsed_keypair = config
-            .get_keypair()
-            .expect("Keypair should be parsed")
-            .expect("Keypair should be Some");
-
-        assert_eq!(parsed_keypair.pubkey(), test_keypair.pubkey());
-    }
-
-    #[test]
-    fn test_wallet_keypair_json_array_via_env() {
-        // Test that JSON array format works through from_env() with custom deserializer
-        figment::Jail::expect_with(|jail| {
-            // Create a test keypair and encode it as JSON array
-            let test_keypair = solana_sdk::signature::Keypair::new();
-            let json_keypair = serde_json::to_string(&test_keypair.to_bytes().to_vec()).unwrap();
-
-            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", &json_keypair);
-
-            let config = ClientConfig::from_env()?;
-            let parsed_keypair = config
-                .get_keypair()
-                .map_err(|e| figment::Error::from(e.to_string()))?
-                .expect("Keypair should be parsed");
-
-            assert_eq!(parsed_keypair.pubkey(), test_keypair.pubkey());
-
-            // Verify the stored value is a JSON string (not parsed as sequence)
-            assert!(config
-                .shared
-                .wallet_keypair
-                .as_ref()
-                .unwrap()
-                .starts_with('['));
-            assert!(config
-                .shared
-                .wallet_keypair
-                .as_ref()
-                .unwrap()
-                .ends_with(']'));
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_wallet_keypair_comma_separated() {
-        figment::Jail::expect_with(|jail| {
-            // Create a test keypair and encode it as comma-separated bytes
-            let test_keypair = solana_sdk::signature::Keypair::new();
-            let bytes = test_keypair.to_bytes();
-            let comma_keypair = bytes
-                .iter()
-                .map(|b| b.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-
-            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", &comma_keypair);
-
-            let config = ClientConfig::from_env()?;
-            let parsed_keypair = config
-                .get_keypair()
-                .map_err(|e| figment::Error::from(e.to_string()))?
-                .expect("Keypair should be parsed");
-
-            assert_eq!(parsed_keypair.pubkey(), test_keypair.pubkey());
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_wallet_keypair_invalid_format() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", "invalid_format");
-
-            let config = ClientConfig::from_env()?;
-            let result = config.get_keypair();
-
-            assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid wallet keypair format"));
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_optional_titan_fields() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("DEX_SUPERAGG_SHARED__WALLET_KEYPAIR", "test_keypair");
-            jail.set_env(
-                "DEX_SUPERAGG_TITAN__TITAN_WS_ENDPOINT",
-                "test.titan.exchange",
-            );
-            // Don't set Jupiter config - it should use defaults automatically
-            // Don't set titan_api_key - it should be None
-
-            let config = ClientConfig::from_env()?;
-
-            let titan = config
-                .titan
-                .as_ref()
-                .expect("Titan config should be present");
-            assert_eq!(titan.titan_api_key, None);
-            assert_eq!(titan.titan_ws_endpoint, "test.titan.exchange");
-            // Verify Jupiter uses default
-            assert_eq!(
-                config.jupiter.jup_swap_api_url,
-                JupiterConfig::default().jup_swap_api_url
-            );
-
-            Ok(())
-        });
-    }
-
-    #[tokio::test]
-    async fn test_validate_keypair() {
-        let test_keypair = solana_sdk::signature::Keypair::new();
-        let base58_keypair = bs58::encode(test_keypair.to_bytes()).into_string();
-
-        let mut config = ClientConfig::default();
-        config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.shared.wallet_keypair = Some(base58_keypair);
-        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
-
-        let result = config.validate().await;
-
-        // Should only have errors for endpoint connectivity, not keypair
-        if let Err(errors) = result {
-            assert!(!errors.iter().any(|e| e.contains("wallet keypair")));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_validate_invalid_keypair() {
-        let mut config = ClientConfig::default();
-        config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.shared.wallet_keypair = Some("invalid_keypair".to_string());
-        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
-
-        let result = config.validate().await;
-
-        assert!(result.is_err());
-        if let Err(errors) = result {
-            assert!(errors.iter().any(|e| e.contains("wallet keypair")));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_validate_rpc_endpoint() {
-        // Test with a real Solana RPC endpoint
-        let mut config = ClientConfig::default();
-        config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
-
-        let result = config.validate().await;
-
-        // Should not have RPC URL errors if it's reachable
-        // (may have other errors if endpoints are down, but RPC should work)
-        if let Err(errors) = result {
-            let rpc_errors: Vec<_> = errors.iter().filter(|e| e.contains("RPC URL")).collect();
-            // If RPC is unreachable, that's fine for the test - we just want to make sure
-            // the validation logic works
-            println!("RPC validation errors: {:?}", rpc_errors);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_validate_jupiter_endpoint() {
-        let mut config = ClientConfig::default();
-        config.shared.rpc_url = "https://api.mainnet-beta.solana.com".to_string();
-        config.jupiter.jup_swap_api_url = "https://api.jup.ag/swap/v1".to_string();
-
-        let result = config.validate().await;
-
-        // Should not have Jupiter URL errors if it's reachable
-        if let Err(errors) = result {
-            let jupiter_errors: Vec<_> = errors
-                .iter()
-                .filter(|e| e.contains("Jupiter API URL"))
-                .collect();
-            // If Jupiter is unreachable, that's fine for the test
-            println!("Jupiter validation errors: {:?}", jupiter_errors);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_validate_invalid_endpoints() {
-        let mut config = ClientConfig::default();
-        config.shared.rpc_url = "https://invalid-rpc-url-that-does-not-exist.com".to_string();
-        config.jupiter.jup_swap_api_url =
-            "https://invalid-jupiter-url-that-does-not-exist.com".to_string();
-
-        let result = config.validate().await;
-
-        // Should have errors for both invalid endpoints
-        assert!(result.is_err());
-        if let Err(errors) = result {
-            assert!(errors.iter().any(|e| e.contains("RPC URL")));
-            assert!(errors.iter().any(|e| e.contains("Jupiter API URL")));
-        }
-    }
-
-    #[test]
-    fn test_routing_strategy_default() {
-        figment::Jail::expect_with(|jail| {
-            // Don't set routing_strategy - should default to BestPrice
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-
-            let config = ClientConfig::from_env()?;
-            assert_eq!(
-                config.shared.routing_strategy,
-                Some(RoutingStrategy::BestPrice)
-            );
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_routing_strategy_preferred_aggregator_jupiter() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE",
-                "preferred_aggregator",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__AGGREGATOR",
-                "jupiter",
-            );
-
-            let config = ClientConfig::from_env()?;
-
-            match &config.shared.routing_strategy {
-                Some(RoutingStrategy::PreferredAggregator { aggregator }) => {
-                    assert_eq!(*aggregator, Aggregator::Jupiter);
-                }
-                _ => panic!("Expected PreferredAggregator with Jupiter"),
-            }
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_routing_strategy_preferred_aggregator_titan() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE",
-                "preferred_aggregator",
-            );
-            jail.set_env("DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__AGGREGATOR", "titan");
-
-            let config = ClientConfig::from_env()?;
-
-            match &config.shared.routing_strategy {
-                Some(RoutingStrategy::PreferredAggregator { aggregator }) => {
-                    assert_eq!(*aggregator, Aggregator::Titan);
-                }
-                _ => panic!("Expected PreferredAggregator with Titan"),
-            }
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_routing_strategy_lowest_slippage_climber() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__RPC_URL",
-                "https://api.testnet.solana.com",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__TYPE",
-                "lowest_slippage_climber",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__FLOOR_SLIPPAGE_BPS",
-                "10",
-            );
-            jail.set_env(
-                "DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__MAX_SLIPPAGE_BPS",
-                "100",
-            );
-            jail.set_env("DEX_SUPERAGG_SHARED__ROUTING_STRATEGY__STEP_BPS", "5");
-
-            let config = ClientConfig::from_env()?;
-
-            match &config.shared.routing_strategy {
-                Some(RoutingStrategy::LowestSlippageClimber {
-                    floor_slippage_bps,
-                    max_slippage_bps,
-                    step_bps,
-                }) => {
-                    assert_eq!(*floor_slippage_bps, 10);
-                    assert_eq!(*max_slippage_bps, 100);
-                    assert_eq!(*step_bps, 5);
-                }
-                _ => panic!("Expected LowestSlippageClimber"),
-            }
-
-            Ok(())
-        });
     }
 }

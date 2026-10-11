@@ -1,18 +1,11 @@
-// Titan API type definitions
-// All types follow MessagePack encoding as specified in Titan API docs
+//! Titan WebSocket API messages (MessagePack, structs encoded as maps). Only the fields we use;
+//! the rest of a server message is ignored.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Common Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Solana public key encoded as 32-byte binary data (MessagePack bin format)
 pub type Pubkey = [u8; 32];
 
-/// Account metadata for Solana instructions
-/// Uses short field names to save space in MessagePack encoding
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountMeta {
     pub p: Pubkey, // public key
@@ -20,8 +13,6 @@ pub struct AccountMeta {
     pub w: bool,   // is_writable
 }
 
-/// Solana instruction
-/// Uses short field names to save space in MessagePack encoding
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instruction {
     pub p: Pubkey,           // program_id
@@ -29,25 +20,17 @@ pub struct Instruction {
     pub d: Vec<u8>,          // data
 }
 
-/// Swap mode for interpreting amounts
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SwapMode {
     ExactIn,
-    ExactOut,
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Request Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Client request wrapper
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientRequest {
     pub id: u32,
     pub data: RequestData,
 }
 
-/// Request data variants
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum RequestData {
@@ -55,7 +38,6 @@ pub enum RequestData {
     StopStream(StopStreamRequest),
 }
 
-/// Swap quote request parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapQuoteRequest {
     pub swap: SwapParams,
@@ -64,7 +46,6 @@ pub struct SwapQuoteRequest {
     pub update: Option<QuoteUpdateParams>,
 }
 
-/// Swap parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapParams {
@@ -75,25 +56,8 @@ pub struct SwapParams {
     pub swap_mode: Option<SwapMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slippage_bps: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dexes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exclude_dexes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub only_direct_routes: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub add_size_constraint: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size_constraint: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub providers: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accounts_limit_total: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub accounts_limit_writable: Option<u16>,
 }
 
-/// Transaction generation parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionParams {
@@ -102,21 +66,11 @@ pub struct TransactionParams {
     pub close_input_token_account: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create_output_token_account: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_account: Option<Pubkey>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_bps: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_from_input_mint: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_account: Option<Pubkey>,
-    /// Leave a wSOL output as wSOL instead of unwrapping it to native SOL (Titan unwraps by
-    /// default). Only has an effect when the output mint is wSOL.
+    /// Leave a wSOL output as wSOL; Titan unwraps it to native SOL by default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_wsol: Option<bool>,
 }
 
-/// Quote update parameters for streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteUpdateParams {
@@ -126,17 +80,11 @@ pub struct QuoteUpdateParams {
     pub num_quotes: Option<u32>,
 }
 
-/// Stop stream request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopStreamRequest {
     pub id: u32,
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Response Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Server message variants
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ServerMessage {
@@ -146,17 +94,14 @@ pub enum ServerMessage {
     StreamEnd(StreamEnd),
 }
 
-/// Successful response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseSuccess {
     pub request_id: u32,
-    pub data: ResponseData,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Set when the request started a stream.
     pub stream: Option<StreamStart>,
 }
 
-/// Error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseError {
@@ -165,139 +110,45 @@ pub struct ResponseError {
     pub message: String,
 }
 
-/// Response data variants
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum ResponseData {
-    NewSwapQuoteStream(QuoteSwapStreamResponse),
-    StreamStopped(StopStreamResponse),
-}
-
-/// Quote swap stream response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuoteSwapStreamResponse {
-    pub interval_ms: u64,
-}
-
-/// Stop stream response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StopStreamResponse {
-    pub id: u32,
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Stream Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Stream data type indicator
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum StreamDataType {
-    SwapQuotes,
-}
-
-/// Stream start notification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StreamStart {
     pub id: u32,
-    pub data_type: StreamDataType,
 }
 
-/// Stream data packet
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamData {
     pub id: u32,
-    pub seq: u32,
     pub payload: StreamDataPayload,
 }
 
-/// Stream data payload variants
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum StreamDataPayload {
     SwapQuotes(SwapQuotes),
 }
 
-/// Stream end notification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamEnd {
     pub id: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Swap Quote Types
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Swap quotes from multiple providers
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SwapQuotes {
-    pub id: String,
-    pub input_mint: Pubkey,
-    pub output_mint: Pubkey,
-    pub swap_mode: SwapMode,
-    pub amount: u64,
+    /// Route per provider.
     pub quotes: HashMap<String, SwapRoute>,
 }
 
-/// Swap route from a provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapRoute {
-    pub in_amount: u64,
     pub out_amount: u64,
-    pub slippage_bps: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform_fee: Option<PlatformFee>,
-    pub steps: Vec<RoutePlanStep>,
+    /// Empty for providers that only hand out a prebuilt transaction.
     pub instructions: Vec<Instruction>,
     pub address_lookup_tables: Vec<Pubkey>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_slot: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_taken_ns: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_after_slot: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub compute_units: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Recommended CU limit.
     pub compute_units_safe: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transaction: Option<Vec<u8>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference_id: Option<String>,
-}
-
-/// Route plan step
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RoutePlanStep {
-    pub amm_key: Pubkey,
-    pub label: String,
-    pub input_mint: Pubkey,
-    pub output_mint: Pubkey,
-    pub in_amount: u64,
-    pub out_amount: u64,
-    pub alloc_ppb: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_mint: Option<Pubkey>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_amount: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_slot: Option<u64>,
-}
-
-/// Platform fee information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformFee {
-    pub amount: u64,
-    pub fee_bps: u8,
 }

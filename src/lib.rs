@@ -1,10 +1,6 @@
-pub mod aggregators;
+mod aggregators;
 pub mod client;
 pub mod config;
 
-pub use aggregators::{
-    DexAggregator, QuoteMetadata, QuoteResult, SwapRequest, SwapResult, SwapSummary,
-    SwapTransaction,
-};
-pub use client::DexSuperAggClient;
-pub use config::{Aggregator, ClientConfig, RouteConfig, RoutingStrategy};
+pub use client::{DexSuperAggClient, SwapTransaction};
+pub use config::{Aggregator, ClientConfig, JupiterConfig, RoutingStrategy, TitanConfig};

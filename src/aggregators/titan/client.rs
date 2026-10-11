@@ -1,11 +1,6 @@
-//! Titan WebSocket client.
-//!
-//! One connection is shared by every caller. A single reader task owns the read half of the socket
-//! and routes each server message to whoever is waiting for it — by request id for responses, by
-//! stream id for stream data — so concurrent requests never consume each other's replies.
-//!
-//! Every request carries a deadline. A connection that drops, or that lets a request time out, is
-//! marked dead and transparently replaced on the next request.
+//! Titan WebSocket client. One connection serves every caller: a reader task routes each server
+//! message by request id or stream id, so concurrent requests never consume each other's replies.
+//! A connection that drops, or lets a request miss its deadline, is replaced on the next request.
 
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -24,9 +19,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use super::types::*;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-/// Default deadline for connecting and for each request (including waiting for the first quote).
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum StreamEvent {
     Data(StreamData),
@@ -50,8 +42,8 @@ impl From<RequestError> for String {
 
 struct Pending {
     reply: oneshot::Sender<Result<ResponseSuccess, RequestError>>,
-    /// Where to route the stream this request starts, if it starts one. Registered by the reader
-    /// together with the response, so no stream data can arrive before its consumer exists.
+    /// Where the stream this request starts goes. The reader registers it on the response, so no
+    /// stream data can arrive before its consumer exists.
     stream_tx: Option<mpsc::UnboundedSender<StreamEvent>>,
 }
 
@@ -103,8 +95,7 @@ impl Connection {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// Stop routing new requests to this connection; it is replaced on the next request and closed
-    /// once in-flight requests release it.
+    /// Replace this connection on the next request; it closes once in-flight requests drop it.
     fn retire(&self) {
         self.alive.store(false, Ordering::SeqCst);
     }
@@ -270,8 +261,7 @@ fn build_ws_request(
         .map_err(|e| format!("Failed to build request: {}", e))
 }
 
-/// Titan WebSocket client for swap quote streaming
-pub struct TitanClient {
+pub(crate) struct TitanClient {
     endpoint: String,
     jwt_token: String,
     request_timeout: Duration,
@@ -280,32 +270,16 @@ pub struct TitanClient {
 }
 
 impl TitanClient {
-    /// Create a new Titan client. Nothing is connected until the first request (or [`connect`]).
-    ///
-    /// # Arguments
-    /// * `endpoint` - Server endpoint (e.g., "de1.api.demo.titan.exchange")
-    /// * `jwt_token` - JWT authentication token
-    ///
-    /// [`connect`]: TitanClient::connect
-    pub fn new(endpoint: String, jwt_token: String) -> Self {
+    /// Connects lazily, on the first request. `request_timeout` bounds connecting and each request
+    /// (including the wait for the first quote).
+    pub fn new(endpoint: String, jwt_token: String, request_timeout: Duration) -> Self {
         TitanClient {
             endpoint,
             jwt_token,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            request_timeout,
             connection: Mutex::new(None),
             next_request_id: AtomicU32::new(1),
         }
-    }
-
-    /// Deadline for connecting and for each request.
-    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
-        self.request_timeout = request_timeout;
-        self
-    }
-
-    /// Establish the connection now instead of on the first request.
-    pub async fn connect(&self) -> Result<(), String> {
-        self.connection().await.map(|_| ())
     }
 
     /// The live connection, reconnecting if there is none.
@@ -392,11 +366,8 @@ impl TitanClient {
         }
     }
 
-    /// Open a quote stream for `request`, take the first update that contains an executable route,
-    /// and stop the stream. Returns the best route (highest out amount) and its provider id.
-    ///
-    /// Routes that come only as a prebuilt `transaction` (no instructions) are skipped: we need the
-    /// instructions to add the compute budget and SOL wrapping ourselves.
+    /// The best route (and its provider) from the first quote-stream update that has one. Routes
+    /// without instructions (prebuilt transaction only) are skipped: we add the compute budget.
     pub async fn request_swap_quotes(
         &self,
         request: SwapQuoteRequest,
@@ -443,8 +414,7 @@ impl TitanClient {
         })
         .await;
 
-        // Stop the stream whatever happened; we only ever need one update. Fire-and-forget: the
-        // stop confirmation is ignored by the reader.
+        // We only ever need one update; the stop confirmation is ignored.
         connection.forget_stream(stream_id);
         let stop = ClientRequest {
             id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
@@ -459,22 +429,6 @@ impl TitanClient {
             "Timed out waiting for a Titan quote".to_string()
         })?
     }
-
-    /// Close the WebSocket connection
-    pub async fn close(&self) -> Result<(), String> {
-        let connection = self.connection.lock().await.take();
-        if let Some(connection) = connection {
-            connection.retire();
-            connection
-                .sink
-                .lock()
-                .await
-                .close()
-                .await
-                .map_err(|e| format!("Failed to close: {}", e))?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -485,25 +439,16 @@ mod tests {
 
     fn route(out_amount: u64) -> SwapRoute {
         SwapRoute {
-            in_amount: 1_000,
             out_amount,
-            slippage_bps: 50,
-            platform_fee: None,
-            steps: vec![],
             instructions: vec![Instruction {
                 p: [7; 32],
                 a: vec![],
                 d: vec![1],
             }],
             address_lookup_tables: vec![],
-            context_slot: None,
-            time_taken_ns: None,
             expires_at_ms: None,
-            expires_after_slot: None,
             compute_units: None,
             compute_units_safe: Some(200_000),
-            transaction: None,
-            reference_id: None,
         }
     }
 
@@ -521,23 +466,11 @@ mod tests {
                 amount,
                 swap_mode: Some(SwapMode::ExactIn),
                 slippage_bps: Some(50),
-                dexes: None,
-                exclude_dexes: None,
-                only_direct_routes: None,
-                add_size_constraint: None,
-                size_constraint: None,
-                providers: None,
-                accounts_limit_total: None,
-                accounts_limit_writable: None,
             },
             transaction: TransactionParams {
                 user_public_key: [3; 32],
                 close_input_token_account: None,
-                create_output_token_account: Some(true),
-                fee_account: None,
-                fee_bps: None,
-                fee_from_input_mint: None,
-                output_account: None,
+                create_output_token_account: None,
                 output_wsol: None,
             },
             update: None,
@@ -601,25 +534,13 @@ mod tests {
                                 .unwrap();
                             ws.send(encode(&ServerMessage::Response(ResponseSuccess {
                                 request_id: request.id,
-                                data: ResponseData::NewSwapQuoteStream(QuoteSwapStreamResponse {
-                                    interval_ms: 1000,
-                                }),
-                                stream: Some(StreamStart {
-                                    id: stream_id,
-                                    data_type: StreamDataType::SwapQuotes,
-                                }),
+                                stream: Some(StreamStart { id: stream_id }),
                             })))
                             .await
                             .unwrap();
                             ws.send(encode(&ServerMessage::StreamData(StreamData {
                                 id: stream_id,
-                                seq: 0,
                                 payload: StreamDataPayload::SwapQuotes(SwapQuotes {
-                                    id: "q".to_string(),
-                                    input_mint: [1; 32],
-                                    output_mint: [2; 32],
-                                    swap_mode: SwapMode::ExactIn,
-                                    amount: quote.swap.amount,
                                     quotes: HashMap::from([(
                                         "mock".to_string(),
                                         route(quote.swap.amount * 2),
@@ -644,9 +565,11 @@ mod tests {
     #[tokio::test]
     async fn concurrent_quotes_each_get_their_own_reply() {
         let (endpoint, _) = mock_titan(Behaviour::Answer).await;
-        let client = Arc::new(
-            TitanClient::new(endpoint, String::new()).with_request_timeout(Duration::from_secs(5)),
-        );
+        let client = Arc::new(TitanClient::new(
+            endpoint,
+            String::new(),
+            Duration::from_secs(5),
+        ));
 
         for round in 0..20u64 {
             let (a, b) = tokio::join!(
@@ -661,8 +584,7 @@ mod tests {
     #[tokio::test]
     async fn unanswered_request_times_out_instead_of_hanging() {
         let (endpoint, connections) = mock_titan(Behaviour::Silent).await;
-        let client = TitanClient::new(endpoint, String::new())
-            .with_request_timeout(Duration::from_millis(300));
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_millis(300));
 
         let started = std::time::Instant::now();
         let error = client
@@ -680,8 +602,7 @@ mod tests {
     #[tokio::test]
     async fn reconnects_after_the_server_drops_the_connection() {
         let (endpoint, connections) = mock_titan(Behaviour::AnswerOnceThenDrop).await;
-        let client =
-            TitanClient::new(endpoint, String::new()).with_request_timeout(Duration::from_secs(5));
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_secs(5));
 
         for amount in [10, 20, 30] {
             let (_, route) = client

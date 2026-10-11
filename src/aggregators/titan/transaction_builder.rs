@@ -1,6 +1,5 @@
-//! Turns a Titan route into transaction instructions. Titan routes carry no compute budget (without
-//! one a route runs under the 200k default limit with no priority fee), so we add it, plus the wrap
-//! of a native-SOL input.
+//! Titan routes carry no compute budget: without one a route runs under the 200k default limit
+//! with no priority fee, so we add it.
 
 use anyhow::{anyhow, Result};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
@@ -11,11 +10,6 @@ use solana_sdk::{
     message::AddressLookupTableAccount,
     pubkey::Pubkey,
 };
-use solana_system_interface::instruction::transfer;
-use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
-};
-use spl_token_interface::{instruction::sync_native, native_mint};
 
 use super::types::{self, SwapRoute};
 
@@ -46,13 +40,11 @@ fn compute_unit_limit(route: &SwapRoute) -> u32 {
         .unwrap_or(FALLBACK_COMPUTE_UNIT_LIMIT)
 }
 
-/// Compute budget, then the optional wrap of `wrap_input_lamports` into the wSOL ATA, then the route.
+/// The compute budget followed by the route.
 pub(crate) fn route_instructions(
     route: &SwapRoute,
-    payer: &Pubkey,
     compute_unit_price_micro_lamports: u64,
-    wrap_input_lamports: Option<u64>,
-) -> Result<Vec<Instruction>> {
+) -> Vec<Instruction> {
     let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(
         compute_unit_limit(route),
     )];
@@ -61,25 +53,12 @@ pub(crate) fn route_instructions(
             compute_unit_price_micro_lamports,
         ));
     }
-    if let Some(lamports) = wrap_input_lamports {
-        let wsol_ata = get_associated_token_address(payer, &native_mint::ID);
-        instructions.extend([
-            create_associated_token_account_idempotent(
-                payer,
-                payer,
-                &native_mint::ID,
-                &spl_token_interface::ID,
-            ),
-            transfer(payer, &wsol_ata, lamports),
-            sync_native(&spl_token_interface::ID, &wsol_ata)?,
-        ]);
-    }
     instructions.extend(route.instructions.iter().map(to_solana_instruction));
-    Ok(instructions)
+    instructions
 }
 
-/// Fetch every lookup table the route needs; a missing one is an error rather than a transaction
-/// that references accounts it can't resolve.
+/// Every lookup table the route needs; a missing one is an error rather than a transaction that
+/// references accounts it can't resolve.
 pub(crate) async fn fetch_lookup_tables(
     rpc: &RpcClient,
     route: &SwapRoute,
@@ -117,25 +96,16 @@ mod tests {
 
     fn route(compute_units: Option<u64>, compute_units_safe: Option<u64>) -> SwapRoute {
         SwapRoute {
-            in_amount: 1,
             out_amount: 1,
-            slippage_bps: 50,
-            platform_fee: None,
-            steps: vec![],
             instructions: vec![types::Instruction {
                 p: [9; 32],
                 a: vec![],
                 d: vec![42],
             }],
             address_lookup_tables: vec![],
-            context_slot: None,
-            time_taken_ns: None,
             expires_at_ms: None,
-            expires_after_slot: None,
             compute_units,
             compute_units_safe,
-            transaction: None,
-            reference_id: None,
         }
     }
 
@@ -151,12 +121,9 @@ mod tests {
     }
 
     #[test]
-    fn route_is_preceded_by_compute_budget_and_wrap() {
-        let payer = Pubkey::new_unique();
-        let ixs = route_instructions(&route(None, Some(300_000)), &payer, 5_000, Some(77)).unwrap();
-
-        // limit, price, create ATA, transfer, sync, route
-        assert_eq!(ixs.len(), 6);
+    fn route_is_preceded_by_the_compute_budget() {
+        let ixs = route_instructions(&route(None, Some(300_000)), 5_000);
+        assert_eq!(ixs.len(), 3);
         assert_eq!(
             ixs[0],
             ComputeBudgetInstruction::set_compute_unit_limit(300_000)
@@ -165,14 +132,11 @@ mod tests {
             ixs[1],
             ComputeBudgetInstruction::set_compute_unit_price(5_000)
         );
-        let wsol_ata = get_associated_token_address(&payer, &native_mint::ID);
-        assert_eq!(ixs[3], transfer(&payer, &wsol_ata, 77));
         assert_eq!(
-            ixs[5],
+            ixs[2],
             to_solana_instruction(&route(None, None).instructions[0])
         );
 
-        let plain = route_instructions(&route(None, Some(300_000)), &payer, 0, None).unwrap();
-        assert_eq!(plain.len(), 2);
+        assert_eq!(route_instructions(&route(None, Some(300_000)), 0).len(), 2);
     }
 }
