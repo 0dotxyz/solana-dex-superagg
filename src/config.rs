@@ -8,16 +8,6 @@ pub enum Aggregator {
     Titan,
 }
 
-/// Which venues to quote.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum RoutingStrategy {
-    /// Quote every configured venue and build the one with the most output.
-    #[default]
-    BestPrice,
-    /// Quote and build only this venue.
-    PreferredAggregator { aggregator: Aggregator },
-}
-
 #[derive(Clone)]
 pub struct JupiterConfig {
     /// e.g. `https://api.jup.ag/swap/v1`
@@ -38,7 +28,6 @@ pub struct ClientConfig {
     pub slippage_bps: u16,
     /// Priority fee per compute unit; 0 leaves each venue's default.
     pub compute_unit_price_micro_lamports: u64,
-    pub routing_strategy: RoutingStrategy,
     /// Per-venue quote deadline; a venue that misses it is left out of the comparison.
     pub quote_timeout: Duration,
     /// Per-venue deadline for building a transaction from its quote.
@@ -55,7 +44,6 @@ impl Default for ClientConfig {
             rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             slippage_bps: 50,
             compute_unit_price_micro_lamports: 0,
-            routing_strategy: RoutingStrategy::BestPrice,
             quote_timeout: Duration::from_secs(5),
             build_timeout: Duration::from_secs(10),
             confirm_timeout: Duration::from_secs(90),
@@ -87,7 +75,6 @@ impl fmt::Debug for ClientConfig {
                 "compute_unit_price_micro_lamports",
                 &self.compute_unit_price_micro_lamports,
             )
-            .field("routing_strategy", &self.routing_strategy)
             .field("quote_timeout", &self.quote_timeout)
             .field("build_timeout", &self.build_timeout)
             .field("confirm_timeout", &self.confirm_timeout)

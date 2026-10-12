@@ -8,7 +8,7 @@ Library for best-price exact-in swaps across Jupiter and Titan; consumed by eva0
 ```
 src/
 ├── lib.rs
-├── config.rs                       # ClientConfig, venue configs, RoutingStrategy
+├── config.rs                       # ClientConfig, venue configs
 ├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, send_and_confirm
 └── aggregators/
     ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload

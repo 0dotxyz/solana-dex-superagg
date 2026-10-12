@@ -7,7 +7,7 @@
 
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
 use solana_dex_superagg::{
-    Aggregator, ClientConfig, DexSuperAggClient, JupiterConfig, RoutingStrategy, TitanConfig,
+    Aggregator, ClientConfig, DexSuperAggClient, JupiterConfig, TitanConfig,
 };
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
 
@@ -61,9 +61,17 @@ async fn builds_a_simulatable_swap_on_every_venue() {
             continue;
         }
 
+        // One venue at a time, so each gets exercised rather than only the best quote.
         let client = DexSuperAggClient::new(
             ClientConfig {
-                routing_strategy: RoutingStrategy::PreferredAggregator { aggregator },
+                jupiter: config
+                    .jupiter
+                    .clone()
+                    .filter(|_| aggregator == Aggregator::Jupiter),
+                titan: config
+                    .titan
+                    .clone()
+                    .filter(|_| aggregator == Aggregator::Titan),
                 ..config.clone()
             },
             wallet(),

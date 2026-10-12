@@ -3,4 +3,4 @@ pub mod client;
 pub mod config;
 
 pub use client::{DexSuperAggClient, SwapTransaction};
-pub use config::{Aggregator, ClientConfig, JupiterConfig, RoutingStrategy, TitanConfig};
+pub use config::{Aggregator, ClientConfig, JupiterConfig, TitanConfig};

@@ -1,7 +1,7 @@
 use crate::aggregators::{
     jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator, Quote,
 };
-use crate::config::{Aggregator, ClientConfig, RoutingStrategy};
+use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, bail, Result};
 use futures_util::future::join_all;
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
@@ -113,13 +113,9 @@ impl DexSuperAggClient {
         if amount == 0 {
             bail!("Swap amount cannot be zero");
         }
-        let venues = match &self.config.routing_strategy {
-            RoutingStrategy::PreferredAggregator { aggregator } => vec![self.venue(*aggregator)?],
-            RoutingStrategy::BestPrice => self.venues.iter().map(|venue| venue.as_ref()).collect(),
-        };
 
         let quote_timeout = self.config.quote_timeout;
-        let results = join_all(venues.into_iter().map(|venue| async move {
+        let results = join_all(self.venues.iter().map(|venue| async move {
             let quote =
                 match timeout(quote_timeout, venue.quote(input_mint, output_mint, amount)).await {
                     Ok(quote) => quote,

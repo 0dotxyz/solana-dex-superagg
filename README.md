@@ -23,7 +23,7 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
 
 - **Routing**: every configured venue is quoted in parallel (`quote_timeout` each); failures are
   logged and left out. The best quote is built (`build_timeout`), falling back to the next best if
-  its venue fails to build. `RoutingStrategy::PreferredAggregator` restricts it to one venue.
+  its venue fails to build.
 - **Min-out**: with `min_out > 0`, a short quote raises the input by the shortfall and re-quotes (at
   most twice), never above `max_in` (default 1.10 × `amount`).
 - **wSOL** is an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist for a
