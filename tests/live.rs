@@ -1,13 +1,13 @@
 //! Builds a 1 USDC → wSOL swap on each configured venue and simulates it; nothing is sent.
 //!
-//! RPC_URL=… WALLET='[1,2,…]' JUP_API_KEY=… TITAN_WS_ENDPOINT=… TITAN_API_KEY=… \
+//! RPC_URL=… WALLET='[1,2,…]' JUP_API_KEY=… TITAN_WS_ENDPOINT=… TITAN_API_KEY=… DFLOW_API_KEY=… \
 //!   cargo test --test live -- --ignored --nocapture
 //!
 //! The wallet needs 1 USDC. A venue whose env vars are unset is skipped.
 
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
 use solana_dex_superagg::{
-    Aggregator, ClientConfig, DexSuperAggClient, JupiterConfig, TitanConfig,
+    Aggregator, ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
 
@@ -47,14 +47,20 @@ async fn builds_a_simulatable_swap_on_every_venue() {
             titan_ws_endpoint: env("TITAN_WS_ENDPOINT").expect("TITAN_WS_ENDPOINT is required"),
             titan_api_key,
         }),
+        dflow: env("DFLOW_API_KEY").map(|api_key| DflowConfig {
+            api_url: env("DFLOW_API_URL")
+                .unwrap_or_else(|| "https://quote-api.dflow.net".to_string()),
+            api_key,
+        }),
         ..Default::default()
     };
     let rpc = RpcClient::new(rpc_url);
 
-    for aggregator in [Aggregator::Jupiter, Aggregator::Titan] {
+    for aggregator in [Aggregator::Jupiter, Aggregator::Titan, Aggregator::Dflow] {
         let configured = match aggregator {
             Aggregator::Jupiter => config.jupiter.is_some(),
             Aggregator::Titan => config.titan.is_some(),
+            Aggregator::Dflow => config.dflow.is_some(),
         };
         if !configured {
             println!("{:?}: skipped (not configured)", aggregator);
@@ -72,6 +78,10 @@ async fn builds_a_simulatable_swap_on_every_venue() {
                     .titan
                     .clone()
                     .filter(|_| aggregator == Aggregator::Titan),
+                dflow: config
+                    .dflow
+                    .clone()
+                    .filter(|_| aggregator == Aggregator::Dflow),
                 ..config.clone()
             },
             wallet(),

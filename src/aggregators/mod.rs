@@ -9,6 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 
+pub(crate) mod dflow;
 pub(crate) mod jupiter;
 pub(crate) mod titan;
 
@@ -23,6 +24,8 @@ pub(crate) struct Quote {
 pub(crate) enum QuotePayload {
     Jupiter(Box<jupiter_swap_api_client::quote::QuoteResponse>),
     Titan(Box<titan::SwapRoute>),
+    /// DFlow's quote JSON, passed back to its `/swap` unchanged.
+    Dflow(Box<serde_json::Value>),
 }
 
 #[async_trait]

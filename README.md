@@ -1,7 +1,6 @@
 # solana-dex-superagg
 
-Best-price exact-in swaps on Solana across the Jupiter and Titan aggregators, used by the eva01 and
-zeeper liquidators.
+Best-price exact-in swaps on Solana across the Jupiter, Titan and DFlow aggregators.
 
 ```rust
 let client = DexSuperAggClient::new(
@@ -11,6 +10,7 @@ let client = DexSuperAggClient::new(
         compute_unit_price_micro_lamports: 10_000,
         jupiter: Some(JupiterConfig { jup_swap_api_url, api_key }),
         titan: Some(TitanConfig { titan_ws_endpoint, titan_api_key }),
+        dflow: Some(DflowConfig { api_url, api_key }),
         ..Default::default()
     },
     keypair,
@@ -21,8 +21,8 @@ let swap = client.build_swap_transaction(usdc, wsol, amount, min_out, Some(max_i
 client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
 ```
 
-- **Routing**: every configured venue is quoted in parallel (`quote_timeout` each); failures are
-  logged and left out. The best quote is built (`build_timeout`), falling back to the next best if
+- **Routing**: every configured venue is quoted in parallel (`quote_timeout` each); failures,
+  including rate limits, are logged and left out, so each extra venue is redundancy for free. The best quote is built (`build_timeout`), falling back to the next best if
   its venue fails to build.
 - **Min-out**: with `min_out > 0`, a short quote raises the input by the shortfall and re-quotes (at
   most twice), never above `max_in` (default 1.10 × `amount`).
@@ -45,6 +45,6 @@ signs exactly that quote. Honour the wSOL rule above and the configured CU price
 ```sh
 cargo test
 # Builds and simulates a 1 USDC → wSOL swap on each configured venue (nothing is sent):
-RPC_URL=… WALLET='[1,2,…]' JUP_API_KEY=… TITAN_WS_ENDPOINT=… TITAN_API_KEY=… \
+RPC_URL=… WALLET='[1,2,…]' JUP_API_KEY=… TITAN_WS_ENDPOINT=… TITAN_API_KEY=… DFLOW_API_KEY=… \
   cargo test --test live -- --ignored --nocapture
 ```

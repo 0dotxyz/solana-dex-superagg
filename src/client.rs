@@ -1,5 +1,6 @@
 use crate::aggregators::{
-    jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator, Quote,
+    dflow::DflowAggregator, jupiter::JupiterAggregator, titan::TitanAggregator, DexAggregator,
+    Quote,
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, bail, Result};
@@ -78,6 +79,13 @@ impl DexSuperAggClient {
                 &config,
                 Arc::clone(&signer),
                 Arc::clone(&rpc_client),
+            )));
+        }
+        if let Some(dflow) = &config.dflow {
+            venues.push(Box::new(DflowAggregator::new(
+                dflow,
+                &config,
+                Arc::clone(&signer),
             )));
         }
         if venues.is_empty() {

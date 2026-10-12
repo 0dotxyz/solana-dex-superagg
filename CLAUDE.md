@@ -1,7 +1,7 @@
 # CLAUDE.md
 
-Library for best-price exact-in swaps across Jupiter and Titan; consumed by eva01 and zeeper
-(`../eva01`, `../zeeper`). See README.md for the API and behaviour.
+Library for best-price exact-in swaps across Jupiter, Titan and DFlow. See README.md for the API
+and behaviour.
 
 ## Layout
 
@@ -13,6 +13,7 @@ src/
 └── aggregators/
     ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload
     ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected)
+    ├── dflow/mod.rs                # DFlow HTTP API (quote JSON passed back to /swap unchanged)
     └── titan/
         ├── mod.rs                  # Titan venue: quote params (outputWsol), build
         ├── client.rs               # WebSocket client: id routing, deadlines, reconnect (+ mock-server tests)
@@ -26,8 +27,8 @@ tests/live.rs                       # ignored: build + simulate on real venues
 - A venue builds exactly the quote it returned; the client compares quotes, then builds.
 - wSOL is never wrapped/unwrapped/closed (`wrapAndUnwrapSol: false`, Titan `outputWsol: true`,
   `closeInputTokenAccount: false`). Consumers keep SOL as wSOL in their ATA.
-- Only Jupiter and Titan: marginfi's receivership introspection allows only those swap programs
-  inside a liquidation transaction.
+- Venues are peers: same trait, same parallel quote, same build. Which of them a consumer may
+  run inside a liquidation transaction is the consumer's concern (configure only those).
 
 ## Commands
 

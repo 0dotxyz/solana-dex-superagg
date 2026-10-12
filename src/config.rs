@@ -6,6 +6,7 @@ use std::time::Duration;
 pub enum Aggregator {
     Jupiter,
     Titan,
+    Dflow,
 }
 
 #[derive(Clone)]
@@ -17,9 +18,16 @@ pub struct JupiterConfig {
 
 #[derive(Clone)]
 pub struct TitanConfig {
-    /// A host (`us1.api.titan.exchange`) or a proxy URL (`http://localhost:8080/ws`)
+    /// A host, e.g. `us1.api.titan.exchange`
     pub titan_ws_endpoint: String,
     pub titan_api_key: String,
+}
+
+#[derive(Clone)]
+pub struct DflowConfig {
+    /// e.g. `https://quote-api.dflow.net`
+    pub api_url: String,
+    pub api_key: String,
 }
 
 #[derive(Clone)]
@@ -36,6 +44,7 @@ pub struct ClientConfig {
     pub confirm_timeout: Duration,
     pub jupiter: Option<JupiterConfig>,
     pub titan: Option<TitanConfig>,
+    pub dflow: Option<DflowConfig>,
 }
 
 impl Default for ClientConfig {
@@ -49,6 +58,7 @@ impl Default for ClientConfig {
             confirm_timeout: Duration::from_secs(90),
             jupiter: None,
             titan: None,
+            dflow: None,
         }
     }
 }
@@ -80,6 +90,7 @@ impl fmt::Debug for ClientConfig {
             .field("confirm_timeout", &self.confirm_timeout)
             .field("jupiter", &self.jupiter)
             .field("titan", &self.titan)
+            .field("dflow", &self.dflow)
             .finish()
     }
 }
@@ -88,6 +99,14 @@ impl fmt::Debug for JupiterConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JupiterConfig")
             .field("jup_swap_api_url", &self.jup_swap_api_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for DflowConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DflowConfig")
+            .field("api_url", &self.api_url)
             .finish_non_exhaustive()
     }
 }
@@ -116,10 +135,19 @@ mod tests {
                 titan_ws_endpoint: "us1.api.titan.exchange".to_string(),
                 titan_api_key: "secret-titan".to_string(),
             }),
+            dflow: Some(DflowConfig {
+                api_url: "https://quote-api.dflow.net".to_string(),
+                api_key: "secret-dflow".to_string(),
+            }),
             ..Default::default()
         };
         let printed = format!("{:?}", config);
-        for secret in ["secret-rpc-token", "secret-jup", "secret-titan"] {
+        for secret in [
+            "secret-rpc-token",
+            "secret-jup",
+            "secret-titan",
+            "secret-dflow",
+        ] {
             assert!(
                 !printed.contains(secret),
                 "{} leaked in {}",
