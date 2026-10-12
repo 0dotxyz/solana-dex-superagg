@@ -456,7 +456,7 @@ mod tests {
         AnswerOnceThenDrop,
     }
 
-    /// A local Titan stand-in. Returns the proxy-mode endpoint and a counter of connections.
+    /// A local Titan stand-in. Returns its `ws://` endpoint and a counter of connections.
     async fn mock_titan(behaviour: Behaviour) -> (String, Arc<AtomicU32>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}/ws", listener.local_addr().unwrap());

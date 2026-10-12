@@ -41,7 +41,7 @@ pub struct SwapTransaction {
     pub aggregator: Aggregator,
 }
 
-/// Routes exact-in swaps across DEX aggregators (Jupiter, Titan).
+/// Routes exact-in swaps across DEX aggregators (Jupiter, Titan, DFlow).
 pub struct DexSuperAggClient {
     rpc_client: Arc<RpcClient>,
     config: ClientConfig,
@@ -107,7 +107,7 @@ impl DexSuperAggClient {
             .ok_or_else(|| anyhow!("{:?} is not configured", aggregator))
     }
 
-    /// Quote every venue of the routing strategy in parallel, best (most output) first. A venue
+    /// Quote every configured venue in parallel, best (most output) first. A venue
     /// that fails or misses the deadline is logged and left out; only if none quotes is it an error.
     async fn collect_quotes(
         &self,

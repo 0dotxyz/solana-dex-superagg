@@ -30,6 +30,11 @@ tests/live.rs                       # ignored: build + simulate on real venues
 - Venues are peers: same trait, same parallel quote, same build. Which of them a consumer may
   run inside a liquidation transaction is the consumer's concern (configure only those).
 
+## Follow-ups
+
+- Jupiter's `/swap/v1` (Metis) is no longer maintained upstream; the maintained equivalent is
+  Swap v2 `/build` (Metis only, caller submits). v1 still works; migrate before it's switched off.
+
 ## Commands
 
 ```sh

@@ -2,11 +2,11 @@
 name = "solana-dex-superagg"
 version = "2.0.0"
 edition = "2021"
-description = "Best-price exact-in swaps across the Jupiter and Titan DEX aggregators on Solana"
+description = "Best-price exact-in swaps across the Jupiter, Titan and DFlow aggregators on Solana"
 license = "MIT"
 repository = "https://github.com/0dotxyz/solana-dex-superagg"
 readme = "README.md"
-keywords = ["solana", "dex", "swap", "jupiter", "titan", "aggregator", "defi"]
+keywords = ["solana", "dex", "swap", "jupiter", "titan", "dflow", "aggregator"]
 categories = ["cryptography::cryptocurrencies", "web-programming"]
 authors = ["Abdul Rabbani"]
 
@@ -18,7 +18,7 @@ path = "src/lib.rs"
 solana-sdk = "=3.0.0"
 solana-client = "=3.1.11"
 solana-commitment-config = "3.1.1"
-solana-address-lookup-table-interface = { version = "3.1.0", features = ["bincode", "bytemuck"] }
+solana-address-lookup-table-interface = { version = "3.1.0", features = ["bytemuck"] }
 solana-compute-budget-interface = "3.0.0"
 
 anyhow = "1.0.102"
