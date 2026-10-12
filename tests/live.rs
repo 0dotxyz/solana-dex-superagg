@@ -5,7 +5,7 @@
 //!
 //! The wallet needs 1 USDC. A venue whose env vars are unset is skipped.
 
-use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
 use solana_dex_superagg::{
     Aggregator, ClientConfig, DexSuperAggClient, JupiterConfig, RoutingStrategy, TitanConfig,
 };
@@ -73,7 +73,16 @@ async fn builds_a_simulatable_swap_on_every_venue() {
             .build_swap_transaction(USDC, WSOL, 1_000_000, 0, None)
             .await
             .unwrap_or_else(|e| panic!("{:?}: {}", aggregator, e));
-        let simulation = rpc.simulate_transaction(&swap.transaction).await.unwrap();
+        let simulation = rpc
+            .simulate_transaction_with_config(
+                &swap.transaction,
+                RpcSimulateTransactionConfig {
+                    replace_recent_blockhash: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         println!(
             "{:?}: 1 USDC -> {} lamports of wSOL, simulation error: {:?}",
             aggregator, swap.out_amount, simulation.value.err

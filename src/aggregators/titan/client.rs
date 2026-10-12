@@ -14,7 +14,11 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
 use super::types::*;
 
@@ -196,69 +200,32 @@ fn dispatch(routes: &StdMutex<Routes>, message: ServerMessage) {
     }
 }
 
-/// Build the WebSocket handshake. Supports both direct mode (`host`, connects to
-/// `wss://host/api/v1/ws`) and proxy mode (`http(s)://proxy/path`).
+/// `endpoint` is a Titan host (`us1.api.titan.exchange`); a full `ws(s)://` URL is used as is.
 fn build_ws_request(
     endpoint: &str,
     jwt_token: &str,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
-    let is_proxy = endpoint.starts_with("http://") || endpoint.starts_with("https://");
-
-    let (url, host) = if is_proxy {
-        let ws_url = endpoint
-            .replace("http://", "ws://")
-            .replace("https://", "wss://");
-        let host = endpoint
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .split('/')
-            .next()
-            .unwrap_or("localhost:8080")
-            .to_string();
-        (ws_url, host)
+    let url = if endpoint.contains("://") {
+        endpoint.to_string()
     } else {
-        (
-            format!("wss://{}/api/v1/ws", endpoint),
-            endpoint.to_string(),
-        )
+        format!("wss://{endpoint}/api/v1/ws")
     };
-
-    // Titan accepts auth as a query parameter (most reliable for WebSockets) and as a Bearer
-    // header (recommended); send both in direct mode.
-    let final_url = if !is_proxy && !jwt_token.is_empty() {
-        let separator = if url.contains('?') { "&" } else { "?" };
-        format!(
-            "{}{}auth={}",
-            url,
-            separator,
-            urlencoding::encode(jwt_token)
-        )
-    } else {
-        url
-    };
-
-    let mut request_builder = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(&final_url)
-        .header("Host", &host)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-        );
-
-    if !is_proxy {
-        request_builder = request_builder.header("Sec-WebSocket-Protocol", "v1.api.titan.ag");
-        if !jwt_token.is_empty() {
-            request_builder =
-                request_builder.header("Authorization", format!("Bearer {}", jwt_token));
-        }
-    }
-
-    request_builder
-        .body(())
-        .map_err(|e| format!("Failed to build request: {}", e))
+    // Titan takes the token as a query parameter and as a Bearer header; send both.
+    let mut request = format!("{url}?auth={}", urlencoding::encode(jwt_token))
+        .into_client_request()
+        .map_err(|e| format!("Invalid Titan endpoint: {e}"))?;
+    let headers = request.headers_mut();
+    headers.insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static("v1.api.titan.ag"),
+    );
+    headers.insert(
+        "Authorization",
+        format!("Bearer {jwt_token}")
+            .parse()
+            .map_err(|e| format!("Invalid Titan API key: {e}"))?,
+    );
+    Ok(request)
 }
 
 pub(crate) struct TitanClient {
@@ -435,7 +402,8 @@ impl TitanClient {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
     fn route(out_amount: u64) -> SwapRoute {
         SwapRoute {
@@ -491,7 +459,7 @@ mod tests {
     /// A local Titan stand-in. Returns the proxy-mode endpoint and a counter of connections.
     async fn mock_titan(behaviour: Behaviour) -> (String, Arc<AtomicU32>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/ws", listener.local_addr().unwrap());
+        let endpoint = format!("ws://{}/ws", listener.local_addr().unwrap());
         let connections = Arc::new(AtomicU32::new(0));
         let counter = Arc::clone(&connections);
 
@@ -500,7 +468,16 @@ mod tests {
                 let (tcp, _) = listener.accept().await.unwrap();
                 counter.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    let mut ws = accept_async(tcp).await.unwrap();
+                    // Agree to the subprotocol like Titan does, or the client rejects the handshake.
+                    let mut ws = accept_hdr_async(tcp, |_req: &Request, mut resp: Response| {
+                        resp.headers_mut().insert(
+                            "Sec-WebSocket-Protocol",
+                            HeaderValue::from_static("v1.api.titan.ag"),
+                        );
+                        Ok(resp)
+                    })
+                    .await
+                    .unwrap();
                     let mut held: Vec<ClientRequest> = Vec::new();
                     let mut next_stream = 100;
                     while let Some(Ok(message)) = ws.next().await {
