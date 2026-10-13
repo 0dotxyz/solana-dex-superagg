@@ -6,12 +6,11 @@ use crate::aggregators::{DexAggregator, Quote, QuotePayload};
 use crate::config::{Aggregator, ClientConfig, TitanConfig};
 use anyhow::{anyhow, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{
-    message::{v0, VersionedMessage},
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::VersionedTransaction,
-};
+use solana_keypair::Keypair;
+use solana_message::{v0, VersionedMessage};
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 

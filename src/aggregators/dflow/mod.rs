@@ -3,11 +3,10 @@ use crate::config::{Aggregator, ClientConfig, DflowConfig};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::VersionedTransaction,
-};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
 
 pub(crate) struct DflowAggregator {

@@ -5,11 +5,9 @@ use anyhow::{anyhow, Result};
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
-    message::AddressLookupTableAccount,
-    pubkey::Pubkey,
-};
+use solana_instruction::{AccountMeta, Instruction};
+use solana_message::AddressLookupTableAccount;
+use solana_pubkey::Pubkey;
 
 use super::types::{self, SwapRoute};
 

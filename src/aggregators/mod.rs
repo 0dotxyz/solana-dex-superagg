@@ -7,7 +7,8 @@
 use crate::config::Aggregator;
 use anyhow::Result;
 use async_trait::async_trait;
-use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+use solana_pubkey::Pubkey;
+use solana_transaction::versioned::VersionedTransaction;
 
 pub(crate) mod dflow;
 pub(crate) mod jupiter;

@@ -9,7 +9,8 @@ use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateT
 use solana_dex_superagg::{
     Aggregator, ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
-use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 
 const USDC: Pubkey = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");

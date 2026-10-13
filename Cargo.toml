@@ -15,10 +15,16 @@ name = "solana_dex_superagg"
 path = "src/lib.rs"
 
 [dependencies]
-solana-sdk = "=3.0.0"
-solana-client = "=3.1.11"
+solana-pubkey = "4"
+solana-keypair = "=3.1.2"
+solana-signer = "3"
+solana-signature = "3"
+solana-instruction = "3"
+solana-message = "4"
+solana-transaction = "4"
+solana-client = "=4.2.2"
 solana-commitment-config = "3.1.1"
-solana-address-lookup-table-interface = { version = "3.1.0", features = ["bytemuck"] }
+solana-address-lookup-table-interface = { version = "3", features = ["bytemuck"] }
 solana-compute-budget-interface = "3.0.0"
 
 anyhow = "1.0.102"
@@ -36,4 +42,4 @@ tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tracing = "0.1"
 urlencoding = "2.1"
 
-jupiter-swap-api-client = { git = "https://github.com/IliaZyrin/jupiter-swap-api-client", rev = "48c811655963daf3a5bb0905a421386bbedc6f61" }
+jupiter-swap-api-client = { git = "https://github.com/IliaZyrin/jupiter-swap-api-client", rev = "fc3574e4f77c065b9a2cf9c4032972ce6e944f3e" }

@@ -7,11 +7,10 @@ use anyhow::{anyhow, bail, Result};
 use futures_util::future::join_all;
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signature},
-    transaction::VersionedTransaction,
-};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
