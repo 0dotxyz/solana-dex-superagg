@@ -4,9 +4,10 @@ use crate::aggregators::{
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, bail, Result};
-use futures_util::future::join_all;
+use futures_util::future::{join_all, BoxFuture};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -35,7 +36,21 @@ const REBROADCAST_EVERY_POLLS: u32 = 4;
 pub struct SwapTransaction {
     pub transaction: VersionedTransaction,
     pub in_amount: u64,
-    /// Expected (not slippage-adjusted) output of the quote it was built from.
+    /// Expected output of the quote it was built from; at least `min_out` is guaranteed.
+    pub out_amount: u64,
+    pub aggregator: Aggregator,
+}
+
+/// A swap's instructions, for embedding in a transaction of the caller's own (which sets the
+/// compute budget, signs and submits).
+#[derive(Debug, Clone)]
+pub struct SwapInstructions {
+    /// Setup (output ATA creation) and swap instructions, in order.
+    pub instructions: Vec<Instruction>,
+    /// Lookup tables the instructions' accounts come from.
+    pub lookup_tables: Vec<Pubkey>,
+    pub in_amount: u64,
+    /// Expected output of the quote they were built from; at least `min_out` is guaranteed.
     pub out_amount: u64,
     pub aggregator: Aggregator,
 }
@@ -152,28 +167,31 @@ impl DexSuperAggClient {
         Ok(quotes)
     }
 
-    /// Build the best quote yielding at least `min_out`, falling back to the next best if its
-    /// venue fails to build.
-    async fn build_best(
+    /// Build the best quote guaranteeing at least `min_out` with `build`, falling back to the
+    /// next best if its venue fails to build.
+    async fn build_best<'q, T>(
         &self,
-        quotes: &[Quote],
+        quotes: &'q [Quote],
         amount: u64,
         min_out: u64,
-    ) -> Result<SwapTransaction> {
+        build: impl for<'a> Fn(&'a dyn DexAggregator, &'a Quote) -> BoxFuture<'a, Result<T>>,
+    ) -> Result<(T, &'q Quote)> {
         let summary: Vec<_> = quotes
             .iter()
             .map(|q| (q.aggregator, q.out_amount))
             .collect();
         let mut failures = Vec::new();
-        for quote in quotes.iter().filter(|quote| quote.out_amount >= min_out) {
+        for quote in quotes
+            .iter()
+            .filter(|quote| quote.min_out_amount >= min_out)
+        {
             let venue = self.venue(quote.aggregator)?;
-            let built =
-                match timeout(self.config.build_timeout, venue.build_transaction(quote)).await {
-                    Ok(built) => built,
-                    Err(_) => Err(anyhow!("timed out after {:?}", self.config.build_timeout)),
-                };
+            let built = match timeout(self.config.build_timeout, build(venue, quote)).await {
+                Ok(built) => built,
+                Err(_) => Err(anyhow!("timed out after {:?}", self.config.build_timeout)),
+            };
             match built {
-                Ok(transaction) => {
+                Ok(built) => {
                     tracing::info!(
                         aggregator = ?quote.aggregator,
                         in_amount = amount,
@@ -181,52 +199,32 @@ impl DexSuperAggClient {
                         quotes = ?summary,
                         "Selected aggregator"
                     );
-                    return Ok(SwapTransaction {
-                        transaction,
-                        in_amount: amount,
-                        out_amount: quote.out_amount,
-                        aggregator: quote.aggregator,
-                    });
+                    return Ok((built, quote));
                 }
                 Err(e) => {
-                    tracing::warn!(aggregator = ?quote.aggregator, error = %e, "Failed to build swap transaction");
+                    tracing::warn!(aggregator = ?quote.aggregator, error = %e, "Failed to build swap");
                     failures.push(format!("{:?}: {}", quote.aggregator, e));
                 }
             }
         }
         bail!(
-            "Could not build a swap transaction on any venue ({})",
+            "Could not build a swap on any venue ({})",
             failures.join("; ")
         )
     }
 
-    /// Every venue's expected output for swapping `amount`, best first.
-    pub async fn quote(
+    /// Quotes whose best guarantees at least `min_out` (0 for any) at the configured slippage, and
+    /// the input they are for. If the quote for `amount` falls short, the input is raised by the
+    /// shortfall and re-quoted (at most `MIN_OUT_MAX_REQUOTES` times), never above
+    /// `max_in_amount` (default: `DEFAULT_MAX_INPUT_BUMP` × `amount`).
+    async fn quotes_for(
         &self,
-        input_mint: Pubkey,
-        output_mint: Pubkey,
-        amount: u64,
-    ) -> Result<Vec<(Aggregator, u64)>> {
-        Ok(self
-            .collect_quotes(&input_mint, &output_mint, amount)
-            .await?
-            .into_iter()
-            .map(|quote| (quote.aggregator, quote.out_amount))
-            .collect())
-    }
-
-    /// Build a signed exact-in swap transaction yielding at least `min_out` (0 for any). If the
-    /// quote for `amount` falls short, the input is raised by the shortfall and re-quoted (at most
-    /// `MIN_OUT_MAX_REQUOTES` times), never above `max_in_amount` (default:
-    /// `DEFAULT_MAX_INPUT_BUMP` × `amount`).
-    pub async fn build_swap_transaction(
-        &self,
-        input_mint: Pubkey,
-        output_mint: Pubkey,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
         amount: u64,
         min_out: u64,
         max_in_amount: Option<u64>,
-    ) -> Result<SwapTransaction> {
+    ) -> Result<(Vec<Quote>, u64)> {
         let max_in =
             max_in_amount.unwrap_or_else(|| (amount as f64 * DEFAULT_MAX_INPUT_BUMP).ceil() as u64);
         if amount > max_in {
@@ -236,17 +234,15 @@ impl DexSuperAggClient {
         let mut amount = amount;
         let mut requotes = 0;
         loop {
-            let quotes = self
-                .collect_quotes(&input_mint, &output_mint, amount)
-                .await?;
-            let best_out = quotes[0].out_amount;
+            let quotes = self.collect_quotes(input_mint, output_mint, amount).await?;
+            let best_out = quotes.iter().map(|q| q.min_out_amount).max().unwrap_or(0);
             if best_out >= min_out {
-                return self.build_best(&quotes, amount, min_out).await;
+                return Ok((quotes, amount));
             }
 
             if requotes == MIN_OUT_MAX_REQUOTES || amount >= max_in {
                 bail!(
-                    "Best quote for {} {} yields {} {}, short of the {} needed; input is capped at {}",
+                    "Best quote for {} {} guarantees {} {}, short of the {} needed; input is capped at {}",
                     amount,
                     input_mint,
                     best_out,
@@ -267,6 +263,74 @@ impl DexSuperAggClient {
             amount = next;
             requotes += 1;
         }
+    }
+
+    /// Every venue's expected output for swapping `amount`, best first.
+    pub async fn quote(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+    ) -> Result<Vec<(Aggregator, u64)>> {
+        Ok(self
+            .collect_quotes(&input_mint, &output_mint, amount)
+            .await?
+            .into_iter()
+            .map(|quote| (quote.aggregator, quote.out_amount))
+            .collect())
+    }
+
+    /// Build a signed exact-in swap transaction guaranteeing at least `min_out` (0 for any),
+    /// raising the input up to `max_in_amount` if the quote falls short (see `quotes_for`).
+    pub async fn build_swap_transaction(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+        min_out: u64,
+        max_in_amount: Option<u64>,
+    ) -> Result<SwapTransaction> {
+        let (quotes, amount) = self
+            .quotes_for(&input_mint, &output_mint, amount, min_out, max_in_amount)
+            .await?;
+        let (transaction, quote) = self
+            .build_best(&quotes, amount, min_out, |venue, quote| {
+                venue.build_transaction(quote)
+            })
+            .await?;
+        Ok(SwapTransaction {
+            transaction,
+            in_amount: amount,
+            out_amount: quote.out_amount,
+            aggregator: quote.aggregator,
+        })
+    }
+
+    /// Like `build_swap_transaction`, but returns the swap's instructions and lookup tables for
+    /// the caller's own transaction.
+    pub async fn build_swap_instructions(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+        min_out: u64,
+        max_in_amount: Option<u64>,
+    ) -> Result<SwapInstructions> {
+        let (quotes, amount) = self
+            .quotes_for(&input_mint, &output_mint, amount, min_out, max_in_amount)
+            .await?;
+        let ((instructions, lookup_tables), quote) = self
+            .build_best(&quotes, amount, min_out, |venue, quote| {
+                venue.build_instructions(quote)
+            })
+            .await?;
+        Ok(SwapInstructions {
+            instructions,
+            lookup_tables,
+            in_amount: amount,
+            out_amount: quote.out_amount,
+            aggregator: quote.aggregator,
+        })
     }
 
     /// Submit `transaction` and wait until it reaches `commitment`, rebroadcasting while its
