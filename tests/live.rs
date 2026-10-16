@@ -1,16 +1,22 @@
-//! Builds a 1 USDC → wSOL swap on each configured venue and simulates it; nothing is sent.
+//! Builds a 1 USDC → wSOL swap on each configured venue, as a transaction and as instructions
+//! embedded in our own transaction, and simulates both; nothing is sent.
 //!
 //! RPC_URL=… WALLET='[1,2,…]' JUP_API_KEY=… TITAN_WS_ENDPOINT=… TITAN_API_KEY=… DFLOW_API_KEY=… \
 //!   cargo test --test live -- --ignored --nocapture
 //!
 //! The wallet needs 1 USDC. A venue whose env vars are unset is skipped.
 
+use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_dex_superagg::{
     Aggregator, ClientConfig, DexSuperAggClient, DflowConfig, JupiterConfig, TitanConfig,
 };
 use solana_keypair::Keypair;
+use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 
 const USDC: Pubkey = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
@@ -31,6 +37,26 @@ fn wallet() -> Keypair {
         })
         .collect();
     Keypair::try_from(bytes.as_slice()).expect("invalid WALLET")
+}
+
+async fn simulate(rpc: &RpcClient, tx: &VersionedTransaction, what: &str) {
+    let simulation = rpc
+        .simulate_transaction_with_config(
+            tx,
+            RpcSimulateTransactionConfig {
+                replace_recent_blockhash: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    println!("{}: simulation error: {:?}", what, simulation.value.err);
+    assert!(
+        simulation.value.err.is_none(),
+        "{}: {:?}",
+        what,
+        simulation.value.logs
+    );
 }
 
 #[tokio::test]
@@ -56,6 +82,7 @@ async fn builds_a_simulatable_swap_on_every_venue() {
         ..Default::default()
     };
     let rpc = RpcClient::new(rpc_url);
+    let signer = wallet();
 
     for aggregator in [Aggregator::Jupiter, Aggregator::Titan, Aggregator::Dflow] {
         let configured = match aggregator {
@@ -88,29 +115,56 @@ async fn builds_a_simulatable_swap_on_every_venue() {
             wallet(),
         )
         .unwrap();
+
         let swap = client
             .build_swap_transaction(USDC, WSOL, 1_000_000, 0, None)
             .await
             .unwrap_or_else(|e| panic!("{:?}: {}", aggregator, e));
-        let simulation = rpc
-            .simulate_transaction_with_config(
-                &swap.transaction,
-                RpcSimulateTransactionConfig {
-                    replace_recent_blockhash: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
         println!(
-            "{:?}: 1 USDC -> {} lamports of wSOL, simulation error: {:?}",
-            aggregator, swap.out_amount, simulation.value.err
+            "{:?}: 1 USDC -> {} lamports of wSOL",
+            aggregator, swap.out_amount
         );
-        assert!(
-            simulation.value.err.is_none(),
-            "{:?}: {:?}",
+        simulate(
+            &rpc,
+            &swap.transaction,
+            &format!("{:?} transaction", aggregator),
+        )
+        .await;
+
+        let swap = client
+            .build_swap_instructions(USDC, WSOL, 1_000_000, 0, None)
+            .await
+            .unwrap_or_else(|e| panic!("{:?}: {}", aggregator, e));
+        let mut lookup_tables = Vec::new();
+        for (key, account) in swap.lookup_tables.iter().zip(
+            rpc.get_multiple_accounts(&swap.lookup_tables)
+                .await
+                .unwrap(),
+        ) {
+            let account = account.unwrap();
+            let table = AddressLookupTable::deserialize(&account.data).unwrap();
+            lookup_tables.push(AddressLookupTableAccount {
+                key: *key,
+                addresses: table.addresses.to_vec(),
+            });
+        }
+        let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+        instructions.extend(swap.instructions);
+        let message = v0::Message::try_compile(
+            &signer.pubkey(),
+            &instructions,
+            &lookup_tables,
+            rpc.get_latest_blockhash().await.unwrap(),
+        )
+        .unwrap();
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&signer]).unwrap();
+        println!(
+            "{:?}: {} instructions, {} lookup tables, {} bytes",
             aggregator,
-            simulation.value.logs
+            instructions.len(),
+            lookup_tables.len(),
+            bincode::serialize(&tx).unwrap().len()
         );
+        simulate(&rpc, &tx, &format!("{:?} instructions", aggregator)).await;
     }
 }

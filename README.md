@@ -19,6 +19,9 @@ let client = DexSuperAggClient::new(
 // Buy at least `min_out`, spending `amount` and, if the quote falls short, at most `max_in`.
 let swap = client.build_swap_transaction(usdc, wsol, amount, min_out, Some(max_in)).await?;
 client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
+
+// The same swap as instructions (plus the lookup tables they use) for a transaction of your own.
+let swap = client.build_swap_instructions(usdc, wsol, amount, min_out, Some(max_in)).await?;
 ```
 
 - **Routing**: every configured venue is quoted in parallel (`quote_timeout` each); failures,
@@ -26,6 +29,8 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
   best quote is built (`build_timeout`), falling back to the next best if its venue fails to build.
 - **Min-out**: with `min_out > 0`, a short quote raises the input by the shortfall and re-quotes (at
   most twice), never above `max_in` (default 1.10 × `amount`).
+- **Instructions**: `build_swap_instructions` returns the venue's setup (output ATA) and swap
+  instructions without a compute budget or cleanup; the caller compiles, signs and submits.
 - **wSOL** is an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist for a
   wSOL input), never wrapped, unwrapped or closed.
 - **Titan**: one WebSocket shared by all callers, opened lazily; replies are routed by request and
@@ -37,7 +42,7 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
 
 Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the expected output plus a
 `QuotePayload` variant holding whatever the venue needs to build; `build_transaction` builds and
-signs exactly that quote. Honour the wSOL rule above and the configured CU price, add an
+signs exactly that quote, `build_instructions` returns its instructions and lookup tables. Honour the wSOL rule above and the configured CU price, add an
 `Aggregator` variant and a config struct, and push the venue in `DexSuperAggClient::new`.
 
 ## Testing

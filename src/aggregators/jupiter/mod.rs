@@ -2,11 +2,12 @@ use crate::aggregators::{DexAggregator, Quote, QuotePayload};
 use crate::config::{Aggregator, ClientConfig, JupiterConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
-    quote::QuoteRequest,
+    quote::{QuoteRequest, QuoteResponse},
     swap::SwapRequest,
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
 };
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -34,6 +35,29 @@ impl JupiterAggregator {
             signer,
             slippage_bps: config.slippage_bps,
             compute_unit_price_micro_lamports: config.compute_unit_price_micro_lamports,
+        })
+    }
+
+    fn swap_request(&self, quote: &Quote) -> Result<SwapRequest> {
+        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
+            return Err(anyhow!(
+                "Jupiter cannot build a {:?} quote",
+                quote.aggregator
+            ));
+        };
+        Ok(SwapRequest {
+            user_public_key: self.signer.pubkey().to_bytes().into(),
+            quote_response: QuoteResponse::clone(quote_response),
+            config: TransactionConfig {
+                wrap_and_unwrap_sol: false,
+                // CU limit sized to the simulated route instead of the 1.4M default.
+                dynamic_compute_unit_limit: true,
+                compute_unit_price_micro_lamports: (self.compute_unit_price_micro_lamports > 0)
+                    .then_some(ComputeUnitPriceMicroLamports::MicroLamports(
+                        self.compute_unit_price_micro_lamports,
+                    )),
+                ..Default::default()
+            },
         })
     }
 }
@@ -65,36 +89,11 @@ impl DexAggregator for JupiterAggregator {
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
-        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
-            return Err(anyhow!(
-                "Jupiter cannot build a {:?} quote",
-                quote.aggregator
-            ));
-        };
-
         let swap_response = self
             .jupiter_client
-            .swap(
-                &SwapRequest {
-                    user_public_key: self.signer.pubkey().to_bytes().into(),
-                    quote_response: (**quote_response).clone(),
-                    config: TransactionConfig {
-                        wrap_and_unwrap_sol: false,
-                        // CU limit sized to the simulated route instead of the 1.4M default.
-                        dynamic_compute_unit_limit: true,
-                        compute_unit_price_micro_lamports: (self.compute_unit_price_micro_lamports
-                            > 0)
-                        .then_some(ComputeUnitPriceMicroLamports::MicroLamports(
-                            self.compute_unit_price_micro_lamports,
-                        )),
-                        ..Default::default()
-                    },
-                },
-                None,
-            )
+            .swap(&self.swap_request(quote)?, None)
             .await
             .map_err(|e| anyhow!("Jupiter swap failed: {}", e))?;
-
         if let Some(error) = swap_response.simulation_error {
             return Err(anyhow!("Jupiter swap simulation failed: {:?}", error));
         }
@@ -103,5 +102,21 @@ impl DexAggregator for JupiterAggregator {
             .map_err(|e| anyhow!("Failed to deserialize Jupiter transaction: {}", e))?;
         VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
             .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
+    }
+
+    async fn build_instructions(&self, quote: &Quote) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
+        let response = self
+            .jupiter_client
+            .swap_instructions(&self.swap_request(quote)?)
+            .await
+            .map_err(|e| anyhow!("Jupiter swap-instructions failed: {}", e))?;
+        if let Some(error) = response.simulation_error {
+            return Err(anyhow!("Jupiter swap simulation failed: {:?}", error));
+        }
+
+        // No cleanup (unwraps wSOL, not requested) and no "other" instructions (a Jito tip).
+        let mut instructions = response.setup_instructions;
+        instructions.push(response.swap_instruction);
+        Ok((instructions, response.address_lookup_table_addresses))
     }
 }

@@ -6,6 +6,7 @@ use crate::aggregators::{DexAggregator, Quote, QuotePayload};
 use crate::config::{Aggregator, ClientConfig, TitanConfig};
 use anyhow::{anyhow, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::{v0, VersionedMessage};
 use solana_pubkey::Pubkey;
@@ -76,6 +77,22 @@ fn quote_request(
     }
 }
 
+fn unexpired_route(quote: &Quote) -> Result<&SwapRoute> {
+    let QuotePayload::Titan(route) = &quote.payload else {
+        return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
+    };
+    if let Some(expires_at_ms) = route.expires_at_ms {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if now_ms >= expires_at_ms {
+            return Err(anyhow!("Titan route expired before it could be built"));
+        }
+    }
+    Ok(route)
+}
+
 #[async_trait::async_trait]
 impl DexAggregator for TitanAggregator {
     fn kind(&self) -> Aggregator {
@@ -104,25 +121,16 @@ impl DexAggregator for TitanAggregator {
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
-        let QuotePayload::Titan(route) = &quote.payload else {
-            return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
-        };
-
-        if let Some(expires_at_ms) = route.expires_at_ms {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            if now_ms >= expires_at_ms {
-                return Err(anyhow!("Titan route expired before it could be built"));
-            }
-        }
-
+        let route = unexpired_route(quote)?;
         let payer = self.signer.pubkey();
-        let instructions =
-            transaction_builder::route_instructions(route, self.compute_unit_price_micro_lamports);
+        let mut instructions = transaction_builder::compute_budget_instructions(
+            route,
+            self.compute_unit_price_micro_lamports,
+        );
+        instructions.extend(transaction_builder::route_instructions(route));
+        let lookup_table_keys = transaction_builder::lookup_table_keys(route);
         let (lookup_tables, blockhash) = tokio::try_join!(
-            transaction_builder::fetch_lookup_tables(&self.rpc_client, route),
+            transaction_builder::fetch_lookup_tables(&self.rpc_client, &lookup_table_keys),
             async {
                 self.rpc_client
                     .get_latest_blockhash()
@@ -135,6 +143,14 @@ impl DexAggregator for TitanAggregator {
 
         VersionedTransaction::try_new(VersionedMessage::V0(message), &[self.signer.as_ref()])
             .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
+    }
+
+    async fn build_instructions(&self, quote: &Quote) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
+        let route = unexpired_route(quote)?;
+        Ok((
+            transaction_builder::route_instructions(route),
+            transaction_builder::lookup_table_keys(route),
+        ))
     }
 }
 
