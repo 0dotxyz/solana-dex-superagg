@@ -235,7 +235,7 @@ impl DexSuperAggClient {
         let mut requotes = 0;
         loop {
             let quotes = self.collect_quotes(input_mint, output_mint, amount).await?;
-            let best_out = quotes[0].min_out_amount;
+            let best_out = quotes.iter().map(|q| q.min_out_amount).max().unwrap_or(0);
             if best_out >= min_out {
                 return Ok((quotes, amount));
             }

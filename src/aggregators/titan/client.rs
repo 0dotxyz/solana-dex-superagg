@@ -408,6 +408,7 @@ mod tests {
     fn route(out_amount: u64) -> SwapRoute {
         SwapRoute {
             out_amount,
+            slippage_bps: None,
             instructions: vec![Instruction {
                 p: [7; 32],
                 a: vec![],

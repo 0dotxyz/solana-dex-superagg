@@ -104,6 +104,7 @@ mod tests {
     fn route(compute_units: Option<u64>, compute_units_safe: Option<u64>) -> SwapRoute {
         SwapRoute {
             out_amount: 1,
+            slippage_bps: None,
             instructions: vec![types::Instruction {
                 p: [9; 32],
                 a: vec![],

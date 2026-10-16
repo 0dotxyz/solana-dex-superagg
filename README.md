@@ -42,10 +42,12 @@ let swap = client.build_swap_instructions(usdc, wsol, amount, min_out, Some(max_
 
 ## Adding a venue
 
-Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the expected output plus a
-`QuotePayload` variant holding whatever the venue needs to build; `build_transaction` builds and
-signs exactly that quote, `build_instructions` returns its instructions and lookup tables. Honour the wSOL rule above and the configured CU price, add an
-`Aggregator` variant and a config struct, and push the venue in `DexSuperAggClient::new`.
+Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the expected and the
+guaranteed (slippage-adjusted) output plus a `QuotePayload` variant holding whatever the venue
+needs to build; `build_transaction` builds and signs exactly that quote, `build_instructions`
+returns its instructions and lookup tables. Honour the wSOL rule above and the configured CU
+price, add an `Aggregator` variant and a config struct, and push the venue in
+`DexSuperAggClient::new`.
 
 ## Testing
 

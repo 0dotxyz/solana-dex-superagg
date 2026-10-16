@@ -121,7 +121,10 @@ impl DexAggregator for TitanAggregator {
         Ok(Quote {
             aggregator: Aggregator::Titan,
             out_amount: route.out_amount,
-            min_out_amount: min_out_amount(route.out_amount, self.slippage_bps),
+            min_out_amount: min_out_amount(
+                route.out_amount,
+                route.slippage_bps.unwrap_or(self.slippage_bps),
+            ),
             payload: QuotePayload::Titan(Box::new(route)),
         })
     }
