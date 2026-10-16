@@ -9,14 +9,14 @@ and behaviour.
 src/
 ├── lib.rs
 ├── config.rs                       # ClientConfig, venue configs
-├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, send_and_confirm
+├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, swap_instructions, send_and_confirm
 └── aggregators/
-    ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload
-    ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected)
+    ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload, RouteQuote, misfit
+    ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected; maxAccounts + /swap-instructions for routes)
     ├── dflow/mod.rs                # DFlow HTTP API (quote JSON passed back to /swap unchanged)
     └── titan/
-        ├── mod.rs                  # Titan venue: quote params (outputWsol), build
-        ├── client.rs               # WebSocket client: id routing, deadlines, reconnect (+ mock-server tests)
+        ├── mod.rs                  # Titan venue: quote params (outputWsol), build, route instructions
+        ├── client.rs               # WebSocket client: id routing, deadlines, reconnect, route filter (+ mock-server tests)
         ├── types.rs                # MessagePack protocol types (only the fields we use)
         └── transaction_builder.rs  # compute budget + route instructions, lookup tables
 tests/live.rs                       # ignored: build + simulate on real venues
@@ -29,6 +29,8 @@ tests/live.rs                       # ignored: build + simulate on real venues
   `closeInputTokenAccount: false`). Consumers keep SOL as wSOL in their ATA.
 - Venues are peers: same trait, same parallel quote, same build. Which of them a consumer may
   run inside a liquidation transaction is the consumer's concern (configure only those).
+- `swap_instructions` judges routes by guaranteed output (after slippage), never by expected
+  output, and returns the route alone: the caller owns the compute budget and the token accounts.
 
 ## Follow-ups
 

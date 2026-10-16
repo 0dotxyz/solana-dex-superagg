@@ -1,4 +1,5 @@
-use crate::aggregators::{DexAggregator, Quote, QuotePayload};
+use crate::aggregators::{DexAggregator, Quote, QuotePayload, RouteQuote};
+use crate::client::{RouteRequest, SwapInstructions};
 use crate::config::{Aggregator, ClientConfig, DflowConfig};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -8,6 +9,8 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
+
+const TRANSACTIONS_ONLY: &str = "DFlow builds only whole transactions";
 
 pub(crate) struct DflowAggregator {
     http_client: reqwest::Client,
@@ -118,5 +121,21 @@ impl DexAggregator for DflowAggregator {
             .map_err(|e| anyhow!("Failed to deserialize DFlow transaction: {}", e))?;
         VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
             .map_err(|e| anyhow!("Failed to sign DFlow transaction: {}", e))
+    }
+
+    fn builds_instructions(&self) -> bool {
+        false
+    }
+
+    async fn route_quote(&self, _request: &RouteRequest, _amount: u64) -> Result<RouteQuote> {
+        Err(anyhow!(TRANSACTIONS_ONLY))
+    }
+
+    async fn route_instructions(
+        &self,
+        _request: &RouteRequest,
+        _quote: &RouteQuote,
+    ) -> Result<SwapInstructions> {
+        Err(anyhow!(TRANSACTIONS_ONLY))
     }
 }
