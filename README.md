@@ -27,15 +27,17 @@ let swap = client.build_swap_instructions(usdc, wsol, amount, min_out, Some(max_
 - **Routing**: every configured venue is quoted in parallel (`quote_timeout` each); failures,
   including rate limits, are logged and left out, so each extra venue is redundancy for free. The
   best quote is built (`build_timeout`), falling back to the next best if its venue fails to build.
-- **Min-out**: with `min_out > 0`, a short quote raises the input by the shortfall and re-quotes (at
-  most twice), never above `max_in` (default 1.10 × `amount`).
+- **Min-out**: `min_out` is checked against what the route guarantees at the configured slippage,
+  not its expected output. A short quote raises the input by the shortfall and re-quotes (at most
+  twice), never above `max_in` (default 1.10 × `amount`).
 - **Instructions**: `build_swap_instructions` returns the venue's setup (output ATA) and swap
-  instructions without a compute budget or cleanup; the caller compiles, signs and submits.
+  instructions without a compute budget; the caller compiles, signs and submits. The venue does
+  not simulate here, since the input may only arrive earlier in the caller's transaction.
 - **wSOL** is an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist for a
   wSOL input), never wrapped, unwrapped or closed.
 - **Titan**: one WebSocket shared by all callers, opened lazily; replies are routed by request and
   stream id, every request has a deadline, and a dropped or timed-out connection is replaced. Its
-  routes get a compute budget (`computeUnitsSafe` limit plus the configured CU price).
+  transactions get a compute budget (`computeUnitsSafe` limit plus the configured CU price).
 - Amounts are in base units; slippage in basis points.
 
 ## Adding a venue

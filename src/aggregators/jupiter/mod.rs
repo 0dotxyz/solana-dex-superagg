@@ -38,7 +38,10 @@ impl JupiterAggregator {
         })
     }
 
-    fn swap_request(&self, quote: &Quote) -> Result<SwapRequest> {
+    /// `dynamic_compute_unit_limit` makes Jupiter simulate the swap against the wallet's current
+    /// balances, so it is off for instructions, whose input may only arrive earlier in the
+    /// caller's transaction.
+    fn swap_request(&self, quote: &Quote, dynamic_compute_unit_limit: bool) -> Result<SwapRequest> {
         let QuotePayload::Jupiter(quote_response) = &quote.payload else {
             return Err(anyhow!(
                 "Jupiter cannot build a {:?} quote",
@@ -50,8 +53,7 @@ impl JupiterAggregator {
             quote_response: QuoteResponse::clone(quote_response),
             config: TransactionConfig {
                 wrap_and_unwrap_sol: false,
-                // CU limit sized to the simulated route instead of the 1.4M default.
-                dynamic_compute_unit_limit: true,
+                dynamic_compute_unit_limit,
                 compute_unit_price_micro_lamports: (self.compute_unit_price_micro_lamports > 0)
                     .then_some(ComputeUnitPriceMicroLamports::MicroLamports(
                         self.compute_unit_price_micro_lamports,
@@ -84,6 +86,7 @@ impl DexAggregator for JupiterAggregator {
         Ok(Quote {
             aggregator: Aggregator::Jupiter,
             out_amount: quote_response.out_amount,
+            min_out_amount: quote_response.other_amount_threshold,
             payload: QuotePayload::Jupiter(Box::new(quote_response)),
         })
     }
@@ -91,7 +94,8 @@ impl DexAggregator for JupiterAggregator {
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
         let swap_response = self
             .jupiter_client
-            .swap(&self.swap_request(quote)?, None)
+            // CU limit sized to the simulated route instead of the 1.4M default.
+            .swap(&self.swap_request(quote, true)?, None)
             .await
             .map_err(|e| anyhow!("Jupiter swap failed: {}", e))?;
         if let Some(error) = swap_response.simulation_error {
@@ -107,14 +111,17 @@ impl DexAggregator for JupiterAggregator {
     async fn build_instructions(&self, quote: &Quote) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
         let response = self
             .jupiter_client
-            .swap_instructions(&self.swap_request(quote)?)
+            .swap_instructions(&self.swap_request(quote, false)?)
             .await
             .map_err(|e| anyhow!("Jupiter swap-instructions failed: {}", e))?;
-        if let Some(error) = response.simulation_error {
-            return Err(anyhow!("Jupiter swap simulation failed: {:?}", error));
-        }
 
-        // No cleanup (unwraps wSOL, not requested) and no "other" instructions (a Jito tip).
+        // Cleanup unwraps wSOL and "other" is a Jito tip; neither is requested, so either showing
+        // up means the response is not what we embed.
+        if response.cleanup_instruction.is_some() || !response.other_instructions.is_empty() {
+            return Err(anyhow!(
+                "Jupiter returned cleanup/other instructions that are not embedded"
+            ));
+        }
         let mut instructions = response.setup_instructions;
         instructions.push(response.swap_instruction);
         Ok((instructions, response.address_lookup_table_addresses))

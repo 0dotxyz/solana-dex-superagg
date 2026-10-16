@@ -18,8 +18,10 @@ pub(crate) mod titan;
 /// An executable exact-in quote, kept so the same route can be built later.
 pub(crate) struct Quote {
     pub aggregator: Aggregator,
-    /// Expected (not slippage-adjusted) output.
+    /// Expected output.
     pub out_amount: u64,
+    /// Output the route guarantees at the configured slippage; it fails on-chain below this.
+    pub min_out_amount: u64,
     pub payload: QuotePayload,
 }
 

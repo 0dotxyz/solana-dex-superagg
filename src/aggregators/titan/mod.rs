@@ -77,6 +77,11 @@ fn quote_request(
     }
 }
 
+/// Titan's route enforces `out_amount` less the requested slippage.
+fn min_out_amount(out_amount: u64, slippage_bps: u16) -> u64 {
+    out_amount - (out_amount as u128 * slippage_bps as u128 / 10_000) as u64
+}
+
 fn unexpired_route(quote: &Quote) -> Result<&SwapRoute> {
     let QuotePayload::Titan(route) = &quote.payload else {
         return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
@@ -116,6 +121,7 @@ impl DexAggregator for TitanAggregator {
         Ok(Quote {
             aggregator: Aggregator::Titan,
             out_amount: route.out_amount,
+            min_out_amount: min_out_amount(route.out_amount, self.slippage_bps),
             payload: QuotePayload::Titan(Box::new(route)),
         })
     }
@@ -157,6 +163,12 @@ impl DexAggregator for TitanAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_out_is_out_less_slippage() {
+        assert_eq!(min_out_amount(10_000, 50), 9_950);
+        assert_eq!(min_out_amount(u64::MAX, 10_000), 0);
+    }
 
     #[test]
     fn wsol_stays_in_the_ata() {

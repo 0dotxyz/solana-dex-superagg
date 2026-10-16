@@ -36,7 +36,7 @@ const REBROADCAST_EVERY_POLLS: u32 = 4;
 pub struct SwapTransaction {
     pub transaction: VersionedTransaction,
     pub in_amount: u64,
-    /// Expected (not slippage-adjusted) output of the quote it was built from.
+    /// Expected output of the quote it was built from; at least `min_out` is guaranteed.
     pub out_amount: u64,
     pub aggregator: Aggregator,
 }
@@ -50,7 +50,7 @@ pub struct SwapInstructions {
     /// Lookup tables the instructions' accounts come from.
     pub lookup_tables: Vec<Pubkey>,
     pub in_amount: u64,
-    /// Expected (not slippage-adjusted) output of the quote they were built from.
+    /// Expected output of the quote they were built from; at least `min_out` is guaranteed.
     pub out_amount: u64,
     pub aggregator: Aggregator,
 }
@@ -167,8 +167,8 @@ impl DexSuperAggClient {
         Ok(quotes)
     }
 
-    /// Build the best quote yielding at least `min_out` with `build`, falling back to the next
-    /// best if its venue fails to build.
+    /// Build the best quote guaranteeing at least `min_out` with `build`, falling back to the
+    /// next best if its venue fails to build.
     async fn build_best<'q, T>(
         &self,
         quotes: &'q [Quote],
@@ -181,7 +181,10 @@ impl DexSuperAggClient {
             .map(|q| (q.aggregator, q.out_amount))
             .collect();
         let mut failures = Vec::new();
-        for quote in quotes.iter().filter(|quote| quote.out_amount >= min_out) {
+        for quote in quotes
+            .iter()
+            .filter(|quote| quote.min_out_amount >= min_out)
+        {
             let venue = self.venue(quote.aggregator)?;
             let built = match timeout(self.config.build_timeout, build(venue, quote)).await {
                 Ok(built) => built,
@@ -210,10 +213,10 @@ impl DexSuperAggClient {
         )
     }
 
-    /// Quotes whose best yields at least `min_out` (0 for any), and the input they are for. If the
-    /// quote for `amount` falls short, the input is raised by the shortfall and re-quoted (at most
-    /// `MIN_OUT_MAX_REQUOTES` times), never above `max_in_amount` (default:
-    /// `DEFAULT_MAX_INPUT_BUMP` × `amount`).
+    /// Quotes whose best guarantees at least `min_out` (0 for any) at the configured slippage, and
+    /// the input they are for. If the quote for `amount` falls short, the input is raised by the
+    /// shortfall and re-quoted (at most `MIN_OUT_MAX_REQUOTES` times), never above
+    /// `max_in_amount` (default: `DEFAULT_MAX_INPUT_BUMP` × `amount`).
     async fn quotes_for(
         &self,
         input_mint: &Pubkey,
@@ -232,14 +235,14 @@ impl DexSuperAggClient {
         let mut requotes = 0;
         loop {
             let quotes = self.collect_quotes(input_mint, output_mint, amount).await?;
-            let best_out = quotes[0].out_amount;
+            let best_out = quotes[0].min_out_amount;
             if best_out >= min_out {
                 return Ok((quotes, amount));
             }
 
             if requotes == MIN_OUT_MAX_REQUOTES || amount >= max_in {
                 bail!(
-                    "Best quote for {} {} yields {} {}, short of the {} needed; input is capped at {}",
+                    "Best quote for {} {} guarantees {} {}, short of the {} needed; input is capped at {}",
                     amount,
                     input_mint,
                     best_out,
@@ -277,8 +280,8 @@ impl DexSuperAggClient {
             .collect())
     }
 
-    /// Build a signed exact-in swap transaction yielding at least `min_out` (0 for any), raising
-    /// the input up to `max_in_amount` if the quote falls short (see `quotes_for`).
+    /// Build a signed exact-in swap transaction guaranteeing at least `min_out` (0 for any),
+    /// raising the input up to `max_in_amount` if the quote falls short (see `quotes_for`).
     pub async fn build_swap_transaction(
         &self,
         input_mint: Pubkey,

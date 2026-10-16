@@ -55,7 +55,14 @@ impl DflowAggregator {
     }
 
     /// POST the quote to `/swap` or `/swap-instructions`, which take the same body.
-    async fn post_swap(&self, endpoint: &str, quote: &Quote) -> Result<Value> {
+    /// `dynamic_compute_unit_limit` simulates the swap against the wallet's current balances, so
+    /// it is off for instructions, whose input may only arrive earlier in the caller's transaction.
+    async fn post_swap(
+        &self,
+        endpoint: &str,
+        quote: &Quote,
+        dynamic_compute_unit_limit: bool,
+    ) -> Result<Value> {
         let QuotePayload::Dflow(quote_response) = &quote.payload else {
             return Err(anyhow!("DFlow cannot build a {:?} quote", quote.aggregator));
         };
@@ -64,8 +71,7 @@ impl DflowAggregator {
             "userPublicKey": self.signer.pubkey().to_string(),
             "quoteResponse": quote_response,
             "wrapAndUnwrapSol": false,
-            // CU limit sized to the simulated route instead of the default.
-            "dynamicComputeUnitLimit": true,
+            "dynamicComputeUnitLimit": dynamic_compute_unit_limit,
         });
         if self.compute_unit_price_micro_lamports > 0 {
             body["computeUnitPriceMicroLamports"] = json!(self.compute_unit_price_micro_lamports);
@@ -78,6 +84,16 @@ impl DflowAggregator {
         )
         .await
     }
+}
+
+fn parse_u64(value: &Value) -> Option<u64> {
+    value.as_str().and_then(|amount| amount.parse().ok())
+}
+
+fn parse_bool(value: &Value) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow!("DFlow: invalid bool {}", value))
 }
 
 fn parse_pubkey(value: &Value) -> Result<Pubkey> {
@@ -95,8 +111,8 @@ fn parse_instruction(value: &Value) -> Result<Instruction> {
         .map(|meta| {
             Ok(AccountMeta {
                 pubkey: parse_pubkey(&meta["pubkey"])?,
-                is_signer: meta["isSigner"].as_bool().unwrap_or(false),
-                is_writable: meta["isWritable"].as_bool().unwrap_or(false),
+                is_signer: parse_bool(&meta["isSigner"])?,
+                is_writable: parse_bool(&meta["isWritable"])?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -130,21 +146,23 @@ impl DexAggregator for DflowAggregator {
                 "quote",
             )
             .await?;
-        let out_amount = quote["outAmount"]
-            .as_str()
-            .and_then(|amount| amount.parse().ok())
+        let out_amount = parse_u64(&quote["outAmount"])
             .ok_or_else(|| anyhow!("DFlow quote has no valid outAmount: {}", quote))?;
+        let min_out_amount = parse_u64(&quote["otherAmountThreshold"])
+            .ok_or_else(|| anyhow!("DFlow quote has no valid otherAmountThreshold: {}", quote))?;
 
         Ok(Quote {
             aggregator: Aggregator::Dflow,
             out_amount,
+            min_out_amount,
             // Passed back to `/swap` unchanged.
             payload: QuotePayload::Dflow(Box::new(quote)),
         })
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
-        let swap = self.post_swap("swap", quote).await?;
+        // CU limit sized to the simulated route instead of the default.
+        let swap = self.post_swap("swap", quote, true).await?;
         let bytes = swap["swapTransaction"]
             .as_str()
             .and_then(|tx| STANDARD.decode(tx).ok())
@@ -156,9 +174,18 @@ impl DexAggregator for DflowAggregator {
     }
 
     async fn build_instructions(&self, quote: &Quote) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
-        let response = self.post_swap("swap-instructions", quote).await?;
+        let response = self.post_swap("swap-instructions", quote, false).await?;
 
-        // No cleanup (unwraps wSOL, not requested) and no "other" instructions.
+        // Cleanup unwraps wSOL, which is not requested, so it or "other" instructions showing up
+        // means the response is not what we embed.
+        for key in ["cleanupInstructions", "otherInstructions"] {
+            if response[key]
+                .as_array()
+                .is_some_and(|list| !list.is_empty())
+            {
+                return Err(anyhow!("DFlow returned {} that are not embedded", key));
+            }
+        }
         let mut instructions = response["setupInstructions"]
             .as_array()
             .map(|setup| {
