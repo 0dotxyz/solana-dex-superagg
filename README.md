@@ -33,18 +33,60 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
   routes get a compute budget (`computeUnitsSafe` limit plus the configured CU price).
 - Amounts are in base units; slippage in basis points.
 
+## Instructions for your own transaction
+
+`swap_instructions` hands a route out as instructions, for a caller that swaps inside its own
+transaction, such as a marginfi order execution or liquidation:
+
+```rust
+// Routes for `user` paying at least `min_out` once slippage is counted, best first.
+let routes = client
+    .swap_instructions(&RouteRequest {
+        user,
+        input_mint: usdc,
+        output_mint: wsol,
+        amount: estimate,
+        min_out,
+        sizing: Sizing::ToMinOut { max_in },
+        slippage_bps: 50,
+        transaction_accounts,
+        max_accounts: 30,
+        allowed_programs: Some(vec![jupiter_program, titan_program]),
+    })
+    .await?;
+```
+
+- **Guaranteed output**: routes are quoted at the request's `slippage_bps`, not the client's, and
+  ranked and accepted by what they pay once it is counted (Jupiter's `otherAmountThreshold`,
+  Titan's output less its `slippageBps`), not by their expected output.
+- **Sizing**: with `Sizing::ToMinOut`, the input starts at `amount` and is resized after each
+  quote (at most 4), never above `max_in`, toward the least whose best route covers `min_out` by
+  at most `SIZING_TOLERANCE_BPS` (5). With `Sizing::Fixed`, every route swaps exactly `amount`.
+- **Limits**: a route may add at most `max_accounts` accounts beyond the `transaction_accounts` the
+  caller's transaction already references, and its top-level instructions may call only
+  `allowed_programs` (the programs those call in turn are not checked). Jupiter is quoted with
+  `maxAccounts`; any route that breaks a limit is left out.
+- **The route alone**: built for `user`, with no compute budget, and no token account creation,
+  wrapping or closing. The user's token accounts for both mints must exist. The lookup tables are
+  optional; a transaction may list the accounts inline instead.
+- Every route that covers `min_out` is returned, so a caller can fall back to the next. Only Jupiter
+  and Titan build instructions; DFlow builds only whole transactions.
+
 ## Adding a venue
 
 Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the expected output plus a
 `QuotePayload` variant holding whatever the venue needs to build; `build_transaction` builds and
 signs exactly that quote. Honour the wSOL rule above and the configured CU price, add an
-`Aggregator` variant and a config struct, and push the venue in `DexSuperAggClient::new`.
+`Aggregator` variant and a config struct, and push the venue in `DexSuperAggClient::new`. Every
+venue also implements `builds_instructions`, `route_quote` and `route_instructions`; one that builds
+only whole transactions returns `false` and an error from the other two, as DFlow does.
 
 ## Testing
 
 ```sh
 cargo test
-# Builds and simulates a 1 USDC → wSOL swap on each configured venue (nothing is sent):
+# Builds and simulates a 1 USDC → wSOL swap on each configured venue, as a transaction and as
+# sized and fixed instructions (nothing is sent):
 RPC_URL=… WALLET='[1,2,…]' JUP_API_KEY=… TITAN_WS_ENDPOINT=… TITAN_API_KEY=… DFLOW_API_KEY=… \
   cargo test --test live -- --ignored --nocapture
 ```

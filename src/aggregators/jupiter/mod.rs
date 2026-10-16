@@ -1,8 +1,9 @@
-use crate::aggregators::{DexAggregator, Quote, QuotePayload};
+use crate::aggregators::{DexAggregator, Quote, QuotePayload, RouteQuote};
+use crate::client::{RouteRequest, SwapInstructions};
 use crate::config::{Aggregator, ClientConfig, JupiterConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
-    quote::QuoteRequest,
+    quote::{QuoteRequest, QuoteResponse},
     swap::SwapRequest,
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
@@ -36,6 +37,29 @@ impl JupiterAggregator {
             compute_unit_price_micro_lamports: config.compute_unit_price_micro_lamports,
         })
     }
+
+    /// Jupiter's exact-in quote for `amount` at `slippage_bps`, routed through at most
+    /// `max_accounts` accounts when set.
+    async fn quote_response(
+        &self,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount: u64,
+        slippage_bps: u16,
+        max_accounts: Option<usize>,
+    ) -> Result<QuoteResponse> {
+        self.jupiter_client
+            .quote(&QuoteRequest {
+                input_mint: input_mint.to_bytes().into(),
+                output_mint: output_mint.to_bytes().into(),
+                amount,
+                slippage_bps,
+                max_accounts,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))
+    }
 }
 
 #[async_trait::async_trait]
@@ -46,16 +70,8 @@ impl DexAggregator for JupiterAggregator {
 
     async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote> {
         let quote_response = self
-            .jupiter_client
-            .quote(&QuoteRequest {
-                input_mint: input_mint.to_bytes().into(),
-                output_mint: output_mint.to_bytes().into(),
-                amount,
-                slippage_bps: self.slippage_bps,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
+            .quote_response(input_mint, output_mint, amount, self.slippage_bps, None)
+            .await?;
 
         Ok(Quote {
             aggregator: Aggregator::Jupiter,
@@ -103,5 +119,67 @@ impl DexAggregator for JupiterAggregator {
             .map_err(|e| anyhow!("Failed to deserialize Jupiter transaction: {}", e))?;
         VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
             .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
+    }
+
+    fn builds_instructions(&self) -> bool {
+        true
+    }
+
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote> {
+        let quote_response = self
+            .quote_response(
+                &request.input_mint,
+                &request.output_mint,
+                amount,
+                request.slippage_bps,
+                Some(request.max_accounts),
+            )
+            .await?;
+
+        Ok(RouteQuote {
+            in_amount: quote_response.in_amount,
+            min_out_amount: quote_response.other_amount_threshold,
+            quote: Quote {
+                aggregator: Aggregator::Jupiter,
+                out_amount: quote_response.out_amount,
+                payload: QuotePayload::Jupiter(Box::new(quote_response)),
+            },
+        })
+    }
+
+    async fn route_instructions(
+        &self,
+        request: &RouteRequest,
+        quote: &RouteQuote,
+    ) -> Result<SwapInstructions> {
+        let QuotePayload::Jupiter(quote_response) = &quote.quote.payload else {
+            return Err(anyhow!(
+                "Jupiter cannot build a {:?} quote",
+                quote.quote.aggregator
+            ));
+        };
+
+        let response = self
+            .jupiter_client
+            .swap_instructions(&SwapRequest {
+                user_public_key: request.user.to_bytes().into(),
+                quote_response: (**quote_response).clone(),
+                config: TransactionConfig {
+                    wrap_and_unwrap_sol: false,
+                    ..Default::default()
+                },
+            })
+            .await
+            .map_err(|e| anyhow!("Jupiter swap instructions failed: {}", e))?;
+
+        Ok(SwapInstructions {
+            aggregator: Aggregator::Jupiter,
+            in_amount: quote.in_amount,
+            out_amount: quote_response.out_amount,
+            min_out_amount: quote.min_out_amount,
+            instructions: vec![response.swap_instruction],
+            address_lookup_tables: response.address_lookup_table_addresses,
+            compute_units: None,
+        })
     }
 }
