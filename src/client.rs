@@ -11,6 +11,7 @@ use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::future::Future;
 use std::sync::Arc;
@@ -138,6 +139,8 @@ pub struct SwapInstructions {
 pub struct DexSuperAggClient {
     rpc_client: Arc<RpcClient>,
     config: ClientConfig,
+    /// The signer, which whole-transaction swaps are quoted and built for.
+    user: Pubkey,
     /// Configured venues; their order breaks ties in output amount.
     venues: Vec<Box<dyn DexAggregator>>,
 }
@@ -243,6 +246,7 @@ impl DexSuperAggClient {
         Ok(Self {
             rpc_client,
             config,
+            user: signer.pubkey(),
             venues,
         })
     }
@@ -275,17 +279,12 @@ impl DexSuperAggClient {
         successes(results, "Quote failed", "No aggregator returned a quote")
     }
 
-    /// Quotes every venue, sorted by guaranteed output, best first.
-    async fn collect_quotes(
-        &self,
-        input_mint: &Pubkey,
-        output_mint: &Pubkey,
-        amount: u64,
-    ) -> Result<Vec<Quote>> {
-        check_swap(input_mint, output_mint, amount)?;
+    /// Quotes every venue for `request` at `amount`, sorted by guaranteed output, best first.
+    async fn collect_quotes(&self, request: &RouteRequest, amount: u64) -> Result<Vec<Quote>> {
+        check_swap(&request.input_mint, &request.output_mint, amount)?;
         let mut quotes = self
             .quote_each(self.venues.iter().map(|venue| venue.as_ref()), |venue| {
-                venue.quote(input_mint, output_mint, amount)
+                venue.quote(request, amount)
             })
             .await?;
 
@@ -294,21 +293,25 @@ impl DexSuperAggClient {
         Ok(quotes)
     }
 
-    /// Quotes every venue for `request` at `amount`, sorted by guaranteed output, best first.
-    async fn collect_route_quotes(
+    /// A request for the whole-transaction path: the signer swaps at the configured slippage, and
+    /// the route may use any number of accounts (the transaction has lookup tables for them).
+    fn transaction_request(
         &self,
-        request: &RouteRequest,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
         amount: u64,
-    ) -> Result<Vec<Quote>> {
-        check_swap(&request.input_mint, &request.output_mint, amount)?;
-        let mut quotes = self
-            .quote_each(self.venues.iter().map(|venue| venue.as_ref()), |venue| {
-                venue.quote_route(request, amount)
-            })
-            .await?;
-
-        quotes.sort_by(|a, b| b.min_out_amount.cmp(&a.min_out_amount));
-        Ok(quotes)
+    ) -> RouteRequest {
+        RouteRequest {
+            max_accounts: usize::MAX,
+            ..RouteRequest::new(
+                self.user,
+                input_mint,
+                output_mint,
+                amount,
+                0,
+                self.config.slippage_bps,
+            )
+        }
     }
 
     /// Builds the instructions of every quote that guarantees `min_out`, in parallel, keeping the
@@ -408,7 +411,10 @@ impl DexSuperAggClient {
         amount: u64,
     ) -> Result<Vec<VenueQuote>> {
         Ok(self
-            .collect_quotes(&input_mint, &output_mint, amount)
+            .collect_quotes(
+                &self.transaction_request(input_mint, output_mint, amount),
+                amount,
+            )
             .await?
             .into_iter()
             .map(|quote| VenueQuote {
@@ -437,12 +443,11 @@ impl DexSuperAggClient {
             bail!("input {} already exceeds the input cap {}", amount, max_in);
         }
 
+        let request = self.transaction_request(input_mint, output_mint, amount);
         let mut amount = amount;
         let mut requotes = 0;
         loop {
-            let quotes = self
-                .collect_quotes(&input_mint, &output_mint, amount)
-                .await?;
+            let quotes = self.collect_quotes(&request, amount).await?;
             let best_out = quotes.iter().map(|q| q.min_out_amount).max().unwrap_or(0);
             if best_out >= min_out {
                 return self.build_best(&quotes, amount, min_out).await;
@@ -481,7 +486,7 @@ impl DexSuperAggClient {
     ) -> Result<Vec<SwapInstructions>> {
         let (covering, max_in) = match request.sizing {
             Sizing::Fixed => {
-                let quotes = self.collect_route_quotes(request, request.amount).await?;
+                let quotes = self.collect_quotes(request, request.amount).await?;
                 let covers = quotes[0].min_out_amount >= request.min_out;
                 (covers.then_some((request.amount, quotes)), request.amount)
             }
@@ -520,7 +525,7 @@ impl DexSuperAggClient {
         let mut amount = request.amount;
         let mut least_covering: Option<(u64, Vec<Quote>)> = None;
         for _ in 0..SIZING_QUOTES {
-            let quotes = match self.collect_route_quotes(request, amount).await {
+            let quotes = match self.collect_quotes(request, amount).await {
                 Ok(quotes) => quotes,
                 Err(e) if least_covering.is_some() => {
                     tracing::warn!(error = %e, "Sizing quote failed; keeping the covering one");

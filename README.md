@@ -82,7 +82,7 @@ Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the expect
 guaranteed (slippage-adjusted) output plus a `QuotePayload` variant holding whatever the venue
 needs to build; `build_transaction` builds and signs exactly that quote. Honour the wSOL rule
 above and the configured CU price, add an `Aggregator` variant and a config struct, and push the
-venue in `DexSuperAggClient::new`. `quote_route` quotes at the request's slippage and
+venue in `DexSuperAggClient::new`. `quote` quotes at the request's slippage and
 `build_instructions` returns that quote's route; the client assembles the `SwapInstructions`.
 
 ## Testing

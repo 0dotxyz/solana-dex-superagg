@@ -16,7 +16,6 @@ pub(crate) struct DflowAggregator {
     api_url: String,
     api_key: String,
     signer: Arc<Keypair>,
-    slippage_bps: u16,
     compute_unit_price_micro_lamports: u64,
 }
 
@@ -27,7 +26,6 @@ impl DflowAggregator {
             api_url: dflow.api_url.trim_end_matches('/').to_string(),
             api_key: dflow.api_key.clone(),
             signer,
-            slippage_bps: config.slippage_bps,
             compute_unit_price_micro_lamports: config.compute_unit_price_micro_lamports,
         }
     }
@@ -52,41 +50,6 @@ impl DflowAggregator {
             ));
         }
         serde_json::from_str(&body).map_err(|e| anyhow!("DFlow {} response invalid: {}", what, e))
-    }
-
-    /// Quotes `amount` at `slippage_bps`.
-    async fn quote_response(
-        &self,
-        input_mint: &Pubkey,
-        output_mint: &Pubkey,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<Quote> {
-        let quote = self
-            .call(
-                self.http_client
-                    .get(format!("{}/quote", self.api_url))
-                    .query(&[
-                        ("inputMint", input_mint.to_string()),
-                        ("outputMint", output_mint.to_string()),
-                        ("amount", amount.to_string()),
-                        ("slippageBps", slippage_bps.to_string()),
-                    ]),
-                "quote",
-            )
-            .await?;
-        let amount =
-            |key| parse_u64(&quote[key]).map_err(|e| anyhow!("DFlow quote {}: {}", key, e));
-        let out_amount = amount("outAmount")?;
-        let min_out_amount = amount("otherAmountThreshold")?;
-
-        Ok(Quote {
-            aggregator: Aggregator::Dflow,
-            out_amount,
-            min_out_amount,
-            // Passed back to `/swap` unchanged.
-            payload: QuotePayload::Dflow(Box::new(quote)),
-        })
     }
 
     /// Posts the quote to `/swap` or `/swap-instructions` (same body) on behalf of `user`.
@@ -125,9 +88,32 @@ impl DexAggregator for DflowAggregator {
         Aggregator::Dflow
     }
 
-    async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote> {
-        self.quote_response(input_mint, output_mint, amount, self.slippage_bps)
-            .await
+    async fn quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+        let quote = self
+            .call(
+                self.http_client
+                    .get(format!("{}/quote", self.api_url))
+                    .query(&[
+                        ("inputMint", request.input_mint.to_string()),
+                        ("outputMint", request.output_mint.to_string()),
+                        ("amount", amount.to_string()),
+                        ("slippageBps", request.slippage_bps.to_string()),
+                    ]),
+                "quote",
+            )
+            .await?;
+        let amount =
+            |key| parse_u64(&quote[key]).map_err(|e| anyhow!("DFlow quote {}: {}", key, e));
+        let out_amount = amount("outAmount")?;
+        let min_out_amount = amount("otherAmountThreshold")?;
+
+        Ok(Quote {
+            aggregator: Aggregator::Dflow,
+            out_amount,
+            min_out_amount,
+            // Passed back to `/swap` unchanged.
+            payload: QuotePayload::Dflow(Box::new(quote)),
+        })
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
@@ -143,16 +129,6 @@ impl DexAggregator for DflowAggregator {
             .map_err(|e| anyhow!("Failed to deserialize DFlow transaction: {}", e))?;
         VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
             .map_err(|e| anyhow!("Failed to sign DFlow transaction: {}", e))
-    }
-
-    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
-        self.quote_response(
-            &request.input_mint,
-            &request.output_mint,
-            amount,
-            request.slippage_bps,
-        )
-        .await
     }
 
     async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
@@ -181,7 +157,7 @@ impl DexAggregator for DflowAggregator {
             .transpose()?
             .unwrap_or_default();
         instructions.push(parse_instruction(&response["swapInstruction"])?);
-        let lookup_tables = response["addressLookupTableAddresses"]
+        let address_lookup_tables = response["addressLookupTableAddresses"]
             .as_array()
             .map(|keys| keys.iter().map(parse_pubkey).collect::<Result<Vec<_>>>())
             .transpose()?
@@ -189,7 +165,7 @@ impl DexAggregator for DflowAggregator {
 
         Ok(Route {
             instructions,
-            address_lookup_tables: lookup_tables,
+            address_lookup_tables,
         })
     }
 }

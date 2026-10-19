@@ -3,13 +3,12 @@ use crate::client::RouteRequest;
 use crate::config::{Aggregator, ClientConfig, JupiterConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
-    quote::{QuoteRequest, QuoteResponse},
+    quote::QuoteRequest,
     swap::SwapRequest,
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
 };
 use solana_keypair::Keypair;
-use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
@@ -17,7 +16,6 @@ use std::sync::Arc;
 pub(crate) struct JupiterAggregator {
     jupiter_client: JupiterSwapApiClient,
     signer: Arc<Keypair>,
-    slippage_bps: u16,
     compute_unit_price_micro_lamports: u64,
 }
 
@@ -33,32 +31,8 @@ impl JupiterAggregator {
                 jupiter.api_key.clone(),
             )?,
             signer,
-            slippage_bps: config.slippage_bps,
             compute_unit_price_micro_lamports: config.compute_unit_price_micro_lamports,
         })
-    }
-
-    /// Quotes `amount` at `slippage_bps`. `max_accounts` limits how many accounts the whole route
-    /// may use.
-    async fn quote_response(
-        &self,
-        input_mint: &Pubkey,
-        output_mint: &Pubkey,
-        amount: u64,
-        slippage_bps: u16,
-        max_accounts: Option<usize>,
-    ) -> Result<QuoteResponse> {
-        self.jupiter_client
-            .quote(&QuoteRequest {
-                input_mint: input_mint.to_bytes().into(),
-                output_mint: output_mint.to_bytes().into(),
-                amount,
-                slippage_bps,
-                max_accounts,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))
     }
 }
 
@@ -66,19 +40,6 @@ impl JupiterAggregator {
 impl DexAggregator for JupiterAggregator {
     fn kind(&self) -> Aggregator {
         Aggregator::Jupiter
-    }
-
-    async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote> {
-        let quote_response = self
-            .quote_response(input_mint, output_mint, amount, self.slippage_bps, None)
-            .await?;
-
-        Ok(Quote {
-            aggregator: Aggregator::Jupiter,
-            out_amount: quote_response.out_amount,
-            min_out_amount: quote_response.other_amount_threshold,
-            payload: QuotePayload::Jupiter(Box::new(quote_response)),
-        })
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
@@ -116,18 +77,26 @@ impl DexAggregator for JupiterAggregator {
             .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
     }
 
-    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+    async fn quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
         let quote_response = self
-            .quote_response(
-                &request.input_mint,
-                &request.output_mint,
+            .jupiter_client
+            .quote(&QuoteRequest {
+                input_mint: request.input_mint.to_bytes().into(),
+                output_mint: request.output_mint.to_bytes().into(),
                 amount,
-                request.slippage_bps,
+                slippage_bps: request.slippage_bps,
                 // Jupiter's limit counts every account of the route, including those the
                 // transaction already has, and allows at most 64.
-                Some((request.max_accounts + request.transaction_accounts.len()).min(64)),
-            )
-            .await?;
+                max_accounts: Some(
+                    request
+                        .max_accounts
+                        .saturating_add(request.transaction_accounts.len())
+                        .min(64),
+                ),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
 
         Ok(Quote {
             aggregator: Aggregator::Jupiter,

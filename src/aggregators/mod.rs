@@ -76,17 +76,15 @@ pub(crate) struct Route {
 pub(crate) trait DexAggregator: Send + Sync {
     fn kind(&self) -> Aggregator;
 
-    /// Quote swapping `amount` of `input_mint` into `output_mint` at the configured slippage.
-    async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote>;
+    /// Quote swapping `amount` for `request`, at the request's slippage. A venue that can apply
+    /// the request's limits while quoting does so here; the client checks them again after
+    /// building.
+    async fn quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote>;
 
-    /// Build and sign a transaction for a quote this venue returned from `quote`.
+    /// Build and sign a transaction for a quote this venue returned.
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction>;
 
-    /// Quote swapping `amount` for `request` at the request's slippage. A venue that can apply the
-    /// request's limits while quoting does so here; the client checks them again after building.
-    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote>;
-
-    /// Build the instructions for a quote this venue returned from `quote_route`.
+    /// Build the instructions for a quote this venue returned.
     async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route>;
 }
 

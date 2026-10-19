@@ -333,17 +333,9 @@ impl TitanClient {
         }
     }
 
-    /// The best route (and its provider) from the first quote-stream update that has one. Routes
-    /// without instructions (prebuilt transaction only) are skipped: we add the compute budget.
-    pub async fn request_swap_quotes(
-        &self,
-        request: SwapQuoteRequest,
-    ) -> Result<(String, SwapRoute), String> {
-        self.request_swap_routes(request, &|_| Ok(())).await
-    }
-
-    /// Like `request_swap_quotes`, but only routes that `eligible` accepts count. Fails with the
-    /// reasons when an update has executable routes and none of them is eligible.
+    /// The best route (and its provider) from the first quote-stream update that has routes
+    /// with instructions, among those `eligible` accepts. Fails with the reasons when such an
+    /// update has routes and none of them is eligible.
     pub async fn request_swap_routes(
         &self,
         request: SwapQuoteRequest,
@@ -510,6 +502,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     // Agree to the subprotocol like Titan does, or the client rejects the handshake.
+                    #[allow(clippy::result_large_err)]
                     let mut ws = accept_hdr_async(tcp, |_req: &Request, mut resp: Response| {
                         resp.headers_mut().insert(
                             "Sec-WebSocket-Protocol",
@@ -591,8 +584,8 @@ mod tests {
 
         for round in 0..20u64 {
             let (a, b) = tokio::join!(
-                client.request_swap_quotes(quote_request(1_000 + round)),
-                client.request_swap_quotes(quote_request(5_000 + round)),
+                client.request_swap_routes(quote_request(1_000 + round), &|_| Ok(())),
+                client.request_swap_routes(quote_request(5_000 + round), &|_| Ok(())),
             );
             assert_eq!(a.unwrap().1.out_amount, (1_000 + round) * 2);
             assert_eq!(b.unwrap().1.out_amount, (5_000 + round) * 2);
@@ -606,14 +599,16 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = client
-            .request_swap_quotes(quote_request(1))
+            .request_swap_routes(quote_request(1), &|_| Ok(()))
             .await
             .unwrap_err();
         assert!(error.contains("timed out"), "{}", error);
         assert!(started.elapsed() < Duration::from_secs(2));
 
         // The timed-out connection is retired: the next request opens a fresh one.
-        let _ = client.request_swap_quotes(quote_request(1)).await;
+        let _ = client
+            .request_swap_routes(quote_request(1), &|_| Ok(()))
+            .await;
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
 
@@ -663,7 +658,7 @@ mod tests {
 
         for amount in [10, 20, 30] {
             let (_, route) = client
-                .request_swap_quotes(quote_request(amount))
+                .request_swap_routes(quote_request(amount), &|_| Ok(()))
                 .await
                 .unwrap();
             assert_eq!(route.out_amount, amount * 2);

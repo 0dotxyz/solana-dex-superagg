@@ -24,7 +24,6 @@ pub(crate) struct TitanAggregator {
     /// For blockhashes and lookup tables
     rpc_client: Arc<RpcClient>,
     signer: Arc<Keypair>,
-    slippage_bps: u16,
     compute_unit_price_micro_lamports: u64,
 }
 
@@ -43,21 +42,19 @@ impl TitanAggregator {
             ),
             rpc_client,
             signer,
-            slippage_bps: config.slippage_bps,
             compute_unit_price_micro_lamports: config.compute_unit_price_micro_lamports,
         }
     }
 }
 
-/// A quote request for `user`. The output token account is created only for whole transactions;
-/// a route handed out as instructions assumes it exists.
+/// A quote request for `user`. Titan creates the output token account itself (idempotently, by
+/// CPI), so a route works whether or not it exists.
 fn quote_request(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
     amount: u64,
     slippage_bps: u16,
     user: &Pubkey,
-    create_output_token_account: bool,
 ) -> SwapQuoteRequest {
     SwapQuoteRequest {
         swap: SwapParams {
@@ -70,7 +67,7 @@ fn quote_request(
         transaction: TransactionParams {
             user_public_key: user.to_bytes(),
             close_input_token_account: Some(false),
-            create_output_token_account: Some(create_output_token_account),
+            create_output_token_account: Some(true),
             output_wsol: Some(true),
         },
         update: Some(QuoteUpdateParams {
@@ -105,32 +102,6 @@ impl DexAggregator for TitanAggregator {
         Aggregator::Titan
     }
 
-    async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote> {
-        let (provider, route) = self
-            .titan_client
-            .request_swap_quotes(quote_request(
-                input_mint,
-                output_mint,
-                amount,
-                self.slippage_bps,
-                &self.signer.pubkey(),
-                true,
-            ))
-            .await
-            .map_err(|e| anyhow!("Titan quote failed: {}", e))?;
-        tracing::debug!(provider = %provider, out_amount = route.out_amount, "Titan quote");
-
-        Ok(Quote {
-            aggregator: Aggregator::Titan,
-            out_amount: route.out_amount,
-            min_out_amount: min_out(
-                route.out_amount,
-                route.slippage_bps.unwrap_or(self.slippage_bps),
-            ),
-            payload: QuotePayload::Titan(Box::new(route)),
-        })
-    }
-
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
         let route = quote.titan()?;
         ensure_unexpired(route)?;
@@ -156,7 +127,7 @@ impl DexAggregator for TitanAggregator {
             .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
     }
 
-    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+    async fn quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
         let eligible = |route: &SwapRoute| {
             let instructions = transaction_builder::solana_instructions(route).collect::<Vec<_>>();
             misfit(&instructions, request).map_or(Ok(()), Err)
@@ -170,13 +141,12 @@ impl DexAggregator for TitanAggregator {
                     amount,
                     request.slippage_bps,
                     &request.user,
-                    false,
                 ),
                 &eligible,
             )
             .await
             .map_err(|e| anyhow!("Titan quote failed: {}", e))?;
-        tracing::debug!(provider = %provider, out_amount = route.out_amount, "Titan route quote");
+        tracing::debug!(provider = %provider, out_amount = route.out_amount, "Titan quote");
 
         Ok(Quote {
             aggregator: Aggregator::Titan,
@@ -207,20 +177,9 @@ mod tests {
     #[test]
     fn wsol_stays_in_the_ata() {
         let mint = Pubkey::new_unique();
-        let params = quote_request(&mint, &mint, 1, 50, &mint, true).transaction;
+        let params = quote_request(&mint, &mint, 1, 50, &mint).transaction;
         assert_eq!(params.output_wsol, Some(true));
         assert_eq!(params.close_input_token_account, Some(false));
-    }
-
-    #[test]
-    fn only_a_transaction_route_creates_the_output_account() {
-        let mint = Pubkey::new_unique();
-        let created = |create| {
-            quote_request(&mint, &mint, 1, 50, &mint, create)
-                .transaction
-                .create_output_token_account
-        };
-        assert_eq!((created(true), created(false)), (Some(true), Some(false)));
     }
 
     #[test]
