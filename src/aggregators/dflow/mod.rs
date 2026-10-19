@@ -102,14 +102,11 @@ impl DexAggregator for DflowAggregator {
                 "quote",
             )
             .await?;
-        let amount =
-            |key| parse_u64(&quote[key]).map_err(|e| anyhow!("DFlow quote {}: {}", key, e));
-        let out_amount = amount("outAmount")?;
-        let min_out_amount = amount("otherAmountThreshold")?;
+        let min_out_amount = parse_u64(&quote["otherAmountThreshold"])
+            .map_err(|e| anyhow!("DFlow quote otherAmountThreshold: {}", e))?;
 
         Ok(Quote {
             aggregator: Aggregator::Dflow,
-            out_amount,
             min_out_amount,
             // Passed back to `/swap` unchanged.
             payload: QuotePayload::Dflow(Box::new(quote)),

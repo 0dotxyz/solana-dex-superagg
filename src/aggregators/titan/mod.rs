@@ -134,7 +134,7 @@ impl DexAggregator for TitanAggregator {
         };
         let (provider, route) = self
             .titan_client
-            .request_swap_routes(
+            .request_best_route(
                 quote_request(
                     &request.input_mint,
                     &request.output_mint,
@@ -150,7 +150,6 @@ impl DexAggregator for TitanAggregator {
 
         Ok(Quote {
             aggregator: Aggregator::Titan,
-            out_amount: route.out_amount,
             min_out_amount: min_out(
                 route.out_amount,
                 route.slippage_bps.unwrap_or(request.slippage_bps),

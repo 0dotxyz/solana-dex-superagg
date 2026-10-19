@@ -183,12 +183,12 @@ async fn builds_a_simulatable_swap_on_every_venue() {
             continue;
         };
         let swap = client
-            .build_swap_transaction(USDC, WSOL, 1_000_000, 0, None)
+            .build_swap_transaction(USDC, WSOL, 1_000_000, 0)
             .await
             .unwrap_or_else(|e| panic!("{:?}: {}", aggregator, e));
         println!(
-            "{:?}: 1 USDC -> {} lamports of wSOL",
-            aggregator, swap.out_amount
+            "{:?}: 1 USDC -> at least {} lamports of wSOL",
+            aggregator, swap.min_out_amount
         );
         assert_simulates(&rpc, aggregator, &swap.transaction).await;
     }

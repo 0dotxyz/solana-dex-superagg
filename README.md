@@ -16,8 +16,8 @@ let client = DexSuperAggClient::new(
     keypair,
 )?;
 
-// Buy at least `min_out`, spending `amount` and, if the quote falls short, at most `max_in`.
-let swap = client.build_swap_transaction(usdc, wsol, amount, min_out, Some(max_in)).await?;
+// Sell `amount`, guaranteed to receive at least `min_out`.
+let swap = client.build_swap_transaction(usdc, wsol, amount, min_out).await?;
 client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
 ```
 
@@ -26,8 +26,7 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
   quote with the most guaranteed output is built (`build_timeout`), falling back to the next if
   its venue fails to build.
 - **Min-out**: `min_out` is checked against what the route guarantees at the configured slippage,
-  not its expected output. A short quote raises the input by the shortfall and re-quotes (at most
-  twice), never above `max_in` (default 1.10 × `amount`).
+  not its expected output.
 - **wSOL** is an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist for a
   wSOL input), never wrapped, unwrapped or closed.
 - **Titan**: one WebSocket shared by all callers, opened lazily; replies are routed by request and
@@ -78,9 +77,9 @@ let routes = client
 
 ## Adding a venue
 
-Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the expected and the
-guaranteed (slippage-adjusted) output plus a `QuotePayload` variant holding whatever the venue
-needs to build; `build_transaction` builds and signs exactly that quote. Honour the wSOL rule
+Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the guaranteed
+(slippage-adjusted) output plus a `QuotePayload` variant holding whatever the venue needs to
+build; `build_transaction` builds and signs exactly that quote. Honour the wSOL rule
 above and the configured CU price, add an `Aggregator` variant and a config struct, and push the
 venue in `DexSuperAggClient::new`. `quote` quotes at the request's slippage and
 `build_instructions` returns that quote's route; the client assembles the `SwapInstructions`.

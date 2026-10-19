@@ -18,16 +18,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
-/// How far a min-out swap may raise its input above the initial amount when the caller passes no
-/// `max_in_amount`.
-const DEFAULT_MAX_INPUT_BUMP: f64 = 1.10;
-
-/// Margin on top of the observed shortfall ratio when raising a min-out swap's input.
-const MIN_OUT_BUMP_MARGIN: f64 = 1.02;
-
-/// Re-quotes a min-out swap may make after its first quote falls short.
-const MIN_OUT_MAX_REQUOTES: usize = 2;
-
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Rebroadcast the pending transaction every this many polls.
@@ -36,15 +26,14 @@ const REBROADCAST_EVERY_POLLS: u32 = 4;
 /// Maximum quotes `build_swap_instructions` takes while sizing the input.
 const SIZING_QUOTES: usize = 4;
 
-/// Sizing stops once the guaranteed output exceeds `min_out` by at most this much.
+/// Sizing stops once the guaranteed output covers `min_out` without overshooting it by more than
+/// this much.
 pub const SIZING_TOLERANCE_BPS: u64 = 5;
 
 /// One venue's quote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VenueQuote {
     pub aggregator: Aggregator,
-    /// Output the venue expects.
-    pub out_amount: u64,
     /// Output the venue guarantees after slippage.
     pub min_out_amount: u64,
 }
@@ -54,8 +43,8 @@ pub struct VenueQuote {
 pub struct SwapTransaction {
     pub transaction: VersionedTransaction,
     pub in_amount: u64,
-    /// Output the venue expects. The guaranteed output is at least the requested `min_out`.
-    pub out_amount: u64,
+    /// Output the venue guarantees after slippage; at least the requested `min_out`.
+    pub min_out_amount: u64,
     pub aggregator: Aggregator,
 }
 
@@ -123,8 +112,6 @@ pub enum Sizing {
 pub struct SwapInstructions {
     pub aggregator: Aggregator,
     pub in_amount: u64,
-    /// Output the venue expects.
-    pub out_amount: u64,
     /// Output the venue guarantees after slippage. The route fails on-chain below it.
     pub min_out_amount: u64,
     /// The swap instructions, plus any token accounts the route creates for itself (ATA program).
@@ -143,14 +130,6 @@ pub struct DexSuperAggClient {
     user: Pubkey,
     /// Configured venues; their order breaks ties in output amount.
     venues: Vec<Box<dyn DexAggregator>>,
-}
-
-/// Input for the next min-out re-quote: scale by the observed shortfall (plus a margin), always
-/// make progress, and never exceed `max_in`.
-fn bumped_input(amount: u64, quoted_out: u64, min_out: u64, max_in: u64) -> u64 {
-    let ratio = min_out as f64 / quoted_out.max(1) as f64 * MIN_OUT_BUMP_MARGIN;
-    let bumped = (amount as f64 * ratio).ceil() as u64; // saturates on overflow
-    bumped.max(amount.saturating_add(1)).min(max_in)
 }
 
 /// The next input to try: `amount` scaled by `target / got`, where `got` is what `amount`
@@ -339,7 +318,6 @@ impl DexSuperAggClient {
                         Ok(SwapInstructions {
                             aggregator: quote.aggregator,
                             in_amount: amount,
-                            out_amount: quote.out_amount,
                             min_out_amount: quote.min_out_amount,
                             instructions: route.instructions,
                             address_lookup_tables: route.address_lookup_tables,
@@ -380,14 +358,14 @@ impl DexSuperAggClient {
                     tracing::info!(
                         aggregator = ?quote.aggregator,
                         in_amount = amount,
-                        out_amount = quote.out_amount,
+                        min_out_amount = quote.min_out_amount,
                         quotes = ?summary,
                         "Selected aggregator"
                     );
                     return Ok(SwapTransaction {
                         transaction,
                         in_amount: amount,
-                        out_amount: quote.out_amount,
+                        min_out_amount: quote.min_out_amount,
                         aggregator: quote.aggregator,
                     });
                 }
@@ -419,63 +397,34 @@ impl DexSuperAggClient {
             .into_iter()
             .map(|quote| VenueQuote {
                 aggregator: quote.aggregator,
-                out_amount: quote.out_amount,
                 min_out_amount: quote.min_out_amount,
             })
             .collect())
     }
 
     /// Builds a signed swap of `amount` that guarantees at least `min_out` after slippage (0 for
-    /// no minimum). If the quote falls short, the input is raised and re-quoted, at most
-    /// `MIN_OUT_MAX_REQUOTES` times and never above `max_in_amount` (default:
-    /// `DEFAULT_MAX_INPUT_BUMP` × `amount`).
+    /// no minimum).
     pub async fn build_swap_transaction(
         &self,
         input_mint: Pubkey,
         output_mint: Pubkey,
         amount: u64,
         min_out: u64,
-        max_in_amount: Option<u64>,
     ) -> Result<SwapTransaction> {
-        let max_in =
-            max_in_amount.unwrap_or_else(|| (amount as f64 * DEFAULT_MAX_INPUT_BUMP).ceil() as u64);
-        if amount > max_in {
-            bail!("input {} already exceeds the input cap {}", amount, max_in);
-        }
-
         let request = self.transaction_request(input_mint, output_mint, amount);
-        let mut amount = amount;
-        let mut requotes = 0;
-        loop {
-            let quotes = self.collect_quotes(&request, amount).await?;
-            let best_out = quotes.iter().map(|q| q.min_out_amount).max().unwrap_or(0);
-            if best_out >= min_out {
-                return self.build_best(&quotes, amount, min_out).await;
-            }
-
-            if requotes == MIN_OUT_MAX_REQUOTES || amount >= max_in {
-                bail!(
-                    "Best quote for {} {} guarantees {} {}, short of the {} needed; input is capped at {}",
-                    amount,
-                    input_mint,
-                    best_out,
-                    output_mint,
-                    min_out,
-                    max_in
-                );
-            }
-            let next = bumped_input(amount, best_out, min_out, max_in);
-            tracing::debug!(
-                from = amount,
-                to = next,
+        let quotes = self.collect_quotes(&request, amount).await?;
+        let best_out = quotes[0].min_out_amount;
+        if best_out < min_out {
+            bail!(
+                "Best quote for {} {} guarantees {} {}, short of the {} needed",
+                amount,
+                input_mint,
                 best_out,
-                min_out,
-                max_in,
-                "Raising input"
+                output_mint,
+                min_out
             );
-            amount = next;
-            requotes += 1;
         }
+        self.build_best(&quotes, amount, min_out).await
     }
 
     /// Routes for `request` as instructions, every one guaranteeing at least `request.min_out`,
@@ -649,30 +598,6 @@ impl DexSuperAggClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bump_scales_by_shortfall_with_margin() {
-        // Quote delivered 80 of the 100 needed: raise by 100/80 * 1.02.
-        assert_eq!(bumped_input(1_000, 80, 100, 10_000), 1_275);
-    }
-
-    #[test]
-    fn bump_never_exceeds_the_cap() {
-        // A 1.6x market premium wants ~1.63x the input; the cap holds it.
-        assert_eq!(bumped_input(1_000, 625, 1_000, 1_100), 1_100);
-        // A quote of zero would otherwise ask for an absurd input.
-        assert_eq!(bumped_input(1_000, 0, 1_000, 1_100), 1_100);
-    }
-
-    #[test]
-    fn bump_always_makes_progress() {
-        // Already within rounding of min_out: still moves up by at least one unit.
-        assert_eq!(
-            bumped_input(1_000_000, 999_999, 1_000_000, u64::MAX),
-            1_020_002
-        );
-        assert_eq!(bumped_input(10, 10, 10, u64::MAX), 11);
-    }
 
     #[test]
     fn sizing_aims_at_half_the_tolerance_above_min_out() {

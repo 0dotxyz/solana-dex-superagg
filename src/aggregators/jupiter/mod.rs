@@ -100,7 +100,6 @@ impl DexAggregator for JupiterAggregator {
 
         Ok(Quote {
             aggregator: Aggregator::Jupiter,
-            out_amount: quote_response.out_amount,
             min_out_amount: quote_response.other_amount_threshold,
             payload: QuotePayload::Jupiter(Box::new(quote_response)),
         })

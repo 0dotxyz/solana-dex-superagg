@@ -336,7 +336,7 @@ impl TitanClient {
     /// The best route (and its provider) from the first quote-stream update that has routes
     /// with instructions, among those `eligible` accepts. Fails with the reasons when such an
     /// update has routes and none of them is eligible.
-    pub async fn request_swap_routes(
+    pub async fn request_best_route(
         &self,
         request: SwapQuoteRequest,
         eligible: &(dyn Fn(&SwapRoute) -> Result<(), String> + Send + Sync),
@@ -582,8 +582,8 @@ mod tests {
 
         for round in 0..20u64 {
             let (a, b) = tokio::join!(
-                client.request_swap_routes(quote_request(1_000 + round), &|_| Ok(())),
-                client.request_swap_routes(quote_request(5_000 + round), &|_| Ok(())),
+                client.request_best_route(quote_request(1_000 + round), &|_| Ok(())),
+                client.request_best_route(quote_request(5_000 + round), &|_| Ok(())),
             );
             assert_eq!(a.unwrap().1.out_amount, (1_000 + round) * 2);
             assert_eq!(b.unwrap().1.out_amount, (5_000 + round) * 2);
@@ -597,7 +597,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = client
-            .request_swap_routes(quote_request(1), &|_| Ok(()))
+            .request_best_route(quote_request(1), &|_| Ok(()))
             .await
             .unwrap_err();
         assert!(error.contains("timed out"), "{}", error);
@@ -605,7 +605,7 @@ mod tests {
 
         // The timed-out connection is retired: the next request opens a fresh one.
         let _ = client
-            .request_swap_routes(quote_request(1), &|_| Ok(()))
+            .request_best_route(quote_request(1), &|_| Ok(()))
             .await;
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
@@ -647,7 +647,7 @@ mod tests {
 
         for amount in [10, 20, 30] {
             let (_, route) = client
-                .request_swap_routes(quote_request(amount), &|_| Ok(()))
+                .request_best_route(quote_request(amount), &|_| Ok(()))
                 .await
                 .unwrap();
             assert_eq!(route.out_amount, amount * 2);

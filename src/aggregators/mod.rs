@@ -20,8 +20,6 @@ pub(crate) mod titan;
 /// A quote from one venue, with whatever that venue needs to build the same route later.
 pub(crate) struct Quote {
     pub aggregator: Aggregator,
-    /// Output the venue expects.
-    pub out_amount: u64,
     /// Output the venue guarantees after slippage. The route fails on-chain below it.
     pub min_out_amount: u64,
     pub payload: QuotePayload,
