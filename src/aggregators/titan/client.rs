@@ -361,10 +361,16 @@ impl TitanClient {
                 match stream_rx.recv().await {
                     Some(StreamEvent::Data(data)) => {
                         let StreamDataPayload::SwapQuotes(quotes) = data.payload;
-                        if let Some(best) = best_route(quotes.quotes, eligible) {
-                            return best;
+                        let routes: Vec<_> = quotes
+                            .quotes
+                            .into_iter()
+                            .filter(|(_, route)| !route.instructions.is_empty())
+                            .collect();
+                        if routes.is_empty() {
+                            // Nothing we can use in this update; wait for the next one.
+                            continue;
                         }
-                        // No executable route in this update yet; wait for the next one.
+                        return best_route(routes, eligible);
                     }
                     Some(StreamEvent::End(end)) => {
                         return Err(match end.error_message {
@@ -395,20 +401,15 @@ impl TitanClient {
     }
 }
 
-/// The eligible route with the most output. `None` when no route has instructions yet (prebuilt
-/// transactions only); `Some(Err)` with the reasons when routes exist but none is eligible.
+/// The route with the most output among those `eligible` accepts. Fails with every rejection
+/// reason when it accepts none.
 fn best_route(
-    quotes: HashMap<String, SwapRoute>,
+    routes: Vec<(String, SwapRoute)>,
     eligible: &(dyn Fn(&SwapRoute) -> Result<(), String> + Send + Sync),
-) -> Option<Result<(String, SwapRoute), String>> {
-    let mut executable = false;
+) -> Result<(String, SwapRoute), String> {
     let mut best: Option<(String, SwapRoute)> = None;
     let mut misfits = Vec::new();
-    for (provider, route) in quotes {
-        if route.instructions.is_empty() {
-            continue;
-        }
-        executable = true;
+    for (provider, route) in routes {
         match eligible(&route) {
             Ok(()) => {
                 if best
@@ -421,13 +422,10 @@ fn best_route(
             Err(reason) => misfits.push(format!("{}: {}", provider, reason)),
         }
     }
-    if !executable {
-        return None;
-    }
-    Some(best.ok_or_else(|| {
+    best.ok_or_else(|| {
         misfits.sort();
         format!("No route fits ({})", misfits.join("; "))
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -612,7 +610,7 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
 
-    fn routes(out_amounts: &[(&str, u64)]) -> HashMap<String, SwapRoute> {
+    fn routes(out_amounts: &[(&str, u64)]) -> Vec<(String, SwapRoute)> {
         out_amounts
             .iter()
             .map(|(provider, out_amount)| (provider.to_string(), route(*out_amount)))
@@ -625,9 +623,8 @@ mod tests {
             300 => Err("calls program X".to_string()),
             _ => Ok(()),
         };
-        let (provider, best) = best_route(routes(&[("a", 100), ("b", 300), ("c", 200)]), &eligible)
-            .unwrap()
-            .unwrap();
+        let (provider, best) =
+            best_route(routes(&[("a", 100), ("b", 300), ("c", 200)]), &eligible).unwrap();
         assert_eq!((provider.as_str(), best.out_amount), ("c", 200));
     }
 
@@ -636,19 +633,11 @@ mod tests {
         let error = best_route(routes(&[("a", 100), ("b", 300)]), &|_| {
             Err("adds 70 accounts".to_string())
         })
-        .unwrap()
         .unwrap_err();
         assert_eq!(
             error,
             "No route fits (a: adds 70 accounts; b: adds 70 accounts)"
         );
-    }
-
-    #[test]
-    fn an_update_of_prebuilt_transactions_only_waits_for_the_next() {
-        let mut prebuilt = routes(&[("a", 100)]);
-        prebuilt.get_mut("a").unwrap().instructions.clear();
-        assert!(best_route(prebuilt, &|_| Ok(())).is_none());
     }
 
     #[tokio::test]

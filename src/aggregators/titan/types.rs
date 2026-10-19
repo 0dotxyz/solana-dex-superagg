@@ -146,7 +146,8 @@ pub struct SwapRoute {
     pub out_amount: u64,
     /// Slippage the route was quoted at.
     pub slippage_bps: Option<u16>,
-    /// Empty for providers that only hand out a prebuilt transaction.
+    /// A provider returns its route either as instructions or only as a ready-built transaction;
+    /// in the latter case this is empty and the route is unusable for us.
     pub instructions: Vec<Instruction>,
     pub address_lookup_tables: Vec<Pubkey>,
     pub expires_at_ms: Option<u64>,
