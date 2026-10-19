@@ -6,7 +6,7 @@
 
 use crate::client::RouteRequest;
 use crate::config::Aggregator;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -33,6 +33,34 @@ pub(crate) enum QuotePayload {
     Titan(Box<titan::SwapRoute>),
     /// DFlow's quote JSON, sent back to its swap endpoints as is.
     Dflow(Box<serde_json::Value>),
+}
+
+/// Each venue's payload, or an error when the quote came from another venue.
+impl Quote {
+    pub fn jupiter(&self) -> Result<&jupiter_swap_api_client::quote::QuoteResponse> {
+        match &self.payload {
+            QuotePayload::Jupiter(quote) => Ok(quote),
+            _ => Err(self.not_from(Aggregator::Jupiter)),
+        }
+    }
+
+    pub fn titan(&self) -> Result<&titan::SwapRoute> {
+        match &self.payload {
+            QuotePayload::Titan(route) => Ok(route),
+            _ => Err(self.not_from(Aggregator::Titan)),
+        }
+    }
+
+    pub fn dflow(&self) -> Result<&serde_json::Value> {
+        match &self.payload {
+            QuotePayload::Dflow(quote) => Ok(quote),
+            _ => Err(self.not_from(Aggregator::Dflow)),
+        }
+    }
+
+    fn not_from(&self, venue: Aggregator) -> anyhow::Error {
+        anyhow!("{:?} cannot build a {:?} quote", venue, self.aggregator)
+    }
 }
 
 /// A quoted route as instructions, for the caller's own transaction.

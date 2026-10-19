@@ -82,19 +82,13 @@ impl DexAggregator for JupiterAggregator {
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
-        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
-            return Err(anyhow!(
-                "Jupiter cannot build a {:?} quote",
-                quote.aggregator
-            ));
-        };
-
+        let quote_response = quote.jupiter()?;
         let swap_response = self
             .jupiter_client
             .swap(
                 &SwapRequest {
                     user_public_key: self.signer.pubkey().to_bytes().into(),
-                    quote_response: (**quote_response).clone(),
+                    quote_response: quote_response.clone(),
                     config: TransactionConfig {
                         wrap_and_unwrap_sol: false,
                         // CU limit sized to the simulated route instead of the 1.4M default.
@@ -144,18 +138,12 @@ impl DexAggregator for JupiterAggregator {
     }
 
     async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
-        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
-            return Err(anyhow!(
-                "Jupiter cannot build a {:?} quote",
-                quote.aggregator
-            ));
-        };
-
+        let quote_response = quote.jupiter()?;
         let response = self
             .jupiter_client
             .swap_instructions(&SwapRequest {
                 user_public_key: request.user.to_bytes().into(),
-                quote_response: (**quote_response).clone(),
+                quote_response: quote_response.clone(),
                 config: TransactionConfig {
                     wrap_and_unwrap_sol: false,
                     ..Default::default()

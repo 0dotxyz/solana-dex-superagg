@@ -132,9 +132,7 @@ impl DexAggregator for TitanAggregator {
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
-        let QuotePayload::Titan(route) = &quote.payload else {
-            return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
-        };
+        let route = quote.titan()?;
         ensure_unexpired(route)?;
 
         let payer = self.signer.pubkey();
@@ -192,9 +190,7 @@ impl DexAggregator for TitanAggregator {
     }
 
     async fn build_instructions(&self, _request: &RouteRequest, quote: &Quote) -> Result<Route> {
-        let QuotePayload::Titan(route) = &quote.payload else {
-            return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
-        };
+        let route = quote.titan()?;
         ensure_unexpired(route)?;
 
         Ok(Route {

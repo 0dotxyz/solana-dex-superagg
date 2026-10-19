@@ -1,6 +1,7 @@
 mod aggregators;
 pub mod client;
 pub mod config;
+mod json;
 
 pub use client::{
     DexSuperAggClient, RouteRequest, Sizing, SwapInstructions, SwapTransaction, VenueQuote,

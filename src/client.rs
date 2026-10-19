@@ -167,6 +167,14 @@ fn within_tolerance(got: u64, min_out: u64) -> bool {
                 <= u128::from(min_out) * (10_000 + u128::from(SIZING_TOLERANCE_BPS)))
 }
 
+/// `future`'s result, or an error once `limit` passes.
+async fn within<T>(limit: Duration, future: impl Future<Output = Result<T>>) -> Result<T> {
+    match timeout(limit, future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("timed out after {:?}", limit)),
+    }
+}
+
 fn check_swap(input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<()> {
     if input_mint == output_mint {
         bail!("Input and output mints cannot be the same");
@@ -260,13 +268,7 @@ impl DexSuperAggClient {
         let quote_timeout = self.config.quote_timeout;
         let results = join_all(venues.map(|venue| {
             let quoted = quote(venue);
-            async move {
-                let result = match timeout(quote_timeout, quoted).await {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow!("timed out after {:?}", quote_timeout)),
-                };
-                (venue.kind(), result)
-            }
+            async move { (venue.kind(), within(quote_timeout, quoted).await) }
         }))
         .await;
 
@@ -327,12 +329,7 @@ impl DexSuperAggClient {
                     let built = async {
                         let venue = self.venue(quote.aggregator)?;
                         let route =
-                            match timeout(build_timeout, venue.build_instructions(request, quote))
-                                .await
-                            {
-                                Ok(built) => built?,
-                                Err(_) => bail!("timed out after {:?}", build_timeout),
-                            };
+                            within(build_timeout, venue.build_instructions(request, quote)).await?;
                         if let Some(reason) = misfit(&route.instructions, request) {
                             bail!("its route {}", reason);
                         }
@@ -375,12 +372,7 @@ impl DexSuperAggClient {
             .filter(|quote| quote.min_out_amount >= min_out)
         {
             let venue = self.venue(quote.aggregator)?;
-            let built =
-                match timeout(self.config.build_timeout, venue.build_transaction(quote)).await {
-                    Ok(built) => built,
-                    Err(_) => Err(anyhow!("timed out after {:?}", self.config.build_timeout)),
-                };
-            match built {
+            match within(self.config.build_timeout, venue.build_transaction(quote)).await {
                 Ok(transaction) => {
                     tracing::info!(
                         aggregator = ?quote.aggregator,

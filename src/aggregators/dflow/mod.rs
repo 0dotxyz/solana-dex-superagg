@@ -1,15 +1,14 @@
 use crate::aggregators::{DexAggregator, Quote, QuotePayload, Route};
 use crate::client::RouteRequest;
 use crate::config::{Aggregator, ClientConfig, DflowConfig};
+use crate::json::{parse_instruction, parse_pubkey, parse_u64};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use std::str::FromStr;
 use std::sync::Arc;
 
 pub(crate) struct DflowAggregator {
@@ -76,10 +75,10 @@ impl DflowAggregator {
                 "quote",
             )
             .await?;
-        let out_amount = parse_u64(&quote["outAmount"])
-            .ok_or_else(|| anyhow!("DFlow quote has no valid outAmount: {}", quote))?;
-        let min_out_amount = parse_u64(&quote["otherAmountThreshold"])
-            .ok_or_else(|| anyhow!("DFlow quote has no valid otherAmountThreshold: {}", quote))?;
+        let amount =
+            |key| parse_u64(&quote[key]).map_err(|e| anyhow!("DFlow quote {}: {}", key, e));
+        let out_amount = amount("outAmount")?;
+        let min_out_amount = amount("otherAmountThreshold")?;
 
         Ok(Quote {
             aggregator: Aggregator::Dflow,
@@ -101,13 +100,9 @@ impl DflowAggregator {
         user: &Pubkey,
         dynamic_compute_unit_limit: bool,
     ) -> Result<Value> {
-        let QuotePayload::Dflow(quote_response) = &quote.payload else {
-            return Err(anyhow!("DFlow cannot build a {:?} quote", quote.aggregator));
-        };
-
         let mut body = json!({
             "userPublicKey": user.to_string(),
-            "quoteResponse": quote_response,
+            "quoteResponse": quote.dflow()?,
             "wrapAndUnwrapSol": false,
             "dynamicComputeUnitLimit": dynamic_compute_unit_limit,
         });
@@ -122,46 +117,6 @@ impl DflowAggregator {
         )
         .await
     }
-}
-
-fn parse_u64(value: &Value) -> Option<u64> {
-    value.as_str().and_then(|amount| amount.parse().ok())
-}
-
-fn parse_bool(value: &Value) -> Result<bool> {
-    value
-        .as_bool()
-        .ok_or_else(|| anyhow!("DFlow: invalid bool {}", value))
-}
-
-fn parse_pubkey(value: &Value) -> Result<Pubkey> {
-    value
-        .as_str()
-        .and_then(|key| Pubkey::from_str(key).ok())
-        .ok_or_else(|| anyhow!("DFlow: invalid pubkey {}", value))
-}
-
-fn parse_instruction(value: &Value) -> Result<Instruction> {
-    let accounts = value["accounts"]
-        .as_array()
-        .ok_or_else(|| anyhow!("DFlow: instruction without accounts: {}", value))?
-        .iter()
-        .map(|meta| {
-            Ok(AccountMeta {
-                pubkey: parse_pubkey(&meta["pubkey"])?,
-                is_signer: parse_bool(&meta["isSigner"])?,
-                is_writable: parse_bool(&meta["isWritable"])?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Instruction {
-        program_id: parse_pubkey(&value["programId"])?,
-        accounts,
-        data: value["data"]
-            .as_str()
-            .and_then(|data| STANDARD.decode(data).ok())
-            .ok_or_else(|| anyhow!("DFlow: instruction data is not base64: {}", value))?,
-    })
 }
 
 #[async_trait::async_trait]

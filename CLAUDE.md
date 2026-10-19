@@ -9,6 +9,7 @@ and behaviour.
 src/
 ├── lib.rs
 ├── config.rs                       # ClientConfig, venue configs
+├── json.rs                         # parsers for the HTTP venues' JSON (amounts, pubkeys, instructions)
 ├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, build_swap_instructions, send_and_confirm
 └── aggregators/
     ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload, Route, misfit
