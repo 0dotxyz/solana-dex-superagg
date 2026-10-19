@@ -342,8 +342,8 @@ impl TitanClient {
         self.request_swap_routes(request, &|_| Ok(())).await
     }
 
-    /// The best route (and its provider) `eligible` accepts in the first update with instructions,
-    /// or why it accepts none of that update's routes.
+    /// Like `request_swap_quotes`, but only routes that `eligible` accepts count. Fails with the
+    /// reasons when an update has executable routes and none of them is eligible.
     pub async fn request_swap_routes(
         &self,
         request: SwapQuoteRequest,
@@ -403,8 +403,8 @@ impl TitanClient {
     }
 }
 
-/// The most-output route `eligible` accepts among those with instructions, or why it accepts none.
-/// `None` while no route has instructions.
+/// The eligible route with the most output. `None` when no route has instructions yet (prebuilt
+/// transactions only); `Some(Err)` with the reasons when routes exist but none is eligible.
 fn best_route(
     quotes: HashMap<String, SwapRoute>,
     eligible: &(dyn Fn(&SwapRoute) -> Result<(), String> + Send + Sync),

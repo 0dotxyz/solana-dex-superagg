@@ -33,7 +33,7 @@ pub struct DflowConfig {
 #[derive(Clone)]
 pub struct ClientConfig {
     pub rpc_url: String,
-    /// Slippage of whole-transaction swaps. A `RouteRequest` carries its own.
+    /// Slippage for whole-transaction swaps. `RouteRequest` carries its own.
     pub slippage_bps: u16,
     /// Priority fee per compute unit; 0 leaves each venue's default.
     pub compute_unit_price_micro_lamports: u64,

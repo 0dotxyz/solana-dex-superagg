@@ -32,20 +32,19 @@ const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Rebroadcast the pending transaction every this many polls.
 const REBROADCAST_EVERY_POLLS: u32 = 4;
 
-/// Quotes `build_swap_instructions` may take while sizing its input.
+/// Maximum quotes `build_swap_instructions` takes while sizing the input.
 const SIZING_QUOTES: usize = 4;
 
-/// How far above `min_out` the best route's guaranteed output may land before `build_swap_instructions`
-/// sizes its input down.
+/// Sizing stops once the guaranteed output exceeds `min_out` by at most this much.
 pub const SIZING_TOLERANCE_BPS: u64 = 5;
 
-/// A venue's quote for a swap.
+/// One venue's quote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VenueQuote {
     pub aggregator: Aggregator,
-    /// Expected output.
+    /// Output the venue expects.
     pub out_amount: u64,
-    /// Output the route guarantees at the configured slippage.
+    /// Output the venue guarantees after slippage.
     pub min_out_amount: u64,
 }
 
@@ -54,36 +53,37 @@ pub struct VenueQuote {
 pub struct SwapTransaction {
     pub transaction: VersionedTransaction,
     pub in_amount: u64,
-    /// Expected output of the quote it was built from; at least `min_out` is guaranteed.
+    /// Output the venue expects. The guaranteed output is at least the requested `min_out`.
     pub out_amount: u64,
     pub aggregator: Aggregator,
 }
 
-/// An exact-in swap for a caller to put in its own transaction.
+/// A swap to embed in the caller's own transaction.
 #[derive(Debug, Clone)]
 pub struct RouteRequest {
-    /// The wallet the route swaps for, which signs the caller's transaction.
+    /// Wallet that owns the token accounts and signs the caller's transaction.
     pub user: Pubkey,
     pub input_mint: Pubkey,
     pub output_mint: Pubkey,
-    /// The input swapped, or the one resizing starts from.
+    /// Input amount. With `Sizing::ToMinOut` it is only the starting point.
     pub amount: u64,
-    /// The least the route must pay once slippage is counted.
+    /// Minimum output the route must guarantee after slippage.
     pub min_out: u64,
     pub sizing: Sizing,
-    /// Slippage the route is quoted at, which sets the least it pays.
+    /// Slippage to quote at.
     pub slippage_bps: u16,
-    /// Accounts the caller's transaction already references. A route reuses them at no cost.
+    /// Accounts the caller's transaction already contains. They don't count against
+    /// `max_accounts`.
     pub transaction_accounts: Vec<Pubkey>,
-    /// Distinct accounts the route may add to the caller's transaction, programs included.
+    /// Maximum number of new accounts (programs included) the route may add to the transaction.
     pub max_accounts: usize,
-    /// Programs the route's top-level instructions may call; `None` allows any.
+    /// Programs the route's top-level instructions may call. `None` allows any.
     pub allowed_programs: Option<Vec<Pubkey>>,
 }
 
 impl RouteRequest {
-    /// A request to swap exactly `amount` for `user`, with no limits on the route (any program,
-    /// up to a transaction's worth of accounts); set `sizing` and the limits as needed.
+    /// A request that swaps exactly `amount`, allows any program and up to 64 new accounts.
+    /// Override fields as needed.
     pub fn new(
         user: Pubkey,
         input_mint: Pubkey,
@@ -107,30 +107,30 @@ impl RouteRequest {
     }
 }
 
-/// How `build_swap_instructions` picks the input it swaps.
+/// How `build_swap_instructions` chooses the input amount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sizing {
     /// Swap exactly `amount`.
     Fixed,
-    /// Resize from `amount` toward the least input whose best route covers `min_out`, never above
-    /// `max_in`.
+    /// Start from `amount` and resize it, up or down but never above `max_in`, until the
+    /// guaranteed output just covers `min_out`.
     ToMinOut { max_in: u64 },
 }
 
-/// An exact-in route as instructions for the requesting wallet, for the caller's own transaction.
-/// It swaps between the wallet's existing token accounts for the two mints.
+/// A route as instructions, for the requesting wallet's own transaction.
 #[derive(Debug, Clone)]
 pub struct SwapInstructions {
     pub aggregator: Aggregator,
     pub in_amount: u64,
-    /// Expected (not slippage-adjusted) output.
+    /// Output the venue expects.
     pub out_amount: u64,
-    /// The least the route pays; below it the route fails.
+    /// Output the venue guarantees after slippage. The route fails on-chain below it.
     pub min_out_amount: u64,
-    /// The route and any token accounts it creates for itself (ATA program): no compute budget,
-    /// wrapping or closing. The user's token accounts for both mints must exist.
+    /// The swap instructions, plus any token accounts the route creates for itself (ATA program).
+    /// No compute budget and no wrapping or unwrapping. The wallet's token accounts for both mints
+    /// must already exist.
     pub instructions: Vec<Instruction>,
-    /// Lookup tables the venue offers for the route's accounts.
+    /// Lookup tables that cover the route's accounts.
     pub address_lookup_tables: Vec<Pubkey>,
 }
 
@@ -150,8 +150,8 @@ fn bumped_input(amount: u64, quoted_out: u64, min_out: u64, max_in: u64) -> u64 
     bumped.max(amount.saturating_add(1)).min(max_in)
 }
 
-/// The input that brings the best route's guaranteed output to `min_out` plus half the sizing
-/// tolerance, at the rate of a quote that guaranteed `got` for `amount`; never above `max_in`.
+/// The next input to try: `amount` scaled by `target / got`, where `got` is what `amount`
+/// guaranteed and `target` is `min_out` plus half the tolerance. Never above `max_in`.
 fn sized_input(amount: u64, got: u64, min_out: u64, max_in: u64) -> u64 {
     let target =
         (u128::from(min_out) * (20_000 + u128::from(SIZING_TOLERANCE_BPS))).div_ceil(20_000);
@@ -159,7 +159,7 @@ fn sized_input(amount: u64, got: u64, min_out: u64, max_in: u64) -> u64 {
     u64::try_from(sized).unwrap_or(u64::MAX).min(max_in)
 }
 
-/// Whether a guaranteed output of `got` covers `min_out` by no more than `SIZING_TOLERANCE_BPS`.
+/// Whether `got` covers `min_out` without exceeding it by more than `SIZING_TOLERANCE_BPS`.
 fn within_tolerance(got: u64, min_out: u64) -> bool {
     min_out == 0
         || (got >= min_out
@@ -177,8 +177,8 @@ fn check_swap(input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<
     Ok(())
 }
 
-/// What succeeded in `results`, each venue that failed logged as `failed`. Errors with `none` and
-/// every venue's failure when nothing succeeded.
+/// The successful results. Each failure is logged with `failed` as the message. When nothing
+/// succeeded, fails with `none` and every venue's error.
 fn successes<T>(results: Vec<(Aggregator, Result<T>)>, failed: &str, none: &str) -> Result<Vec<T>> {
     let mut successes = Vec::new();
     let mut failures = Vec::new();
@@ -247,8 +247,8 @@ impl DexSuperAggClient {
             .ok_or_else(|| anyhow!("{:?} is not configured", aggregator))
     }
 
-    /// Run `quote` on every venue in `venues` in parallel. A venue that fails or misses the deadline
-    /// is logged and left out; only if none quotes is it an error.
+    /// Runs `quote` on every venue in parallel, each under `quote_timeout`. Venues that fail are
+    /// logged and skipped; it is an error only when all of them fail.
     async fn quote_each<'a, T, Fut>(
         &self,
         venues: impl Iterator<Item = &'a dyn DexAggregator>,
@@ -273,8 +273,7 @@ impl DexSuperAggClient {
         successes(results, "Quote failed", "No aggregator returned a quote")
     }
 
-    /// Quote every configured venue in parallel, most guaranteed output first. A venue that fails
-    /// or misses the deadline is logged and left out; only if none quotes is it an error.
+    /// Quotes every venue, sorted by guaranteed output, best first.
     async fn collect_quotes(
         &self,
         input_mint: &Pubkey,
@@ -293,7 +292,7 @@ impl DexSuperAggClient {
         Ok(quotes)
     }
 
-    /// Quote `amount` for `request` on every venue in parallel, most guaranteed output first.
+    /// Quotes every venue for `request` at `amount`, sorted by guaranteed output, best first.
     async fn collect_route_quotes(
         &self,
         request: &RouteRequest,
@@ -310,8 +309,9 @@ impl DexSuperAggClient {
         Ok(quotes)
     }
 
-    /// The instructions of every quote of `amount` paying at least `min_out`, best first. A venue
-    /// that fails to build, or breaks the request's limits, is logged and left out.
+    /// Builds the instructions of every quote that guarantees `min_out`, in parallel, keeping the
+    /// order. A quote whose venue fails to build, or whose route breaks the request's limits, is
+    /// logged and dropped.
     async fn build_routes(
         &self,
         request: &RouteRequest,
@@ -357,8 +357,8 @@ impl DexSuperAggClient {
         )
     }
 
-    /// Build the best quote guaranteeing at least `min_out`, falling back to the next best if its
-    /// venue fails to build.
+    /// Builds the best quote that guarantees `min_out`. If its venue fails to build, tries the
+    /// next one.
     async fn build_best(
         &self,
         quotes: &[Quote],
@@ -427,10 +427,10 @@ impl DexSuperAggClient {
             .collect())
     }
 
-    /// Build a signed exact-in swap transaction guaranteeing at least `min_out` (0 for any) at the
-    /// configured slippage. If the quote for `amount` falls short, the input is raised by the
-    /// shortfall and re-quoted (at most `MIN_OUT_MAX_REQUOTES` times), never above
-    /// `max_in_amount` (default: `DEFAULT_MAX_INPUT_BUMP` × `amount`).
+    /// Builds a signed swap of `amount` that guarantees at least `min_out` after slippage (0 for
+    /// no minimum). If the quote falls short, the input is raised and re-quoted, at most
+    /// `MIN_OUT_MAX_REQUOTES` times and never above `max_in_amount` (default:
+    /// `DEFAULT_MAX_INPUT_BUMP` × `amount`).
     pub async fn build_swap_transaction(
         &self,
         input_mint: Pubkey,
@@ -481,8 +481,8 @@ impl DexSuperAggClient {
         }
     }
 
-    /// Exact-in routes for `request.user` that pay at least `min_out` once slippage is counted, best
-    /// first, for the input `request.sizing` picks.
+    /// Routes for `request` as instructions, every one guaranteeing at least `request.min_out`,
+    /// best first. The input is `request.amount`, or the sized amount with `Sizing::ToMinOut`.
     pub async fn build_swap_instructions(
         &self,
         request: &RouteRequest,
@@ -508,9 +508,9 @@ impl DexSuperAggClient {
         self.build_routes(request, amount, &quotes).await
     }
 
-    /// The least input up to `max_in` whose best route covers `min_out`, with its quotes, resized
-    /// from `request.amount` until it covers it by at most `SIZING_TOLERANCE_BPS`. `None` if none
-    /// do.
+    /// Finds the smallest input, starting from `request.amount` and never above `max_in`, whose
+    /// best quote guarantees `min_out`, stopping once it does so within `SIZING_TOLERANCE_BPS`.
+    /// Returns that input with its quotes, or `None` if no input covers `min_out`.
     async fn sized_quotes(
         &self,
         request: &RouteRequest,

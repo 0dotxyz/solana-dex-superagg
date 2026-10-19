@@ -45,7 +45,7 @@ fn wallet() -> Keypair {
     Keypair::try_from(bytes.as_slice()).expect("invalid WALLET")
 }
 
-/// Every venue whose env vars are set.
+/// Config with every venue whose env vars are set.
 fn config() -> ClientConfig {
     ClientConfig {
         rpc_url: env("RPC_URL").expect("RPC_URL is required"),
@@ -67,7 +67,7 @@ fn config() -> ClientConfig {
     }
 }
 
-/// A client of `aggregator` alone, or `None` when it is not configured.
+/// A client with only `aggregator`, or `None` if it is not configured.
 fn only(config: &ClientConfig, aggregator: Aggregator) -> Option<DexSuperAggClient> {
     let configured = match aggregator {
         Aggregator::Jupiter => config.jupiter.is_some(),

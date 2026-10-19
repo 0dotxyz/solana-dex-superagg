@@ -1,8 +1,8 @@
-//! A venue quotes, and later builds from that same quote, so the route compared on price is the
-//! route that gets built.
+//! Venue (DEX aggregator) integrations. A venue first quotes, then builds exactly the route it
+//! quoted, so the price we compared is the price we get.
 //!
-//! wSOL is always an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist
-//! for a wSOL input), never wrapped, unwrapped or closed.
+//! wSOL is treated as a plain SPL token: it is swapped from/into the wallet's wSOL ATA (which must
+//! already exist) and never wrapped, unwrapped or closed.
 
 use crate::client::RouteRequest;
 use crate::config::Aggregator;
@@ -17,28 +17,30 @@ pub(crate) mod dflow;
 pub(crate) mod jupiter;
 pub(crate) mod titan;
 
-/// An executable exact-in quote, kept so the same route can be built later.
+/// A quote from one venue, with whatever that venue needs to build the same route later.
 pub(crate) struct Quote {
     pub aggregator: Aggregator,
-    /// Expected output.
+    /// Output the venue expects.
     pub out_amount: u64,
-    /// Output the route guarantees at its slippage; it fails on-chain below this.
+    /// Output the venue guarantees after slippage. The route fails on-chain below it.
     pub min_out_amount: u64,
     pub payload: QuotePayload,
 }
 
+/// Venue-specific data needed to build the quoted route.
 pub(crate) enum QuotePayload {
     Jupiter(Box<jupiter_swap_api_client::quote::QuoteResponse>),
     Titan(Box<titan::SwapRoute>),
-    /// DFlow's quote JSON, passed back to its `/swap` unchanged.
+    /// DFlow's quote JSON, sent back to its swap endpoints as is.
     Dflow(Box<serde_json::Value>),
 }
 
-/// A quote's route as instructions for the caller's own transaction.
+/// A quoted route as instructions, for the caller's own transaction.
 pub(crate) struct Route {
-    /// The route and any token accounts it creates for itself; no compute budget, wrapping or
-    /// closing.
+    /// The swap instructions, plus any token accounts the route creates for itself. No compute
+    /// budget and no wrapping or unwrapping.
     pub instructions: Vec<Instruction>,
+    /// Lookup tables that cover the route's accounts.
     pub address_lookup_tables: Vec<Pubkey>,
 }
 
@@ -46,20 +48,22 @@ pub(crate) struct Route {
 pub(crate) trait DexAggregator: Send + Sync {
     fn kind(&self) -> Aggregator;
 
+    /// Quote swapping `amount` of `input_mint` into `output_mint` at the configured slippage.
     async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote>;
 
-    /// Build and sign a transaction executing `quote`, which this venue produced.
+    /// Build and sign a transaction for a quote this venue returned from `quote`.
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction>;
 
-    /// An exact-in quote of `amount` for `request`, at the request's slippage and, as far as the
-    /// venue can tell up front, within its limits.
+    /// Quote swapping `amount` for `request` at the request's slippage. A venue that can apply the
+    /// request's limits while quoting does so here; the client checks them again after building.
     async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote>;
 
-    /// The route of `quote`, which this venue produced with `route_quote` for `request`.
+    /// Build the instructions for a quote this venue returned from `route_quote`.
     async fn route_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route>;
 }
 
-/// Why `instructions` do not fit `request`'s limits, or `None` when they do.
+/// Checks `instructions` against the request's limits (allowed programs, account budget).
+/// Returns why they don't fit, or `None` if they do.
 pub(crate) fn misfit(instructions: &[Instruction], request: &RouteRequest) -> Option<String> {
     if let Some(allowed) = &request.allowed_programs {
         if let Some(program) = instructions

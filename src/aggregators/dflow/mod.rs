@@ -55,7 +55,7 @@ impl DflowAggregator {
         serde_json::from_str(&body).map_err(|e| anyhow!("DFlow {} response invalid: {}", what, e))
     }
 
-    /// DFlow's exact-in quote for `amount` at `slippage_bps`.
+    /// Quotes `amount` at `slippage_bps`.
     async fn quote_response(
         &self,
         input_mint: &Pubkey,
@@ -90,9 +90,10 @@ impl DflowAggregator {
         })
     }
 
-    /// POST the quote to `/swap` or `/swap-instructions`, which take the same body, for `user`.
-    /// `dynamic_compute_unit_limit` simulates the swap against the wallet's current balances, so
-    /// it is off for instructions, whose input may only arrive earlier in the caller's transaction.
+    /// Posts the quote to `/swap` or `/swap-instructions` (same body) on behalf of `user`.
+    /// `dynamic_compute_unit_limit` makes DFlow simulate the swap against the wallet's current
+    /// balances. That is wrong for instructions: their input may only arrive earlier in the
+    /// caller's transaction.
     async fn post_swap(
         &self,
         endpoint: &str,
@@ -203,8 +204,9 @@ impl DexAggregator for DflowAggregator {
         let response = self
             .post_swap("swap-instructions", quote, &request.user, false)
             .await?;
-        // Cleanup unwraps wSOL, which is not requested, so it or "other" instructions showing up
-        // means the response is not what we hand out. Setup creates the route's token accounts.
+        // We never ask for wSOL unwrapping (cleanup), so it or "other" instructions showing up
+        // means a response we don't understand. Setup instructions create token accounts the
+        // route needs.
         for key in ["cleanupInstructions", "otherInstructions"] {
             if response[key]
                 .as_array()

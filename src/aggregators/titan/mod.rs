@@ -49,7 +49,8 @@ impl TitanAggregator {
     }
 }
 
-/// A quote request for `user`. Only a transaction's route creates the output token account.
+/// A quote request for `user`. The output token account is created only for whole transactions;
+/// a route handed out as instructions assumes it exists.
 fn quote_request(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
@@ -79,7 +80,7 @@ fn quote_request(
     }
 }
 
-/// The least a route paying `out_amount` pays at `slippage_bps`, rounded down.
+/// Guaranteed output: `out_amount` less `slippage_bps`, rounded down.
 fn min_out(out_amount: u64, slippage_bps: u16) -> u64 {
     let kept = 10_000 - u128::from(slippage_bps.min(10_000));
     (u128::from(out_amount) * kept / 10_000) as u64

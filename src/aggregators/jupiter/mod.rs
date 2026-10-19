@@ -38,8 +38,8 @@ impl JupiterAggregator {
         })
     }
 
-    /// Jupiter's exact-in quote for `amount` at `slippage_bps`, routed through at most
-    /// `max_accounts` accounts in all when set.
+    /// Quotes `amount` at `slippage_bps`. `max_accounts` limits how many accounts the whole route
+    /// may use.
     async fn quote_response(
         &self,
         input_mint: &Pubkey,
@@ -129,7 +129,8 @@ impl DexAggregator for JupiterAggregator {
                 &request.output_mint,
                 amount,
                 request.slippage_bps,
-                // Jupiter counts every account of the route, reused ones included, up to 64.
+                // Jupiter's limit counts every account of the route, including those the
+                // transaction already has, and allows at most 64.
                 Some((request.max_accounts + request.transaction_accounts.len()).min(64)),
             )
             .await?;
@@ -162,8 +163,9 @@ impl DexAggregator for JupiterAggregator {
             })
             .await
             .map_err(|e| anyhow!("Jupiter swap instructions failed: {}", e))?;
-        // Cleanup unwraps wSOL and "other" is a Jito tip: neither is requested, so either means
-        // the response is not what we hand out. Setup creates the route's token accounts.
+        // We never ask for wSOL unwrapping (cleanup) or a Jito tip ("other"), so either showing up
+        // means a response we don't understand. Setup instructions create token accounts the
+        // route needs.
         if response.cleanup_instruction.is_some() || !response.other_instructions.is_empty() {
             return Err(anyhow!(
                 "Jupiter returned cleanup/other instructions that are not handed out"
