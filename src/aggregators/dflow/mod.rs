@@ -1,5 +1,5 @@
-use crate::aggregators::{DexAggregator, Quote, QuotePayload, RouteQuote};
-use crate::client::{RouteRequest, SwapInstructions};
+use crate::aggregators::{DexAggregator, Quote, QuotePayload, Route};
+use crate::client::RouteRequest;
 use crate::config::{Aggregator, ClientConfig, DflowConfig};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -189,32 +189,19 @@ impl DexAggregator for DflowAggregator {
             .map_err(|e| anyhow!("Failed to sign DFlow transaction: {}", e))
     }
 
-    fn builds_instructions(&self) -> bool {
-        true
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+        self.quote_response(
+            &request.input_mint,
+            &request.output_mint,
+            amount,
+            request.slippage_bps,
+        )
+        .await
     }
 
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote> {
-        let quote = self
-            .quote_response(
-                &request.input_mint,
-                &request.output_mint,
-                amount,
-                request.slippage_bps,
-            )
-            .await?;
-        Ok(RouteQuote {
-            in_amount: amount,
-            quote,
-        })
-    }
-
-    async fn route_instructions(
-        &self,
-        request: &RouteRequest,
-        quote: &RouteQuote,
-    ) -> Result<SwapInstructions> {
+    async fn route_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
         let response = self
-            .post_swap("swap-instructions", &quote.quote, &request.user, false)
+            .post_swap("swap-instructions", quote, &request.user, false)
             .await?;
         // Cleanup unwraps wSOL, which is not requested, so it or "other" instructions showing up
         // means the response is not what we hand out. Setup creates the route's token accounts.
@@ -243,14 +230,9 @@ impl DexAggregator for DflowAggregator {
             .transpose()?
             .unwrap_or_default();
 
-        Ok(SwapInstructions {
-            aggregator: Aggregator::Dflow,
-            in_amount: quote.in_amount,
-            out_amount: quote.quote.out_amount,
-            min_out_amount: quote.quote.min_out_amount,
+        Ok(Route {
             instructions,
             address_lookup_tables: lookup_tables,
-            compute_units: None,
         })
     }
 }

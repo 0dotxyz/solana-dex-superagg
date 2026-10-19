@@ -2,8 +2,8 @@ mod client;
 mod transaction_builder;
 mod types;
 
-use crate::aggregators::{misfit, DexAggregator, Quote, QuotePayload, RouteQuote};
-use crate::client::{RouteRequest, SwapInstructions};
+use crate::aggregators::{misfit, DexAggregator, Quote, QuotePayload, Route};
+use crate::client::RouteRequest;
 use crate::config::{Aggregator, ClientConfig, TitanConfig};
 use anyhow::{anyhow, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -155,11 +155,7 @@ impl DexAggregator for TitanAggregator {
             .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
     }
 
-    fn builds_instructions(&self) -> bool {
-        true
-    }
-
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote> {
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
         let eligible = |route: &SwapRoute| {
             let instructions = transaction_builder::solana_instructions(route).collect::<Vec<_>>();
             misfit(&instructions, request).map_or(Ok(()), Err)
@@ -181,41 +177,26 @@ impl DexAggregator for TitanAggregator {
             .map_err(|e| anyhow!("Titan quote failed: {}", e))?;
         tracing::debug!(provider = %provider, out_amount = route.out_amount, "Titan route quote");
 
-        Ok(RouteQuote {
-            in_amount: amount,
-            quote: Quote {
-                aggregator: Aggregator::Titan,
-                out_amount: route.out_amount,
-                min_out_amount: min_out(
-                    route.out_amount,
-                    route.slippage_bps.unwrap_or(request.slippage_bps),
-                ),
-                payload: QuotePayload::Titan(Box::new(route)),
-            },
+        Ok(Quote {
+            aggregator: Aggregator::Titan,
+            out_amount: route.out_amount,
+            min_out_amount: min_out(
+                route.out_amount,
+                route.slippage_bps.unwrap_or(request.slippage_bps),
+            ),
+            payload: QuotePayload::Titan(Box::new(route)),
         })
     }
 
-    async fn route_instructions(
-        &self,
-        _request: &RouteRequest,
-        quote: &RouteQuote,
-    ) -> Result<SwapInstructions> {
-        let QuotePayload::Titan(route) = &quote.quote.payload else {
-            return Err(anyhow!(
-                "Titan cannot build a {:?} quote",
-                quote.quote.aggregator
-            ));
+    async fn route_instructions(&self, _request: &RouteRequest, quote: &Quote) -> Result<Route> {
+        let QuotePayload::Titan(route) = &quote.payload else {
+            return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
         };
         ensure_unexpired(route)?;
 
-        Ok(SwapInstructions {
-            aggregator: Aggregator::Titan,
-            in_amount: quote.in_amount,
-            out_amount: route.out_amount,
-            min_out_amount: quote.quote.min_out_amount,
+        Ok(Route {
             instructions: transaction_builder::solana_instructions(route).collect(),
             address_lookup_tables: transaction_builder::lookup_table_addresses(route),
-            compute_units: route.compute_units_safe.or(route.compute_units),
         })
     }
 }

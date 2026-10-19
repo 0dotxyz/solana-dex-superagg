@@ -23,7 +23,8 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
 
 - **Routing**: every configured venue is quoted in parallel (`quote_timeout` each); failures,
   including rate limits, are logged and left out, so each extra venue is redundancy for free. The
-  best quote is built (`build_timeout`), falling back to the next best if its venue fails to build.
+  quote with the most guaranteed output is built (`build_timeout`), falling back to the next if
+  its venue fails to build.
 - **Min-out**: `min_out` is checked against what the route guarantees at the configured slippage,
   not its expected output. A short quote raises the input by the shortfall and re-quotes (at most
   twice), never above `max_in` (default 1.10 × `amount`).
@@ -36,13 +37,13 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
 
 ## Instructions for your own transaction
 
-`swap_instructions` hands a route out as instructions, for a caller that swaps inside its own
+`build_swap_instructions` hands a route out as instructions, for a caller that swaps inside its own
 transaction, such as a marginfi order execution or liquidation:
 
 ```rust
 // Routes for `user` paying at least `min_out` once slippage is counted, best first.
 let routes = client
-    .swap_instructions(&RouteRequest {
+    .build_swap_instructions(&RouteRequest {
         user,
         input_mint: usdc,
         output_mint: wsol,
@@ -61,8 +62,9 @@ let routes = client
   ranked and accepted by what they pay once it is counted (Jupiter's and DFlow's
   `otherAmountThreshold`, Titan's output less its `slippageBps`), not by their expected output.
 - **Sizing**: with `Sizing::ToMinOut`, the input starts at `amount` and is resized after each
-  quote (at most 4), never above `max_in`, toward the least whose best route covers `min_out` by
-  at most `SIZING_TOLERANCE_BPS` (5). With `Sizing::Fixed`, every route swaps exactly `amount`.
+  quote (at most 4 quotes), never above `max_in`, toward the least whose best route covers
+  `min_out` by at most `SIZING_TOLERANCE_BPS` (5). With `Sizing::Fixed`, every route swaps exactly
+  `amount`. `RouteRequest::new` builds a fixed, unlimited request to adjust.
 - **Limits**: a route may add at most `max_accounts` accounts beyond the `transaction_accounts` the
   caller's transaction already references, and its top-level instructions may call only
   `allowed_programs` (the programs those call in turn are not checked). Jupiter is quoted with
@@ -80,9 +82,8 @@ Implement `DexAggregator` (`src/aggregators/mod.rs`): `quote` returns the expect
 guaranteed (slippage-adjusted) output plus a `QuotePayload` variant holding whatever the venue
 needs to build; `build_transaction` builds and signs exactly that quote. Honour the wSOL rule
 above and the configured CU price, add an `Aggregator` variant and a config struct, and push the
-venue in `DexSuperAggClient::new`. Every venue also implements `builds_instructions`,
-`route_quote` and `route_instructions`; one that builds only whole transactions returns `false`
-and an error from the other two.
+venue in `DexSuperAggClient::new`. `route_quote` quotes at the request's slippage and
+`route_instructions` returns that quote's route; the client assembles the `SwapInstructions`.
 
 ## Testing
 

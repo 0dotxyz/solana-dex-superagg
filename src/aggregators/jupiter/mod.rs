@@ -1,5 +1,5 @@
-use crate::aggregators::{DexAggregator, Quote, QuotePayload, RouteQuote};
-use crate::client::{RouteRequest, SwapInstructions};
+use crate::aggregators::{DexAggregator, Quote, QuotePayload, Route};
+use crate::client::RouteRequest;
 use crate::config::{Aggregator, ClientConfig, JupiterConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
@@ -39,7 +39,7 @@ impl JupiterAggregator {
     }
 
     /// Jupiter's exact-in quote for `amount` at `slippage_bps`, routed through at most
-    /// `max_accounts` accounts when set.
+    /// `max_accounts` accounts in all when set.
     async fn quote_response(
         &self,
         input_mint: &Pubkey,
@@ -122,41 +122,31 @@ impl DexAggregator for JupiterAggregator {
             .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
     }
 
-    fn builds_instructions(&self) -> bool {
-        true
-    }
-
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote> {
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
         let quote_response = self
             .quote_response(
                 &request.input_mint,
                 &request.output_mint,
                 amount,
                 request.slippage_bps,
-                Some(request.max_accounts),
+                // Jupiter counts every account of the route, reused ones included, up to 64.
+                Some((request.max_accounts + request.transaction_accounts.len()).min(64)),
             )
             .await?;
 
-        Ok(RouteQuote {
-            in_amount: quote_response.in_amount,
-            quote: Quote {
-                aggregator: Aggregator::Jupiter,
-                out_amount: quote_response.out_amount,
-                min_out_amount: quote_response.other_amount_threshold,
-                payload: QuotePayload::Jupiter(Box::new(quote_response)),
-            },
+        Ok(Quote {
+            aggregator: Aggregator::Jupiter,
+            out_amount: quote_response.out_amount,
+            min_out_amount: quote_response.other_amount_threshold,
+            payload: QuotePayload::Jupiter(Box::new(quote_response)),
         })
     }
 
-    async fn route_instructions(
-        &self,
-        request: &RouteRequest,
-        quote: &RouteQuote,
-    ) -> Result<SwapInstructions> {
-        let QuotePayload::Jupiter(quote_response) = &quote.quote.payload else {
+    async fn route_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
+        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
             return Err(anyhow!(
                 "Jupiter cannot build a {:?} quote",
-                quote.quote.aggregator
+                quote.aggregator
             ));
         };
 
@@ -182,14 +172,9 @@ impl DexAggregator for JupiterAggregator {
         let mut instructions = response.setup_instructions;
         instructions.push(response.swap_instruction);
 
-        Ok(SwapInstructions {
-            aggregator: Aggregator::Jupiter,
-            in_amount: quote.in_amount,
-            out_amount: quote_response.out_amount,
-            min_out_amount: quote.quote.min_out_amount,
+        Ok(Route {
             instructions,
             address_lookup_tables: response.address_lookup_table_addresses,
-            compute_units: None,
         })
     }
 }

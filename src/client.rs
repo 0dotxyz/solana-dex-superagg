@@ -1,6 +1,6 @@
 use crate::aggregators::{
     dflow::DflowAggregator, jupiter::JupiterAggregator, misfit, titan::TitanAggregator,
-    DexAggregator, Quote, RouteQuote,
+    DexAggregator, Quote,
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, bail, Result};
@@ -32,12 +32,22 @@ const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Rebroadcast the pending transaction every this many polls.
 const REBROADCAST_EVERY_POLLS: u32 = 4;
 
-/// Quotes `swap_instructions` may take while sizing its input.
+/// Quotes `build_swap_instructions` may take while sizing its input.
 const SIZING_QUOTES: usize = 4;
 
-/// How far above `min_out` the best route's guaranteed output may land before `swap_instructions`
+/// How far above `min_out` the best route's guaranteed output may land before `build_swap_instructions`
 /// sizes its input down.
 pub const SIZING_TOLERANCE_BPS: u64 = 5;
+
+/// A venue's quote for a swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VenueQuote {
+    pub aggregator: Aggregator,
+    /// Expected output.
+    pub out_amount: u64,
+    /// Output the route guarantees at the configured slippage.
+    pub min_out_amount: u64,
+}
 
 /// A signed swap transaction, not yet submitted.
 #[derive(Debug, Clone)]
@@ -71,7 +81,33 @@ pub struct RouteRequest {
     pub allowed_programs: Option<Vec<Pubkey>>,
 }
 
-/// How `swap_instructions` picks the input it swaps.
+impl RouteRequest {
+    /// A request to swap exactly `amount` for `user`, with no limits on the route (any program,
+    /// up to a transaction's worth of accounts); set `sizing` and the limits as needed.
+    pub fn new(
+        user: Pubkey,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+        min_out: u64,
+        slippage_bps: u16,
+    ) -> Self {
+        Self {
+            user,
+            input_mint,
+            output_mint,
+            amount,
+            min_out,
+            sizing: Sizing::Fixed,
+            slippage_bps,
+            transaction_accounts: vec![],
+            max_accounts: 64,
+            allowed_programs: None,
+        }
+    }
+}
+
+/// How `build_swap_instructions` picks the input it swaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sizing {
     /// Swap exactly `amount`.
@@ -96,8 +132,6 @@ pub struct SwapInstructions {
     pub instructions: Vec<Instruction>,
     /// Lookup tables the venue offers for the route's accounts.
     pub address_lookup_tables: Vec<Pubkey>,
-    /// The venue's compute limit for the route, when it recommends one.
-    pub compute_units: Option<u64>,
 }
 
 /// Routes exact-in swaps across DEX aggregators (Jupiter, Titan, DFlow).
@@ -127,9 +161,10 @@ fn sized_input(amount: u64, got: u64, min_out: u64, max_in: u64) -> u64 {
 
 /// Whether a guaranteed output of `got` covers `min_out` by no more than `SIZING_TOLERANCE_BPS`.
 fn within_tolerance(got: u64, min_out: u64) -> bool {
-    got >= min_out
-        && u128::from(got) * 10_000
-            <= u128::from(min_out) * (10_000 + u128::from(SIZING_TOLERANCE_BPS))
+    min_out == 0
+        || (got >= min_out
+            && u128::from(got) * 10_000
+                <= u128::from(min_out) * (10_000 + u128::from(SIZING_TOLERANCE_BPS)))
 }
 
 fn check_swap(input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<()> {
@@ -238,8 +273,8 @@ impl DexSuperAggClient {
         successes(results, "Quote failed", "No aggregator returned a quote")
     }
 
-    /// Quote every configured venue in parallel, best (most output) first. A venue
-    /// that fails or misses the deadline is logged and left out; only if none quotes is it an error.
+    /// Quote every configured venue in parallel, most guaranteed output first. A venue that fails
+    /// or misses the deadline is logged and left out; only if none quotes is it an error.
     async fn collect_quotes(
         &self,
         input_mint: &Pubkey,
@@ -254,47 +289,43 @@ impl DexSuperAggClient {
             .await?;
 
         // Stable: on a tie the configured order decides.
-        quotes.sort_by(|a, b| b.out_amount.cmp(&a.out_amount));
+        quotes.sort_by(|a, b| b.min_out_amount.cmp(&a.min_out_amount));
         Ok(quotes)
     }
 
-    /// Quote `amount` for `request` on every venue that builds instructions, in parallel, most
-    /// guaranteed output first.
+    /// Quote `amount` for `request` on every venue in parallel, most guaranteed output first.
     async fn collect_route_quotes(
         &self,
         request: &RouteRequest,
         amount: u64,
-    ) -> Result<Vec<RouteQuote>> {
+    ) -> Result<Vec<Quote>> {
         check_swap(&request.input_mint, &request.output_mint, amount)?;
         let mut quotes = self
-            .quote_each(
-                self.venues
-                    .iter()
-                    .map(|venue| venue.as_ref())
-                    .filter(|venue| venue.builds_instructions()),
-                |venue| venue.route_quote(request, amount),
-            )
+            .quote_each(self.venues.iter().map(|venue| venue.as_ref()), |venue| {
+                venue.route_quote(request, amount)
+            })
             .await?;
 
-        quotes.sort_by(|a, b| b.quote.min_out_amount.cmp(&a.quote.min_out_amount));
+        quotes.sort_by(|a, b| b.min_out_amount.cmp(&a.min_out_amount));
         Ok(quotes)
     }
 
-    /// The instructions of every quote paying at least `min_out`, best first. A venue that fails to
-    /// build, or breaks the request's limits, is logged and left out.
+    /// The instructions of every quote of `amount` paying at least `min_out`, best first. A venue
+    /// that fails to build, or breaks the request's limits, is logged and left out.
     async fn build_routes(
         &self,
         request: &RouteRequest,
-        quotes: &[RouteQuote],
+        amount: u64,
+        quotes: &[Quote],
     ) -> Result<Vec<SwapInstructions>> {
         let build_timeout = self.config.build_timeout;
         let results = join_all(
             quotes
                 .iter()
-                .filter(|quote| quote.quote.min_out_amount >= request.min_out)
+                .filter(|quote| quote.min_out_amount >= request.min_out)
                 .map(|quote| async move {
                     let built = async {
-                        let venue = self.venue(quote.quote.aggregator)?;
+                        let venue = self.venue(quote.aggregator)?;
                         let route =
                             match timeout(build_timeout, venue.route_instructions(request, quote))
                                 .await
@@ -305,10 +336,17 @@ impl DexSuperAggClient {
                         if let Some(reason) = misfit(&route.instructions, request) {
                             bail!("its route {}", reason);
                         }
-                        Ok(route)
+                        Ok(SwapInstructions {
+                            aggregator: quote.aggregator,
+                            in_amount: amount,
+                            out_amount: quote.out_amount,
+                            min_out_amount: quote.min_out_amount,
+                            instructions: route.instructions,
+                            address_lookup_tables: route.address_lookup_tables,
+                        })
                     }
                     .await;
-                    (quote.quote.aggregator, built)
+                    (quote.aggregator, built)
                 }),
         )
         .await;
@@ -329,7 +367,7 @@ impl DexSuperAggClient {
     ) -> Result<SwapTransaction> {
         let summary: Vec<_> = quotes
             .iter()
-            .map(|q| (q.aggregator, q.out_amount))
+            .map(|q| (q.aggregator, q.min_out_amount))
             .collect();
         let mut failures = Vec::new();
         for quote in quotes
@@ -370,18 +408,22 @@ impl DexSuperAggClient {
         )
     }
 
-    /// Every venue's expected output for swapping `amount`, best first.
+    /// Every venue's quote for swapping `amount`, best guaranteed output first.
     pub async fn quote(
         &self,
         input_mint: Pubkey,
         output_mint: Pubkey,
         amount: u64,
-    ) -> Result<Vec<(Aggregator, u64)>> {
+    ) -> Result<Vec<VenueQuote>> {
         Ok(self
             .collect_quotes(&input_mint, &output_mint, amount)
             .await?
             .into_iter()
-            .map(|quote| (quote.aggregator, quote.out_amount))
+            .map(|quote| VenueQuote {
+                aggregator: quote.aggregator,
+                out_amount: quote.out_amount,
+                min_out_amount: quote.min_out_amount,
+            })
             .collect())
     }
 
@@ -441,20 +483,20 @@ impl DexSuperAggClient {
 
     /// Exact-in routes for `request.user` that pay at least `min_out` once slippage is counted, best
     /// first, for the input `request.sizing` picks.
-    pub async fn swap_instructions(&self, request: &RouteRequest) -> Result<Vec<SwapInstructions>> {
-        if !self.venues.iter().any(|venue| venue.builds_instructions()) {
-            bail!("No configured aggregator builds instructions");
-        }
+    pub async fn build_swap_instructions(
+        &self,
+        request: &RouteRequest,
+    ) -> Result<Vec<SwapInstructions>> {
         let (covering, max_in) = match request.sizing {
             Sizing::Fixed => {
                 let quotes = self.collect_route_quotes(request, request.amount).await?;
-                let covers = quotes[0].quote.min_out_amount >= request.min_out;
-                (covers.then_some(quotes), request.amount)
+                let covers = quotes[0].min_out_amount >= request.min_out;
+                (covers.then_some((request.amount, quotes)), request.amount)
             }
             Sizing::ToMinOut { max_in } => (self.sized_quotes(request, max_in).await?, max_in),
         };
 
-        let quotes = covering.ok_or_else(|| {
+        let (amount, quotes) = covering.ok_or_else(|| {
             anyhow!(
                 "No route pays {} {} for at most {} {}",
                 request.min_out,
@@ -463,16 +505,17 @@ impl DexSuperAggClient {
                 request.input_mint
             )
         })?;
-        self.build_routes(request, &quotes).await
+        self.build_routes(request, amount, &quotes).await
     }
 
-    /// Quotes for the least input up to `max_in` whose best route covers `min_out`, resized from
-    /// `request.amount` until it covers it by at most `SIZING_TOLERANCE_BPS`. `None` if none do.
+    /// The least input up to `max_in` whose best route covers `min_out`, with its quotes, resized
+    /// from `request.amount` until it covers it by at most `SIZING_TOLERANCE_BPS`. `None` if none
+    /// do.
     async fn sized_quotes(
         &self,
         request: &RouteRequest,
         max_in: u64,
-    ) -> Result<Option<Vec<RouteQuote>>> {
+    ) -> Result<Option<(u64, Vec<Quote>)>> {
         let min_out = request.min_out;
         if request.amount > max_in {
             bail!(
@@ -483,7 +526,7 @@ impl DexSuperAggClient {
         }
 
         let mut amount = request.amount;
-        let mut least_covering: Option<(u64, Vec<RouteQuote>)> = None;
+        let mut least_covering: Option<(u64, Vec<Quote>)> = None;
         for _ in 0..SIZING_QUOTES {
             let quotes = match self.collect_route_quotes(request, amount).await {
                 Ok(quotes) => quotes,
@@ -493,7 +536,7 @@ impl DexSuperAggClient {
                 }
                 Err(e) => return Err(e),
             };
-            let best = quotes[0].quote.min_out_amount;
+            let best = quotes[0].min_out_amount;
             if best >= min_out {
                 let tight = within_tolerance(best, min_out);
                 if least_covering
@@ -520,7 +563,7 @@ impl DexSuperAggClient {
             );
             amount = next;
         }
-        Ok(least_covering.map(|(_, quotes)| quotes))
+        Ok(least_covering)
     }
 
     /// Submit `transaction` and wait until it reaches `commitment`, rebroadcasting while its
@@ -660,6 +703,7 @@ mod tests {
     #[test]
     fn a_tight_route_covers_min_out_within_the_tolerance() {
         assert!(within_tolerance(1_000_000, 1_000_000));
+        assert!(within_tolerance(1, 0));
         assert!(within_tolerance(1_000_500, 1_000_000));
         assert!(!within_tolerance(1_000_501, 1_000_000));
         assert!(!within_tolerance(999_999, 1_000_000));

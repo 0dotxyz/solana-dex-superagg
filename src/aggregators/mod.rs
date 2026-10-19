@@ -1,10 +1,10 @@
-//! A venue quotes, and later builds a transaction from that same quote, so the route compared on
-//! price is the route that gets built.
+//! A venue quotes, and later builds from that same quote, so the route compared on price is the
+//! route that gets built.
 //!
 //! wSOL is always an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist
 //! for a wSOL input), never wrapped, unwrapped or closed.
 
-use crate::client::{RouteRequest, SwapInstructions};
+use crate::client::RouteRequest;
 use crate::config::Aggregator;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -34,11 +34,12 @@ pub(crate) enum QuotePayload {
     Dflow(Box<serde_json::Value>),
 }
 
-/// An exact-in quote whose route fits a caller's transaction. `route_instructions` builds that
-/// same route.
-pub(crate) struct RouteQuote {
-    pub quote: Quote,
-    pub in_amount: u64,
+/// A quote's route as instructions for the caller's own transaction.
+pub(crate) struct Route {
+    /// The route and any token accounts it creates for itself; no compute budget, wrapping or
+    /// closing.
+    pub instructions: Vec<Instruction>,
+    pub address_lookup_tables: Vec<Pubkey>,
 }
 
 #[async_trait]
@@ -50,19 +51,12 @@ pub(crate) trait DexAggregator: Send + Sync {
     /// Build and sign a transaction executing `quote`, which this venue produced.
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction>;
 
-    /// Whether this venue hands routes out as instructions, through `route_quote` and
-    /// `route_instructions`.
-    fn builds_instructions(&self) -> bool;
+    /// An exact-in quote of `amount` for `request`, at the request's slippage and, as far as the
+    /// venue can tell up front, within its limits.
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote>;
 
-    /// An exact-in quote of `amount` for `request`, whose route fits the request's limits.
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote>;
-
-    /// The instructions of `quote`, which this venue produced with `route_quote` for `request`.
-    async fn route_instructions(
-        &self,
-        request: &RouteRequest,
-        quote: &RouteQuote,
-    ) -> Result<SwapInstructions>;
+    /// The route of `quote`, which this venue produced with `route_quote` for `request`.
+    async fn route_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route>;
 }
 
 /// Why `instructions` do not fit `request`'s limits, or `None` when they do.

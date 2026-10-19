@@ -9,9 +9,9 @@ and behaviour.
 src/
 ├── lib.rs
 ├── config.rs                       # ClientConfig, venue configs
-├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, swap_instructions, send_and_confirm
+├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, build_swap_instructions, send_and_confirm
 └── aggregators/
-    ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload, RouteQuote, misfit
+    ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload, Route, misfit
     ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected; maxAccounts + /swap-instructions for routes)
     ├── dflow/mod.rs                # DFlow HTTP API (quote JSON passed back to /swap unchanged; /swap-instructions for routes)
     └── titan/
@@ -30,7 +30,7 @@ tests/live.rs                       # ignored: build + simulate on real venues
 - Venues are peers: same trait, same parallel quote, same build. Which of them a consumer may
   run inside a liquidation transaction is the consumer's concern (configure only those).
 - Routes and transactions are judged by guaranteed output (after slippage), never by expected
-  output. `swap_instructions` returns the route alone (plus the ATA creations a multi-hop route
+  output. `build_swap_instructions` returns the route alone (plus the ATA creations a multi-hop route
   needs): the caller owns the compute budget and its own token accounts, and the venue does not
   simulate (the input may only arrive in the caller's tx).
 
@@ -42,7 +42,7 @@ tests/live.rs                       # ignored: build + simulate on real venues
 ## Commands
 
 ```sh
-cargo test
+cargo test                                        # Rust >= 1.91 (Cargo.toml rust-version)
 cargo clippy --all-targets
 cargo test --test live -- --ignored --nocapture   # needs env vars, see tests/live.rs
 ```
