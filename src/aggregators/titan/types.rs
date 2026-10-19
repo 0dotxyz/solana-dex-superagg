@@ -144,8 +144,7 @@ pub struct SwapQuotes {
 #[serde(rename_all = "camelCase")]
 pub struct SwapRoute {
     pub out_amount: u64,
-    /// Slippage the route was built with, when reported.
-    #[serde(default)]
+    /// The slippage the route's minimum output allows.
     pub slippage_bps: Option<u16>,
     /// Empty for providers that only hand out a prebuilt transaction.
     pub instructions: Vec<Instruction>,

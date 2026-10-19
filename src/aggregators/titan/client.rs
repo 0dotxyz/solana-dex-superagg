@@ -339,6 +339,16 @@ impl TitanClient {
         &self,
         request: SwapQuoteRequest,
     ) -> Result<(String, SwapRoute), String> {
+        self.request_swap_routes(request, &|_| Ok(())).await
+    }
+
+    /// The best route (and its provider) `eligible` accepts in the first update with instructions,
+    /// or why it accepts none of that update's routes.
+    pub async fn request_swap_routes(
+        &self,
+        request: SwapQuoteRequest,
+        eligible: &(dyn Fn(&SwapRoute) -> Result<(), String> + Send + Sync),
+    ) -> Result<(String, SwapRoute), String> {
         let deadline = Instant::now() + self.request_timeout;
 
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
@@ -359,13 +369,8 @@ impl TitanClient {
                 match stream_rx.recv().await {
                     Some(StreamEvent::Data(data)) => {
                         let StreamDataPayload::SwapQuotes(quotes) = data.payload;
-                        let best = quotes
-                            .quotes
-                            .into_iter()
-                            .filter(|(_, route)| !route.instructions.is_empty())
-                            .max_by_key(|(_, route)| route.out_amount);
-                        if let Some(best) = best {
-                            return Ok(best);
+                        if let Some(best) = best_route(quotes.quotes, eligible) {
+                            return best;
                         }
                         // No executable route in this update yet; wait for the next one.
                     }
@@ -398,6 +403,41 @@ impl TitanClient {
     }
 }
 
+/// The most-output route `eligible` accepts among those with instructions, or why it accepts none.
+/// `None` while no route has instructions.
+fn best_route(
+    quotes: HashMap<String, SwapRoute>,
+    eligible: &(dyn Fn(&SwapRoute) -> Result<(), String> + Send + Sync),
+) -> Option<Result<(String, SwapRoute), String>> {
+    let mut executable = false;
+    let mut best: Option<(String, SwapRoute)> = None;
+    let mut misfits = Vec::new();
+    for (provider, route) in quotes {
+        if route.instructions.is_empty() {
+            continue;
+        }
+        executable = true;
+        match eligible(&route) {
+            Ok(()) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, best)| route.out_amount > best.out_amount)
+                {
+                    best = Some((provider, route));
+                }
+            }
+            Err(reason) => misfits.push(format!("{}: {}", provider, reason)),
+        }
+    }
+    if !executable {
+        return None;
+    }
+    Some(best.ok_or_else(|| {
+        misfits.sort();
+        format!("No route fits ({})", misfits.join("; "))
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +448,7 @@ mod tests {
     fn route(out_amount: u64) -> SwapRoute {
         SwapRoute {
             out_amount,
-            slippage_bps: None,
+            slippage_bps: Some(50),
             instructions: vec![Instruction {
                 p: [7; 32],
                 a: vec![],
@@ -575,6 +615,45 @@ mod tests {
         // The timed-out connection is retired: the next request opens a fresh one.
         let _ = client.request_swap_quotes(quote_request(1)).await;
         assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    fn routes(out_amounts: &[(&str, u64)]) -> HashMap<String, SwapRoute> {
+        out_amounts
+            .iter()
+            .map(|(provider, out_amount)| (provider.to_string(), route(*out_amount)))
+            .collect()
+    }
+
+    #[test]
+    fn the_best_route_is_the_best_one_eligible() {
+        let eligible = |route: &SwapRoute| match route.out_amount {
+            300 => Err("calls program X".to_string()),
+            _ => Ok(()),
+        };
+        let (provider, best) = best_route(routes(&[("a", 100), ("b", 300), ("c", 200)]), &eligible)
+            .unwrap()
+            .unwrap();
+        assert_eq!((provider.as_str(), best.out_amount), ("c", 200));
+    }
+
+    #[test]
+    fn an_update_with_no_eligible_route_says_why() {
+        let error = best_route(routes(&[("a", 100), ("b", 300)]), &|_| {
+            Err("adds 70 accounts".to_string())
+        })
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "No route fits (a: adds 70 accounts; b: adds 70 accounts)"
+        );
+    }
+
+    #[test]
+    fn an_update_of_prebuilt_transactions_only_waits_for_the_next() {
+        let mut prebuilt = routes(&[("a", 100)]);
+        prebuilt.get_mut("a").unwrap().instructions.clear();
+        assert!(best_route(prebuilt, &|_| Ok(())).is_none());
     }
 
     #[tokio::test]

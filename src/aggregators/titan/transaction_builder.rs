@@ -30,6 +30,18 @@ fn to_solana_instruction(instruction: &types::Instruction) -> Instruction {
     }
 }
 
+pub(crate) fn solana_instructions(route: &SwapRoute) -> impl Iterator<Item = Instruction> + '_ {
+    route.instructions.iter().map(to_solana_instruction)
+}
+
+pub(crate) fn lookup_table_addresses(route: &SwapRoute) -> Vec<Pubkey> {
+    route
+        .address_lookup_tables
+        .iter()
+        .map(|key| Pubkey::new_from_array(*key))
+        .collect()
+}
+
 fn compute_unit_limit(route: &SwapRoute) -> u32 {
     route
         .compute_units_safe
@@ -38,7 +50,8 @@ fn compute_unit_limit(route: &SwapRoute) -> u32 {
         .unwrap_or(FALLBACK_COMPUTE_UNIT_LIMIT)
 }
 
-pub(crate) fn compute_budget_instructions(
+/// The compute budget followed by the route.
+pub(crate) fn route_instructions(
     route: &SwapRoute,
     compute_unit_price_micro_lamports: u64,
 ) -> Vec<Instruction> {
@@ -50,47 +63,33 @@ pub(crate) fn compute_budget_instructions(
             compute_unit_price_micro_lamports,
         ));
     }
+    instructions.extend(solana_instructions(route));
     instructions
 }
 
-pub(crate) fn route_instructions(route: &SwapRoute) -> Vec<Instruction> {
-    route
-        .instructions
-        .iter()
-        .map(to_solana_instruction)
-        .collect()
-}
-
-pub(crate) fn lookup_table_keys(route: &SwapRoute) -> Vec<Pubkey> {
-    route
-        .address_lookup_tables
-        .iter()
-        .map(|key| Pubkey::new_from_array(*key))
-        .collect()
-}
-
-/// Every table in `keys`; a missing one is an error rather than a transaction that references
-/// accounts it can't resolve.
+/// Every lookup table the route needs; a missing one is an error rather than a transaction that
+/// references accounts it can't resolve.
 pub(crate) async fn fetch_lookup_tables(
     rpc: &RpcClient,
-    keys: &[Pubkey],
+    route: &SwapRoute,
 ) -> Result<Vec<AddressLookupTableAccount>> {
-    if keys.is_empty() {
+    if route.address_lookup_tables.is_empty() {
         return Ok(vec![]);
     }
+    let keys = lookup_table_addresses(route);
     let accounts = rpc
-        .get_multiple_accounts(keys)
+        .get_multiple_accounts(&keys)
         .await
         .map_err(|e| anyhow!("Failed to fetch Titan lookup tables: {}", e))?;
 
-    keys.iter()
+    keys.into_iter()
         .zip(accounts)
         .map(|(key, account)| {
             let account = account.ok_or_else(|| anyhow!("Lookup table {} not found", key))?;
             let table = AddressLookupTable::deserialize(&account.data)
                 .map_err(|e| anyhow!("Invalid lookup table {}: {}", key, e))?;
             Ok(AddressLookupTableAccount {
-                key: *key,
+                key,
                 addresses: table.addresses.to_vec(),
             })
         })
@@ -110,7 +109,7 @@ mod tests {
                 a: vec![],
                 d: vec![42],
             }],
-            address_lookup_tables: vec![[7; 32]],
+            address_lookup_tables: vec![],
             expires_at_ms: None,
             compute_units,
             compute_units_safe,
@@ -129,31 +128,22 @@ mod tests {
     }
 
     #[test]
-    fn compute_budget_has_a_price_only_when_set() {
-        let ixs = compute_budget_instructions(&route(None, Some(300_000)), 5_000);
+    fn route_is_preceded_by_the_compute_budget() {
+        let ixs = route_instructions(&route(None, Some(300_000)), 5_000);
+        assert_eq!(ixs.len(), 3);
         assert_eq!(
-            ixs,
-            vec![
-                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
-                ComputeBudgetInstruction::set_compute_unit_price(5_000),
-            ]
+            ixs[0],
+            ComputeBudgetInstruction::set_compute_unit_limit(300_000)
         );
         assert_eq!(
-            compute_budget_instructions(&route(None, Some(300_000)), 0).len(),
-            1
+            ixs[1],
+            ComputeBudgetInstruction::set_compute_unit_price(5_000)
         );
-    }
+        assert_eq!(
+            ixs[2],
+            to_solana_instruction(&route(None, None).instructions[0])
+        );
 
-    #[test]
-    fn route_converts_instructions_and_tables() {
-        let route = route(None, None);
-        let ixs = route_instructions(&route);
-        assert_eq!(ixs.len(), 1);
-        assert_eq!(ixs[0].program_id, Pubkey::new_from_array([9; 32]));
-        assert_eq!(ixs[0].data, vec![42]);
-        assert_eq!(
-            lookup_table_keys(&route),
-            vec![Pubkey::new_from_array([7; 32])]
-        );
+        assert_eq!(route_instructions(&route(None, Some(300_000)), 0).len(), 2);
     }
 }

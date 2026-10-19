@@ -1,4 +1,5 @@
-use crate::aggregators::{DexAggregator, Quote, QuotePayload};
+use crate::aggregators::{DexAggregator, Quote, QuotePayload, RouteQuote};
+use crate::client::{RouteRequest, SwapInstructions};
 use crate::config::{Aggregator, ClientConfig, JupiterConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
@@ -7,7 +8,6 @@ use jupiter_swap_api_client::{
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
 };
-use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -38,29 +38,27 @@ impl JupiterAggregator {
         })
     }
 
-    /// `dynamic_compute_unit_limit` makes Jupiter simulate the swap against the wallet's current
-    /// balances, so it is off for instructions, whose input may only arrive earlier in the
-    /// caller's transaction.
-    fn swap_request(&self, quote: &Quote, dynamic_compute_unit_limit: bool) -> Result<SwapRequest> {
-        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
-            return Err(anyhow!(
-                "Jupiter cannot build a {:?} quote",
-                quote.aggregator
-            ));
-        };
-        Ok(SwapRequest {
-            user_public_key: self.signer.pubkey().to_bytes().into(),
-            quote_response: QuoteResponse::clone(quote_response),
-            config: TransactionConfig {
-                wrap_and_unwrap_sol: false,
-                dynamic_compute_unit_limit,
-                compute_unit_price_micro_lamports: (self.compute_unit_price_micro_lamports > 0)
-                    .then_some(ComputeUnitPriceMicroLamports::MicroLamports(
-                        self.compute_unit_price_micro_lamports,
-                    )),
+    /// Jupiter's exact-in quote for `amount` at `slippage_bps`, routed through at most
+    /// `max_accounts` accounts when set.
+    async fn quote_response(
+        &self,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount: u64,
+        slippage_bps: u16,
+        max_accounts: Option<usize>,
+    ) -> Result<QuoteResponse> {
+        self.jupiter_client
+            .quote(&QuoteRequest {
+                input_mint: input_mint.to_bytes().into(),
+                output_mint: output_mint.to_bytes().into(),
+                amount,
+                slippage_bps,
+                max_accounts,
                 ..Default::default()
-            },
-        })
+            })
+            .await
+            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))
     }
 }
 
@@ -72,16 +70,8 @@ impl DexAggregator for JupiterAggregator {
 
     async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote> {
         let quote_response = self
-            .jupiter_client
-            .quote(&QuoteRequest {
-                input_mint: input_mint.to_bytes().into(),
-                output_mint: output_mint.to_bytes().into(),
-                amount,
-                slippage_bps: self.slippage_bps,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
+            .quote_response(input_mint, output_mint, amount, self.slippage_bps, None)
+            .await?;
 
         Ok(Quote {
             aggregator: Aggregator::Jupiter,
@@ -92,12 +82,36 @@ impl DexAggregator for JupiterAggregator {
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
+        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
+            return Err(anyhow!(
+                "Jupiter cannot build a {:?} quote",
+                quote.aggregator
+            ));
+        };
+
         let swap_response = self
             .jupiter_client
-            // CU limit sized to the simulated route instead of the 1.4M default.
-            .swap(&self.swap_request(quote, true)?, None)
+            .swap(
+                &SwapRequest {
+                    user_public_key: self.signer.pubkey().to_bytes().into(),
+                    quote_response: (**quote_response).clone(),
+                    config: TransactionConfig {
+                        wrap_and_unwrap_sol: false,
+                        // CU limit sized to the simulated route instead of the 1.4M default.
+                        dynamic_compute_unit_limit: true,
+                        compute_unit_price_micro_lamports: (self.compute_unit_price_micro_lamports
+                            > 0)
+                        .then_some(ComputeUnitPriceMicroLamports::MicroLamports(
+                            self.compute_unit_price_micro_lamports,
+                        )),
+                        ..Default::default()
+                    },
+                },
+                None,
+            )
             .await
             .map_err(|e| anyhow!("Jupiter swap failed: {}", e))?;
+
         if let Some(error) = swap_response.simulation_error {
             return Err(anyhow!("Jupiter swap simulation failed: {:?}", error));
         }
@@ -108,22 +122,74 @@ impl DexAggregator for JupiterAggregator {
             .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
     }
 
-    async fn build_instructions(&self, quote: &Quote) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
+    fn builds_instructions(&self) -> bool {
+        true
+    }
+
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote> {
+        let quote_response = self
+            .quote_response(
+                &request.input_mint,
+                &request.output_mint,
+                amount,
+                request.slippage_bps,
+                Some(request.max_accounts),
+            )
+            .await?;
+
+        Ok(RouteQuote {
+            in_amount: quote_response.in_amount,
+            quote: Quote {
+                aggregator: Aggregator::Jupiter,
+                out_amount: quote_response.out_amount,
+                min_out_amount: quote_response.other_amount_threshold,
+                payload: QuotePayload::Jupiter(Box::new(quote_response)),
+            },
+        })
+    }
+
+    async fn route_instructions(
+        &self,
+        request: &RouteRequest,
+        quote: &RouteQuote,
+    ) -> Result<SwapInstructions> {
+        let QuotePayload::Jupiter(quote_response) = &quote.quote.payload else {
+            return Err(anyhow!(
+                "Jupiter cannot build a {:?} quote",
+                quote.quote.aggregator
+            ));
+        };
+
         let response = self
             .jupiter_client
-            .swap_instructions(&self.swap_request(quote, false)?)
+            .swap_instructions(&SwapRequest {
+                user_public_key: request.user.to_bytes().into(),
+                quote_response: (**quote_response).clone(),
+                config: TransactionConfig {
+                    wrap_and_unwrap_sol: false,
+                    ..Default::default()
+                },
+            })
             .await
-            .map_err(|e| anyhow!("Jupiter swap-instructions failed: {}", e))?;
-
-        // Cleanup unwraps wSOL and "other" is a Jito tip; neither is requested, so either showing
-        // up means the response is not what we embed.
+            .map_err(|e| anyhow!("Jupiter swap instructions failed: {}", e))?;
+        // Cleanup unwraps wSOL and "other" is a Jito tip: neither is requested, so either means
+        // the response is not what we hand out. Setup creates the route's token accounts.
         if response.cleanup_instruction.is_some() || !response.other_instructions.is_empty() {
             return Err(anyhow!(
-                "Jupiter returned cleanup/other instructions that are not embedded"
+                "Jupiter returned cleanup/other instructions that are not handed out"
             ));
         }
         let mut instructions = response.setup_instructions;
         instructions.push(response.swap_instruction);
-        Ok((instructions, response.address_lookup_table_addresses))
+
+        Ok(SwapInstructions {
+            aggregator: Aggregator::Jupiter,
+            in_amount: quote.in_amount,
+            out_amount: quote_response.out_amount,
+            min_out_amount: quote.quote.min_out_amount,
+            instructions,
+            address_lookup_tables: response.address_lookup_table_addresses,
+            compute_units: None,
+        })
     }
 }

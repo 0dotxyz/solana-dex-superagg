@@ -2,11 +2,11 @@ mod client;
 mod transaction_builder;
 mod types;
 
-use crate::aggregators::{DexAggregator, Quote, QuotePayload};
+use crate::aggregators::{misfit, DexAggregator, Quote, QuotePayload, RouteQuote};
+use crate::client::{RouteRequest, SwapInstructions};
 use crate::config::{Aggregator, ClientConfig, TitanConfig};
 use anyhow::{anyhow, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::{v0, VersionedMessage};
 use solana_pubkey::Pubkey;
@@ -49,12 +49,14 @@ impl TitanAggregator {
     }
 }
 
+/// A quote request for `user`. Only a transaction's route creates the output token account.
 fn quote_request(
     input_mint: &Pubkey,
     output_mint: &Pubkey,
     amount: u64,
     slippage_bps: u16,
     user: &Pubkey,
+    create_output_token_account: bool,
 ) -> SwapQuoteRequest {
     SwapQuoteRequest {
         swap: SwapParams {
@@ -67,7 +69,7 @@ fn quote_request(
         transaction: TransactionParams {
             user_public_key: user.to_bytes(),
             close_input_token_account: Some(false),
-            create_output_token_account: Some(true),
+            create_output_token_account: Some(create_output_token_account),
             output_wsol: Some(true),
         },
         update: Some(QuoteUpdateParams {
@@ -77,15 +79,13 @@ fn quote_request(
     }
 }
 
-/// Titan's route enforces `out_amount` less the requested slippage.
-fn min_out_amount(out_amount: u64, slippage_bps: u16) -> u64 {
-    out_amount - (out_amount as u128 * slippage_bps as u128 / 10_000) as u64
+/// The least a route paying `out_amount` pays at `slippage_bps`, rounded down.
+fn min_out(out_amount: u64, slippage_bps: u16) -> u64 {
+    let kept = 10_000 - u128::from(slippage_bps.min(10_000));
+    (u128::from(out_amount) * kept / 10_000) as u64
 }
 
-fn unexpired_route(quote: &Quote) -> Result<&SwapRoute> {
-    let QuotePayload::Titan(route) = &quote.payload else {
-        return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
-    };
+fn ensure_unexpired(route: &SwapRoute) -> Result<()> {
     if let Some(expires_at_ms) = route.expires_at_ms {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -95,7 +95,7 @@ fn unexpired_route(quote: &Quote) -> Result<&SwapRoute> {
             return Err(anyhow!("Titan route expired before it could be built"));
         }
     }
-    Ok(route)
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -113,6 +113,7 @@ impl DexAggregator for TitanAggregator {
                 amount,
                 self.slippage_bps,
                 &self.signer.pubkey(),
+                true,
             ))
             .await
             .map_err(|e| anyhow!("Titan quote failed: {}", e))?;
@@ -121,7 +122,7 @@ impl DexAggregator for TitanAggregator {
         Ok(Quote {
             aggregator: Aggregator::Titan,
             out_amount: route.out_amount,
-            min_out_amount: min_out_amount(
+            min_out_amount: min_out(
                 route.out_amount,
                 route.slippage_bps.unwrap_or(self.slippage_bps),
             ),
@@ -130,16 +131,16 @@ impl DexAggregator for TitanAggregator {
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
-        let route = unexpired_route(quote)?;
+        let QuotePayload::Titan(route) = &quote.payload else {
+            return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
+        };
+        ensure_unexpired(route)?;
+
         let payer = self.signer.pubkey();
-        let mut instructions = transaction_builder::compute_budget_instructions(
-            route,
-            self.compute_unit_price_micro_lamports,
-        );
-        instructions.extend(transaction_builder::route_instructions(route));
-        let lookup_table_keys = transaction_builder::lookup_table_keys(route);
+        let instructions =
+            transaction_builder::route_instructions(route, self.compute_unit_price_micro_lamports);
         let (lookup_tables, blockhash) = tokio::try_join!(
-            transaction_builder::fetch_lookup_tables(&self.rpc_client, &lookup_table_keys),
+            transaction_builder::fetch_lookup_tables(&self.rpc_client, route),
             async {
                 self.rpc_client
                     .get_latest_blockhash()
@@ -154,12 +155,68 @@ impl DexAggregator for TitanAggregator {
             .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
     }
 
-    async fn build_instructions(&self, quote: &Quote) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
-        let route = unexpired_route(quote)?;
-        Ok((
-            transaction_builder::route_instructions(route),
-            transaction_builder::lookup_table_keys(route),
-        ))
+    fn builds_instructions(&self) -> bool {
+        true
+    }
+
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote> {
+        let eligible = |route: &SwapRoute| {
+            let instructions = transaction_builder::solana_instructions(route).collect::<Vec<_>>();
+            misfit(&instructions, request).map_or(Ok(()), Err)
+        };
+        let (provider, route) = self
+            .titan_client
+            .request_swap_routes(
+                quote_request(
+                    &request.input_mint,
+                    &request.output_mint,
+                    amount,
+                    request.slippage_bps,
+                    &request.user,
+                    false,
+                ),
+                &eligible,
+            )
+            .await
+            .map_err(|e| anyhow!("Titan quote failed: {}", e))?;
+        tracing::debug!(provider = %provider, out_amount = route.out_amount, "Titan route quote");
+
+        Ok(RouteQuote {
+            in_amount: amount,
+            quote: Quote {
+                aggregator: Aggregator::Titan,
+                out_amount: route.out_amount,
+                min_out_amount: min_out(
+                    route.out_amount,
+                    route.slippage_bps.unwrap_or(request.slippage_bps),
+                ),
+                payload: QuotePayload::Titan(Box::new(route)),
+            },
+        })
+    }
+
+    async fn route_instructions(
+        &self,
+        _request: &RouteRequest,
+        quote: &RouteQuote,
+    ) -> Result<SwapInstructions> {
+        let QuotePayload::Titan(route) = &quote.quote.payload else {
+            return Err(anyhow!(
+                "Titan cannot build a {:?} quote",
+                quote.quote.aggregator
+            ));
+        };
+        ensure_unexpired(route)?;
+
+        Ok(SwapInstructions {
+            aggregator: Aggregator::Titan,
+            in_amount: quote.in_amount,
+            out_amount: route.out_amount,
+            min_out_amount: quote.quote.min_out_amount,
+            instructions: transaction_builder::solana_instructions(route).collect(),
+            address_lookup_tables: transaction_builder::lookup_table_addresses(route),
+            compute_units: route.compute_units_safe.or(route.compute_units),
+        })
     }
 }
 
@@ -168,16 +225,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn min_out_is_out_less_slippage() {
-        assert_eq!(min_out_amount(10_000, 50), 9_950);
-        assert_eq!(min_out_amount(u64::MAX, 10_000), 0);
+    fn wsol_stays_in_the_ata() {
+        let mint = Pubkey::new_unique();
+        let params = quote_request(&mint, &mint, 1, 50, &mint, true).transaction;
+        assert_eq!(params.output_wsol, Some(true));
+        assert_eq!(params.close_input_token_account, Some(false));
     }
 
     #[test]
-    fn wsol_stays_in_the_ata() {
+    fn only_a_transaction_route_creates_the_output_account() {
         let mint = Pubkey::new_unique();
-        let params = quote_request(&mint, &mint, 1, 50, &mint).transaction;
-        assert_eq!(params.output_wsol, Some(true));
-        assert_eq!(params.close_input_token_account, Some(false));
+        let created = |create| {
+            quote_request(&mint, &mint, 1, 50, &mint, create)
+                .transaction
+                .create_output_token_account
+        };
+        assert_eq!((created(true), created(false)), (Some(true), Some(false)));
+    }
+
+    #[test]
+    fn a_route_pays_its_output_less_slippage_rounded_down() {
+        assert_eq!(min_out(1_000_000, 50), 995_000);
+        assert_eq!(min_out(999, 50), 994);
+        assert_eq!(min_out(1_000, 0), 1_000);
     }
 }

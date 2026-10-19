@@ -1,4 +1,5 @@
-use crate::aggregators::{DexAggregator, Quote, QuotePayload};
+use crate::aggregators::{DexAggregator, Quote, QuotePayload, RouteQuote};
+use crate::client::{RouteRequest, SwapInstructions};
 use crate::config::{Aggregator, ClientConfig, DflowConfig};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -54,13 +55,49 @@ impl DflowAggregator {
         serde_json::from_str(&body).map_err(|e| anyhow!("DFlow {} response invalid: {}", what, e))
     }
 
-    /// POST the quote to `/swap` or `/swap-instructions`, which take the same body.
+    /// DFlow's exact-in quote for `amount` at `slippage_bps`.
+    async fn quote_response(
+        &self,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+        amount: u64,
+        slippage_bps: u16,
+    ) -> Result<Quote> {
+        let quote = self
+            .call(
+                self.http_client
+                    .get(format!("{}/quote", self.api_url))
+                    .query(&[
+                        ("inputMint", input_mint.to_string()),
+                        ("outputMint", output_mint.to_string()),
+                        ("amount", amount.to_string()),
+                        ("slippageBps", slippage_bps.to_string()),
+                    ]),
+                "quote",
+            )
+            .await?;
+        let out_amount = parse_u64(&quote["outAmount"])
+            .ok_or_else(|| anyhow!("DFlow quote has no valid outAmount: {}", quote))?;
+        let min_out_amount = parse_u64(&quote["otherAmountThreshold"])
+            .ok_or_else(|| anyhow!("DFlow quote has no valid otherAmountThreshold: {}", quote))?;
+
+        Ok(Quote {
+            aggregator: Aggregator::Dflow,
+            out_amount,
+            min_out_amount,
+            // Passed back to `/swap` unchanged.
+            payload: QuotePayload::Dflow(Box::new(quote)),
+        })
+    }
+
+    /// POST the quote to `/swap` or `/swap-instructions`, which take the same body, for `user`.
     /// `dynamic_compute_unit_limit` simulates the swap against the wallet's current balances, so
     /// it is off for instructions, whose input may only arrive earlier in the caller's transaction.
     async fn post_swap(
         &self,
         endpoint: &str,
         quote: &Quote,
+        user: &Pubkey,
         dynamic_compute_unit_limit: bool,
     ) -> Result<Value> {
         let QuotePayload::Dflow(quote_response) = &quote.payload else {
@@ -68,7 +105,7 @@ impl DflowAggregator {
         };
 
         let mut body = json!({
-            "userPublicKey": self.signer.pubkey().to_string(),
+            "userPublicKey": user.to_string(),
             "quoteResponse": quote_response,
             "wrapAndUnwrapSol": false,
             "dynamicComputeUnitLimit": dynamic_compute_unit_limit,
@@ -133,36 +170,15 @@ impl DexAggregator for DflowAggregator {
     }
 
     async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote> {
-        let quote = self
-            .call(
-                self.http_client
-                    .get(format!("{}/quote", self.api_url))
-                    .query(&[
-                        ("inputMint", input_mint.to_string()),
-                        ("outputMint", output_mint.to_string()),
-                        ("amount", amount.to_string()),
-                        ("slippageBps", self.slippage_bps.to_string()),
-                    ]),
-                "quote",
-            )
-            .await?;
-        let out_amount = parse_u64(&quote["outAmount"])
-            .ok_or_else(|| anyhow!("DFlow quote has no valid outAmount: {}", quote))?;
-        let min_out_amount = parse_u64(&quote["otherAmountThreshold"])
-            .ok_or_else(|| anyhow!("DFlow quote has no valid otherAmountThreshold: {}", quote))?;
-
-        Ok(Quote {
-            aggregator: Aggregator::Dflow,
-            out_amount,
-            min_out_amount,
-            // Passed back to `/swap` unchanged.
-            payload: QuotePayload::Dflow(Box::new(quote)),
-        })
+        self.quote_response(input_mint, output_mint, amount, self.slippage_bps)
+            .await
     }
 
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
         // CU limit sized to the simulated route instead of the default.
-        let swap = self.post_swap("swap", quote, true).await?;
+        let swap = self
+            .post_swap("swap", quote, &self.signer.pubkey(), true)
+            .await?;
         let bytes = swap["swapTransaction"]
             .as_str()
             .and_then(|tx| STANDARD.decode(tx).ok())
@@ -173,17 +189,41 @@ impl DexAggregator for DflowAggregator {
             .map_err(|e| anyhow!("Failed to sign DFlow transaction: {}", e))
     }
 
-    async fn build_instructions(&self, quote: &Quote) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
-        let response = self.post_swap("swap-instructions", quote, false).await?;
+    fn builds_instructions(&self) -> bool {
+        true
+    }
 
+    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<RouteQuote> {
+        let quote = self
+            .quote_response(
+                &request.input_mint,
+                &request.output_mint,
+                amount,
+                request.slippage_bps,
+            )
+            .await?;
+        Ok(RouteQuote {
+            in_amount: amount,
+            quote,
+        })
+    }
+
+    async fn route_instructions(
+        &self,
+        request: &RouteRequest,
+        quote: &RouteQuote,
+    ) -> Result<SwapInstructions> {
+        let response = self
+            .post_swap("swap-instructions", &quote.quote, &request.user, false)
+            .await?;
         // Cleanup unwraps wSOL, which is not requested, so it or "other" instructions showing up
-        // means the response is not what we embed.
+        // means the response is not what we hand out. Setup creates the route's token accounts.
         for key in ["cleanupInstructions", "otherInstructions"] {
             if response[key]
                 .as_array()
                 .is_some_and(|list| !list.is_empty())
             {
-                return Err(anyhow!("DFlow returned {} that are not embedded", key));
+                return Err(anyhow!("DFlow returned {} that are not handed out", key));
             }
         }
         let mut instructions = response["setupInstructions"]
@@ -202,6 +242,15 @@ impl DexAggregator for DflowAggregator {
             .map(|keys| keys.iter().map(parse_pubkey).collect::<Result<Vec<_>>>())
             .transpose()?
             .unwrap_or_default();
-        Ok((instructions, lookup_tables))
+
+        Ok(SwapInstructions {
+            aggregator: Aggregator::Dflow,
+            in_amount: quote.in_amount,
+            out_amount: quote.quote.out_amount,
+            min_out_amount: quote.quote.min_out_amount,
+            instructions,
+            address_lookup_tables: lookup_tables,
+            compute_units: None,
+        })
     }
 }
