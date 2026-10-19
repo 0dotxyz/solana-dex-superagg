@@ -56,10 +56,10 @@ pub(crate) trait DexAggregator: Send + Sync {
 
     /// Quote swapping `amount` for `request` at the request's slippage. A venue that can apply the
     /// request's limits while quoting does so here; the client checks them again after building.
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote>;
+    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote>;
 
-    /// Build the instructions for a quote this venue returned from `route_quote`.
-    async fn route_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route>;
+    /// Build the instructions for a quote this venue returned from `quote_route`.
+    async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route>;
 }
 
 /// Checks `instructions` against the request's limits (allowed programs, account budget).

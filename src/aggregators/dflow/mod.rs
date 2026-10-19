@@ -190,7 +190,7 @@ impl DexAggregator for DflowAggregator {
             .map_err(|e| anyhow!("Failed to sign DFlow transaction: {}", e))
     }
 
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
         self.quote_response(
             &request.input_mint,
             &request.output_mint,
@@ -200,7 +200,7 @@ impl DexAggregator for DflowAggregator {
         .await
     }
 
-    async fn route_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
+    async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
         let response = self
             .post_swap("swap-instructions", quote, &request.user, false)
             .await?;

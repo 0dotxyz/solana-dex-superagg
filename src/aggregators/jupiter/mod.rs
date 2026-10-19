@@ -122,7 +122,7 @@ impl DexAggregator for JupiterAggregator {
             .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
     }
 
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
         let quote_response = self
             .quote_response(
                 &request.input_mint,
@@ -143,7 +143,7 @@ impl DexAggregator for JupiterAggregator {
         })
     }
 
-    async fn route_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
+    async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
         let QuotePayload::Jupiter(quote_response) = &quote.payload else {
             return Err(anyhow!(
                 "Jupiter cannot build a {:?} quote",

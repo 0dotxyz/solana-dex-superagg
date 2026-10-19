@@ -301,7 +301,7 @@ impl DexSuperAggClient {
         check_swap(&request.input_mint, &request.output_mint, amount)?;
         let mut quotes = self
             .quote_each(self.venues.iter().map(|venue| venue.as_ref()), |venue| {
-                venue.route_quote(request, amount)
+                venue.quote_route(request, amount)
             })
             .await?;
 
@@ -327,7 +327,7 @@ impl DexSuperAggClient {
                     let built = async {
                         let venue = self.venue(quote.aggregator)?;
                         let route =
-                            match timeout(build_timeout, venue.route_instructions(request, quote))
+                            match timeout(build_timeout, venue.build_instructions(request, quote))
                                 .await
                             {
                                 Ok(built) => built?,

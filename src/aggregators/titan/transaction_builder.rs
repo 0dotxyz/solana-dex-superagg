@@ -51,7 +51,7 @@ fn compute_unit_limit(route: &SwapRoute) -> u32 {
 }
 
 /// The compute budget followed by the route.
-pub(crate) fn route_instructions(
+pub(crate) fn transaction_instructions(
     route: &SwapRoute,
     compute_unit_price_micro_lamports: u64,
 ) -> Vec<Instruction> {
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn route_is_preceded_by_the_compute_budget() {
-        let ixs = route_instructions(&route(None, Some(300_000)), 5_000);
+        let ixs = transaction_instructions(&route(None, Some(300_000)), 5_000);
         assert_eq!(ixs.len(), 3);
         assert_eq!(
             ixs[0],
@@ -144,6 +144,9 @@ mod tests {
             to_solana_instruction(&route(None, None).instructions[0])
         );
 
-        assert_eq!(route_instructions(&route(None, Some(300_000)), 0).len(), 2);
+        assert_eq!(
+            transaction_instructions(&route(None, Some(300_000)), 0).len(),
+            2
+        );
     }
 }

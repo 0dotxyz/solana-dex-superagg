@@ -138,8 +138,10 @@ impl DexAggregator for TitanAggregator {
         ensure_unexpired(route)?;
 
         let payer = self.signer.pubkey();
-        let instructions =
-            transaction_builder::route_instructions(route, self.compute_unit_price_micro_lamports);
+        let instructions = transaction_builder::transaction_instructions(
+            route,
+            self.compute_unit_price_micro_lamports,
+        );
         let (lookup_tables, blockhash) = tokio::try_join!(
             transaction_builder::fetch_lookup_tables(&self.rpc_client, route),
             async {
@@ -156,7 +158,7 @@ impl DexAggregator for TitanAggregator {
             .map_err(|e| anyhow!("Failed to sign transaction: {}", e))
     }
 
-    async fn route_quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+    async fn quote_route(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
         let eligible = |route: &SwapRoute| {
             let instructions = transaction_builder::solana_instructions(route).collect::<Vec<_>>();
             misfit(&instructions, request).map_or(Ok(()), Err)
@@ -189,7 +191,7 @@ impl DexAggregator for TitanAggregator {
         })
     }
 
-    async fn route_instructions(&self, _request: &RouteRequest, quote: &Quote) -> Result<Route> {
+    async fn build_instructions(&self, _request: &RouteRequest, quote: &Quote) -> Result<Route> {
         let QuotePayload::Titan(route) = &quote.payload else {
             return Err(anyhow!("Titan cannot build a {:?} quote", quote.aggregator));
         };
