@@ -1,40 +1,226 @@
-//! A venue quotes, and later builds a transaction from that same quote, so the route compared on
-//! price is the route that gets built.
+//! Venue (DEX aggregator) integrations. A venue first quotes, then builds exactly the route it
+//! quoted, so the price we compared is the price we get.
 //!
-//! wSOL is always an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist
-//! for a wSOL input), never wrapped, unwrapped or closed.
+//! wSOL is treated as a plain SPL token: it is swapped from/into the wallet's wSOL ATA (which must
+//! already exist) and never wrapped, unwrapped or closed.
 
+use crate::client::RouteRequest;
 use crate::config::Aggregator;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use solana_instruction::Instruction;
+use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
+use std::collections::HashSet;
 
 pub(crate) mod dflow;
 pub(crate) mod jupiter;
 pub(crate) mod titan;
 
-/// An executable exact-in quote, kept so the same route can be built later.
+/// A quote from one venue, with whatever that venue needs to build the same route later.
 pub(crate) struct Quote {
     pub aggregator: Aggregator,
-    /// Expected (not slippage-adjusted) output.
-    pub out_amount: u64,
+    /// Output the venue guarantees after slippage. The route fails on-chain below it.
+    pub min_out_amount: u64,
     pub payload: QuotePayload,
 }
 
+/// Venue-specific data needed to build the quoted route.
 pub(crate) enum QuotePayload {
     Jupiter(Box<jupiter_swap_api_client::quote::QuoteResponse>),
     Titan(Box<titan::SwapRoute>),
-    /// DFlow's quote JSON, passed back to its `/swap` unchanged.
+    /// DFlow's quote JSON, sent back to its swap endpoints as is.
     Dflow(Box<serde_json::Value>),
+}
+
+/// Each venue's payload, or an error when the quote came from another venue.
+impl Quote {
+    pub fn jupiter(&self) -> Result<&jupiter_swap_api_client::quote::QuoteResponse> {
+        match &self.payload {
+            QuotePayload::Jupiter(quote) => Ok(quote),
+            _ => Err(self.not_from(Aggregator::Jupiter)),
+        }
+    }
+
+    pub fn titan(&self) -> Result<&titan::SwapRoute> {
+        match &self.payload {
+            QuotePayload::Titan(route) => Ok(route),
+            _ => Err(self.not_from(Aggregator::Titan)),
+        }
+    }
+
+    pub fn dflow(&self) -> Result<&serde_json::Value> {
+        match &self.payload {
+            QuotePayload::Dflow(quote) => Ok(quote),
+            _ => Err(self.not_from(Aggregator::Dflow)),
+        }
+    }
+
+    fn not_from(&self, venue: Aggregator) -> anyhow::Error {
+        anyhow!("{:?} cannot build a {:?} quote", venue, self.aggregator)
+    }
+}
+
+/// A quoted route as instructions, for the caller's own transaction.
+#[derive(Debug)]
+pub(crate) struct Route {
+    /// The swap instructions, plus any token accounts the route creates for itself. No compute
+    /// budget and no wrapping or unwrapping.
+    pub instructions: Vec<Instruction>,
+    /// Lookup tables that cover the route's accounts.
+    pub address_lookup_tables: Vec<Pubkey>,
 }
 
 #[async_trait]
 pub(crate) trait DexAggregator: Send + Sync {
     fn kind(&self) -> Aggregator;
 
-    async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote>;
+    /// Quote swapping `amount` for `request`, at the request's slippage. A venue that can apply
+    /// the request's limits while quoting does so here; the client checks them again after
+    /// building.
+    async fn quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote>;
 
-    /// Build and sign a transaction executing `quote`, which this venue produced.
+    /// Build and sign a transaction for a quote this venue returned.
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction>;
+
+    /// Build the instructions for a quote this venue returned.
+    async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route>;
+}
+
+/// Checks `instructions` against the request's limits (allowed programs, account budget).
+/// Returns why they don't fit, or `None` if they do.
+pub(crate) fn misfit(instructions: &[Instruction], request: &RouteRequest) -> Option<String> {
+    if let Some(allowed) = &request.allowed_programs {
+        if let Some(program) = instructions
+            .iter()
+            .map(|instruction| instruction.program_id)
+            .find(|program| !allowed.contains(program))
+        {
+            return Some(format!("calls program {}", program));
+        }
+    }
+    let accounts = instructions
+        .iter()
+        .flat_map(|instruction| {
+            std::iter::once(instruction.program_id)
+                .chain(instruction.accounts.iter().map(|meta| meta.pubkey))
+        })
+        .filter(|account| !request.transaction_accounts.contains(account))
+        .collect::<HashSet<_>>()
+        .len();
+    (accounts > request.max_accounts).then(|| {
+        format!(
+            "adds {} accounts, over the {} allowed",
+            accounts, request.max_accounts
+        )
+    })
+}
+
+/// Signs the serialized transaction a venue built for `signer`.
+pub(crate) fn sign_transaction(
+    bytes: &[u8],
+    signer: &Keypair,
+    venue: Aggregator,
+) -> Result<VersionedTransaction> {
+    let tx = bincode::deserialize::<VersionedTransaction>(bytes)
+        .map_err(|e| anyhow!("Failed to deserialize {:?} transaction: {}", venue, e))?;
+    VersionedTransaction::try_new(tx.message, &[signer])
+        .map_err(|e| anyhow!("Failed to sign {:?} transaction: {}", venue, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Sizing;
+    use solana_instruction::AccountMeta;
+    use solana_message::{Message, VersionedMessage};
+    use solana_signer::Signer;
+
+    #[test]
+    fn a_venue_transaction_is_signed_for_its_fee_payer() {
+        let signer = Keypair::new();
+        let unsigned = VersionedTransaction {
+            signatures: vec![Default::default()],
+            message: VersionedMessage::Legacy(Message::new(
+                &[instruction(Pubkey::new_unique(), &[])],
+                Some(&signer.pubkey()),
+            )),
+        };
+        let bytes = bincode::serialize(&unsigned).unwrap();
+
+        let signed = sign_transaction(&bytes, &signer, Aggregator::Dflow).unwrap();
+        assert_eq!(signed.message, unsigned.message);
+        assert_eq!(
+            signed.signatures,
+            [signer.sign_message(&signed.message.serialize())]
+        );
+
+        let error = sign_transaction(&bytes, &Keypair::new(), Aggregator::Dflow).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to sign Dflow transaction"),
+            "{}",
+            error
+        );
+        let error =
+            sign_transaction(b"not a transaction", &signer, Aggregator::Jupiter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to deserialize Jupiter transaction"),
+            "{}",
+            error
+        );
+    }
+
+    fn instruction(program: Pubkey, accounts: &[Pubkey]) -> Instruction {
+        Instruction {
+            program_id: program,
+            accounts: accounts
+                .iter()
+                .map(|account| AccountMeta::new(*account, false))
+                .collect(),
+            data: vec![1; 8],
+        }
+    }
+
+    #[test]
+    fn a_route_fits_while_it_calls_allowed_programs_within_the_account_limit() {
+        let (program, a, b) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let route = [instruction(program, &[a, b]), instruction(program, &[b])];
+        let limits = |transaction_accounts, max_accounts, allowed_programs| RouteRequest {
+            user: a,
+            input_mint: Pubkey::new_unique(),
+            output_mint: Pubkey::new_unique(),
+            amount: 1,
+            min_out: 1,
+            sizing: Sizing::Fixed,
+            slippage_bps: 50,
+            transaction_accounts,
+            max_accounts,
+            allowed_programs,
+        };
+
+        assert_eq!(
+            misfit(&route, &limits(vec![], 3, Some(vec![program]))),
+            None
+        );
+        assert_eq!(misfit(&route, &limits(vec![], 3, None)), None);
+        assert_eq!(
+            misfit(&route, &limits(vec![], 2, None)),
+            Some("adds 3 accounts, over the 2 allowed".to_string())
+        );
+        // Accounts the transaction already references cost nothing.
+        assert_eq!(misfit(&route, &limits(vec![a, b], 1, None)), None);
+        assert_eq!(
+            misfit(&route, &limits(vec![], 3, Some(vec![a]))),
+            Some(format!("calls program {}", program))
+        );
+    }
 }

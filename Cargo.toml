@@ -2,6 +2,7 @@
 name = "solana-dex-superagg"
 version = "2.0.0"
 edition = "2021"
+rust-version = "1.91"
 description = "Best-price exact-in swaps across the Jupiter, Titan and DFlow aggregators on Solana"
 license = "MIT"
 repository = "https://github.com/0dotxyz/solana-dex-superagg"
@@ -43,3 +44,7 @@ tracing = "0.1"
 urlencoding = "2.1"
 
 jupiter-swap-api-client = { git = "https://github.com/IliaZyrin/jupiter-swap-api-client", rev = "fc3574e4f77c065b9a2cf9c4032972ce6e944f3e" }
+
+[dev-dependencies]
+solana-rpc-client = "=4.2.2"
+tokio = { version = "1.50.0", features = ["test-util"] }

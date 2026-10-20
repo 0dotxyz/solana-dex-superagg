@@ -1,14 +1,14 @@
-use crate::aggregators::{DexAggregator, Quote, QuotePayload};
+use crate::aggregators::{sign_transaction, DexAggregator, Quote, QuotePayload, Route};
+use crate::client::RouteRequest;
 use crate::config::{Aggregator, ClientConfig, JupiterConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
     quote::QuoteRequest,
-    swap::SwapRequest,
+    swap::{SwapInstructionsResponse, SwapRequest},
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
 };
 use solana_keypair::Keypair;
-use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
@@ -16,7 +16,6 @@ use std::sync::Arc;
 pub(crate) struct JupiterAggregator {
     jupiter_client: JupiterSwapApiClient,
     signer: Arc<Keypair>,
-    slippage_bps: u16,
     compute_unit_price_micro_lamports: u64,
 }
 
@@ -32,7 +31,6 @@ impl JupiterAggregator {
                 jupiter.api_key.clone(),
             )?,
             signer,
-            slippage_bps: config.slippage_bps,
             compute_unit_price_micro_lamports: config.compute_unit_price_micro_lamports,
         })
     }
@@ -44,40 +42,14 @@ impl DexAggregator for JupiterAggregator {
         Aggregator::Jupiter
     }
 
-    async fn quote(&self, input_mint: &Pubkey, output_mint: &Pubkey, amount: u64) -> Result<Quote> {
-        let quote_response = self
-            .jupiter_client
-            .quote(&QuoteRequest {
-                input_mint: input_mint.to_bytes().into(),
-                output_mint: output_mint.to_bytes().into(),
-                amount,
-                slippage_bps: self.slippage_bps,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
-
-        Ok(Quote {
-            aggregator: Aggregator::Jupiter,
-            out_amount: quote_response.out_amount,
-            payload: QuotePayload::Jupiter(Box::new(quote_response)),
-        })
-    }
-
     async fn build_transaction(&self, quote: &Quote) -> Result<VersionedTransaction> {
-        let QuotePayload::Jupiter(quote_response) = &quote.payload else {
-            return Err(anyhow!(
-                "Jupiter cannot build a {:?} quote",
-                quote.aggregator
-            ));
-        };
-
+        let quote_response = quote.jupiter()?;
         let swap_response = self
             .jupiter_client
             .swap(
                 &SwapRequest {
                     user_public_key: self.signer.pubkey().to_bytes().into(),
-                    quote_response: (**quote_response).clone(),
+                    quote_response: quote_response.clone(),
                     config: TransactionConfig {
                         wrap_and_unwrap_sol: false,
                         // CU limit sized to the simulated route instead of the 1.4M default.
@@ -99,9 +71,149 @@ impl DexAggregator for JupiterAggregator {
             return Err(anyhow!("Jupiter swap simulation failed: {:?}", error));
         }
 
-        let tx = bincode::deserialize::<VersionedTransaction>(&swap_response.swap_transaction)
-            .map_err(|e| anyhow!("Failed to deserialize Jupiter transaction: {}", e))?;
-        VersionedTransaction::try_new(tx.message, &[self.signer.as_ref()])
-            .map_err(|e| anyhow!("Failed to sign Jupiter transaction: {}", e))
+        sign_transaction(
+            &swap_response.swap_transaction,
+            &self.signer,
+            Aggregator::Jupiter,
+        )
+    }
+
+    async fn quote(&self, request: &RouteRequest, amount: u64) -> Result<Quote> {
+        let quote_response = self
+            .jupiter_client
+            .quote(&QuoteRequest {
+                input_mint: request.input_mint.to_bytes().into(),
+                output_mint: request.output_mint.to_bytes().into(),
+                amount,
+                slippage_bps: request.slippage_bps,
+                max_accounts: Some(max_accounts(request)),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
+
+        Ok(Quote {
+            aggregator: Aggregator::Jupiter,
+            min_out_amount: quote_response.other_amount_threshold,
+            payload: QuotePayload::Jupiter(Box::new(quote_response)),
+        })
+    }
+
+    async fn build_instructions(&self, request: &RouteRequest, quote: &Quote) -> Result<Route> {
+        let quote_response = quote.jupiter()?;
+        let response = self
+            .jupiter_client
+            .swap_instructions(&SwapRequest {
+                user_public_key: request.user.to_bytes().into(),
+                quote_response: quote_response.clone(),
+                config: TransactionConfig {
+                    wrap_and_unwrap_sol: false,
+                    ..Default::default()
+                },
+            })
+            .await
+            .map_err(|e| anyhow!("Jupiter swap instructions failed: {}", e))?;
+        route(response)
+    }
+}
+
+/// Jupiter's limit counts every account of the route, including those the transaction already
+/// has, and allows at most 64.
+fn max_accounts(request: &RouteRequest) -> usize {
+    request
+        .max_accounts
+        .saturating_add(request.transaction_accounts.len())
+        .min(64)
+}
+
+/// The route in a `/swap-instructions` response. We never ask for wSOL unwrapping (cleanup) or a
+/// Jito tip ("other"), so either showing up means a response we don't understand. Setup
+/// instructions create token accounts the route needs.
+fn route(response: SwapInstructionsResponse) -> Result<Route> {
+    if response.cleanup_instruction.is_some() || !response.other_instructions.is_empty() {
+        return Err(anyhow!(
+            "Jupiter returned cleanup/other instructions that are not handed out"
+        ));
+    }
+    let mut instructions = response.setup_instructions;
+    instructions.push(response.swap_instruction);
+
+    Ok(Route {
+        instructions,
+        address_lookup_tables: response.address_lookup_table_addresses,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_instruction::Instruction;
+    use solana_pubkey::Pubkey;
+
+    #[test]
+    fn the_account_limit_is_gross_and_at_most_64() {
+        let mut request = RouteRequest::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1,
+            0,
+            50,
+        );
+        request.max_accounts = 30;
+        request.transaction_accounts = vec![Pubkey::new_unique(); 10];
+        assert_eq!(max_accounts(&request), 40);
+        request.max_accounts = 60;
+        assert_eq!(max_accounts(&request), 64);
+        request.max_accounts = usize::MAX;
+        assert_eq!(max_accounts(&request), 64);
+    }
+
+    fn instruction(program: Pubkey) -> Instruction {
+        Instruction {
+            program_id: program,
+            accounts: vec![],
+            data: vec![],
+        }
+    }
+
+    fn response(setup: Vec<Instruction>, swap: Instruction) -> SwapInstructionsResponse {
+        SwapInstructionsResponse {
+            token_ledger_instruction: None,
+            compute_budget_instructions: vec![instruction(Pubkey::new_unique())],
+            setup_instructions: setup,
+            swap_instruction: swap,
+            cleanup_instruction: None,
+            other_instructions: vec![],
+            address_lookup_table_addresses: vec![Pubkey::new_unique()],
+            prioritization_fee_lamports: 0,
+            compute_unit_limit: 0,
+            prioritization_type: None,
+            dynamic_slippage_report: None,
+            simulation_error: None,
+        }
+    }
+
+    #[test]
+    fn the_route_is_the_setup_and_swap_instructions_without_the_compute_budget() {
+        let (ata, router) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let response = response(vec![instruction(ata)], instruction(router));
+        let tables = response.address_lookup_table_addresses.clone();
+        let built = route(response).unwrap();
+        let programs: Vec<_> = built.instructions.iter().map(|ix| ix.program_id).collect();
+        assert_eq!(programs, [ata, router]);
+        assert_eq!(built.address_lookup_tables, tables);
+    }
+
+    #[test]
+    fn instructions_we_did_not_ask_for_are_an_error() {
+        let router = Pubkey::new_unique();
+        let mut with_cleanup = response(vec![], instruction(router));
+        with_cleanup.cleanup_instruction = Some(instruction(router));
+        assert!(route(with_cleanup).is_err());
+
+        let mut with_tip = response(vec![], instruction(router));
+        with_tip.other_instructions = vec![instruction(router)];
+        assert!(route(with_tip).is_err());
     }
 }

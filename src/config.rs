@@ -33,6 +33,7 @@ pub struct DflowConfig {
 #[derive(Clone)]
 pub struct ClientConfig {
     pub rpc_url: String,
+    /// Slippage for whole-transaction swaps. `RouteRequest` carries its own.
     pub slippage_bps: u16,
     /// Priority fee per compute unit; 0 leaves each venue's default.
     pub compute_unit_price_micro_lamports: u64,
@@ -122,6 +123,27 @@ impl fmt::Debug for TitanConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn urls_are_reduced_to_scheme_and_host() {
+        assert_eq!(
+            redact_url("https://rpc.example.com"),
+            "https://rpc.example.com"
+        );
+        assert_eq!(
+            redact_url("https://rpc.example.com/token"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(
+            redact_url("https://rpc.example.com?api-key=x"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(
+            redact_url("https://user:secret@rpc.example.com/x"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(redact_url("rpc.example.com/token"), "rpc.example.com/…");
+    }
 
     #[test]
     fn debug_output_hides_credentials() {

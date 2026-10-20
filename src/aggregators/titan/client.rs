@@ -333,11 +333,13 @@ impl TitanClient {
         }
     }
 
-    /// The best route (and its provider) from the first quote-stream update that has one. Routes
-    /// without instructions (prebuilt transaction only) are skipped: we add the compute budget.
-    pub async fn request_swap_quotes(
+    /// The best route (and its provider) from the first quote-stream update that has routes
+    /// with instructions, among those `eligible` accepts. Fails with the reasons when such an
+    /// update has routes and none of them is eligible.
+    pub async fn request_best_route(
         &self,
         request: SwapQuoteRequest,
+        eligible: &(dyn Fn(&SwapRoute) -> Result<(), String> + Send + Sync),
     ) -> Result<(String, SwapRoute), String> {
         let deadline = Instant::now() + self.request_timeout;
 
@@ -359,15 +361,16 @@ impl TitanClient {
                 match stream_rx.recv().await {
                     Some(StreamEvent::Data(data)) => {
                         let StreamDataPayload::SwapQuotes(quotes) = data.payload;
-                        let best = quotes
+                        let routes: Vec<_> = quotes
                             .quotes
                             .into_iter()
                             .filter(|(_, route)| !route.instructions.is_empty())
-                            .max_by_key(|(_, route)| route.out_amount);
-                        if let Some(best) = best {
-                            return Ok(best);
+                            .collect();
+                        if routes.is_empty() {
+                            // Nothing we can use in this update; wait for the next one.
+                            continue;
                         }
-                        // No executable route in this update yet; wait for the next one.
+                        return best_route(routes, eligible);
                     }
                     Some(StreamEvent::End(end)) => {
                         return Err(match end.error_message {
@@ -398,6 +401,33 @@ impl TitanClient {
     }
 }
 
+/// The route with the most output among those `eligible` accepts. Fails with every rejection
+/// reason when it accepts none.
+fn best_route(
+    routes: Vec<(String, SwapRoute)>,
+    eligible: &(dyn Fn(&SwapRoute) -> Result<(), String> + Send + Sync),
+) -> Result<(String, SwapRoute), String> {
+    let mut best: Option<(String, SwapRoute)> = None;
+    let mut misfits = Vec::new();
+    for (provider, route) in routes {
+        match eligible(&route) {
+            Ok(()) => {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, best)| route.out_amount > best.out_amount)
+                {
+                    best = Some((provider, route));
+                }
+            }
+            Err(reason) => misfits.push(format!("{}: {}", provider, reason)),
+        }
+    }
+    best.ok_or_else(|| {
+        misfits.sort();
+        format!("No route fits ({})", misfits.join("; "))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +438,7 @@ mod tests {
     fn route(out_amount: u64) -> SwapRoute {
         SwapRoute {
             out_amount,
+            slippage_bps: Some(50),
             instructions: vec![Instruction {
                 p: [7; 32],
                 a: vec![],
@@ -454,6 +485,28 @@ mod tests {
         Silent,
         /// Answer the first request on each connection, then drop the connection.
         AnswerOnceThenDrop,
+        /// Answer with an update of prebuilt-transaction routes first, then one with instructions.
+        PrebuiltFirst,
+        /// Reject every request with a server error.
+        Reject,
+        /// Start the stream, then end it with an error instead of quoting.
+        EndWithError,
+    }
+
+    fn prebuilt(out_amount: u64) -> SwapRoute {
+        SwapRoute {
+            instructions: vec![],
+            ..route(out_amount)
+        }
+    }
+
+    fn quotes(stream_id: u32, route: SwapRoute) -> ServerMessage {
+        ServerMessage::StreamData(StreamData {
+            id: stream_id,
+            payload: StreamDataPayload::SwapQuotes(SwapQuotes {
+                quotes: HashMap::from([("mock".to_string(), route)]),
+            }),
+        })
     }
 
     /// A local Titan stand-in. Returns its `ws://` endpoint and a counter of connections.
@@ -469,6 +522,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     // Agree to the subprotocol like Titan does, or the client rejects the handshake.
+                    #[allow(clippy::result_large_err)]
                     let mut ws = accept_hdr_async(tcp, |_req: &Request, mut resp: Response| {
                         resp.headers_mut().insert(
                             "Sec-WebSocket-Protocol",
@@ -490,6 +544,16 @@ mod tests {
                         };
                         match behaviour {
                             Behaviour::Silent => continue,
+                            Behaviour::Reject => {
+                                ws.send(encode(&ServerMessage::Error(ResponseError {
+                                    request_id: request.id,
+                                    code: 400,
+                                    message: "bad request".to_string(),
+                                })))
+                                .await
+                                .unwrap();
+                                continue;
+                            }
                             Behaviour::Answer => {
                                 // Hold requests in pairs and answer the later one first, so a
                                 // client that reads replies in send order would mix them up.
@@ -498,7 +562,7 @@ mod tests {
                                     continue;
                                 }
                             }
-                            Behaviour::AnswerOnceThenDrop => held.push(request),
+                            _ => held.push(request),
                         }
                         for request in held.drain(..).rev() {
                             let RequestData::NewSwapQuoteStream(quote) = &request.data else {
@@ -515,17 +579,23 @@ mod tests {
                             })))
                             .await
                             .unwrap();
-                            ws.send(encode(&ServerMessage::StreamData(StreamData {
-                                id: stream_id,
-                                payload: StreamDataPayload::SwapQuotes(SwapQuotes {
-                                    quotes: HashMap::from([(
-                                        "mock".to_string(),
-                                        route(quote.swap.amount * 2),
-                                    )]),
-                                }),
-                            })))
-                            .await
-                            .unwrap();
+                            let amount = quote.swap.amount;
+                            let updates = match behaviour {
+                                Behaviour::EndWithError => {
+                                    vec![ServerMessage::StreamEnd(StreamEnd {
+                                        id: stream_id,
+                                        error_message: Some("no routes".to_string()),
+                                    })]
+                                }
+                                Behaviour::PrebuiltFirst => vec![
+                                    quotes(stream_id, prebuilt(amount * 3)),
+                                    quotes(stream_id, route(amount * 2)),
+                                ],
+                                _ => vec![quotes(stream_id, route(amount * 2))],
+                            };
+                            for update in &updates {
+                                ws.send(encode(update)).await.unwrap();
+                            }
                         }
                         if matches!(behaviour, Behaviour::AnswerOnceThenDrop) {
                             let _ = ws.close(None).await;
@@ -550,8 +620,8 @@ mod tests {
 
         for round in 0..20u64 {
             let (a, b) = tokio::join!(
-                client.request_swap_quotes(quote_request(1_000 + round)),
-                client.request_swap_quotes(quote_request(5_000 + round)),
+                client.request_best_route(quote_request(1_000 + round), &|_| Ok(())),
+                client.request_best_route(quote_request(5_000 + round), &|_| Ok(())),
             );
             assert_eq!(a.unwrap().1.out_amount, (1_000 + round) * 2);
             assert_eq!(b.unwrap().1.out_amount, (5_000 + round) * 2);
@@ -565,15 +635,80 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = client
-            .request_swap_quotes(quote_request(1))
+            .request_best_route(quote_request(1), &|_| Ok(()))
             .await
             .unwrap_err();
         assert!(error.contains("timed out"), "{}", error);
         assert!(started.elapsed() < Duration::from_secs(2));
 
         // The timed-out connection is retired: the next request opens a fresh one.
-        let _ = client.request_swap_quotes(quote_request(1)).await;
+        let _ = client
+            .request_best_route(quote_request(1), &|_| Ok(()))
+            .await;
         assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_update_of_prebuilt_routes_is_skipped_until_one_has_instructions() {
+        let (endpoint, _) = mock_titan(Behaviour::PrebuiltFirst).await;
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_secs(5));
+        let (_, route) = client
+            .request_best_route(quote_request(100), &|_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(route.out_amount, 200);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_request_is_an_error() {
+        let (endpoint, _) = mock_titan(Behaviour::Reject).await;
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_secs(5));
+        let error = client
+            .request_best_route(quote_request(1), &|_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Server error: bad request (code 400)");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_before_quoting_is_an_error() {
+        let (endpoint, _) = mock_titan(Behaviour::EndWithError).await;
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_secs(5));
+        let error = client
+            .request_best_route(quote_request(1), &|_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Stream ended with error: no routes");
+    }
+
+    fn routes(out_amounts: &[(&str, u64)]) -> Vec<(String, SwapRoute)> {
+        out_amounts
+            .iter()
+            .map(|(provider, out_amount)| (provider.to_string(), route(*out_amount)))
+            .collect()
+    }
+
+    #[test]
+    fn the_best_route_is_the_best_one_eligible() {
+        let eligible = |route: &SwapRoute| match route.out_amount {
+            300 => Err("calls program X".to_string()),
+            _ => Ok(()),
+        };
+        let (provider, best) =
+            best_route(routes(&[("a", 100), ("b", 300), ("c", 200)]), &eligible).unwrap();
+        assert_eq!((provider.as_str(), best.out_amount), ("c", 200));
+    }
+
+    #[test]
+    fn an_update_with_no_eligible_route_says_why() {
+        let error = best_route(routes(&[("a", 100), ("b", 300)]), &|_| {
+            Err("adds 70 accounts".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "No route fits (a: adds 70 accounts; b: adds 70 accounts)"
+        );
     }
 
     #[tokio::test]
@@ -583,7 +718,7 @@ mod tests {
 
         for amount in [10, 20, 30] {
             let (_, route) = client
-                .request_swap_quotes(quote_request(amount))
+                .request_best_route(quote_request(amount), &|_| Ok(()))
                 .await
                 .unwrap();
             assert_eq!(route.out_amount, amount * 2);
