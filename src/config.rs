@@ -125,6 +125,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn urls_are_reduced_to_scheme_and_host() {
+        assert_eq!(
+            redact_url("https://rpc.example.com"),
+            "https://rpc.example.com"
+        );
+        assert_eq!(
+            redact_url("https://rpc.example.com/token"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(
+            redact_url("https://rpc.example.com?api-key=x"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(
+            redact_url("https://user:secret@rpc.example.com/x"),
+            "https://rpc.example.com/…"
+        );
+        assert_eq!(redact_url("rpc.example.com/token"), "rpc.example.com/…");
+    }
+
+    #[test]
     fn debug_output_hides_credentials() {
         let config = ClientConfig {
             rpc_url: "https://rpc.example.com/secret-rpc-token".to_string(),

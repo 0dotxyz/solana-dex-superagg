@@ -87,6 +87,8 @@ venue in `DexSuperAggClient::new`. `quote` quotes at the request's slippage and
 ## Testing
 
 ```sh
+# Unit tests need no network: the client is exercised against mock venues and a mock RPC, the
+# Titan client against a local WebSocket server, and the HTTP venues' parsing against fixtures.
 cargo test
 # Builds and simulates a 1 USDC → wSOL swap on each configured venue, as a transaction and as
 # sized and fixed instructions (nothing is sent):

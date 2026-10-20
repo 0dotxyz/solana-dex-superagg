@@ -485,6 +485,28 @@ mod tests {
         Silent,
         /// Answer the first request on each connection, then drop the connection.
         AnswerOnceThenDrop,
+        /// Answer with an update of prebuilt-transaction routes first, then one with instructions.
+        PrebuiltFirst,
+        /// Reject every request with a server error.
+        Reject,
+        /// Start the stream, then end it with an error instead of quoting.
+        EndWithError,
+    }
+
+    fn prebuilt(out_amount: u64) -> SwapRoute {
+        SwapRoute {
+            instructions: vec![],
+            ..route(out_amount)
+        }
+    }
+
+    fn quotes(stream_id: u32, route: SwapRoute) -> ServerMessage {
+        ServerMessage::StreamData(StreamData {
+            id: stream_id,
+            payload: StreamDataPayload::SwapQuotes(SwapQuotes {
+                quotes: HashMap::from([("mock".to_string(), route)]),
+            }),
+        })
     }
 
     /// A local Titan stand-in. Returns its `ws://` endpoint and a counter of connections.
@@ -522,6 +544,16 @@ mod tests {
                         };
                         match behaviour {
                             Behaviour::Silent => continue,
+                            Behaviour::Reject => {
+                                ws.send(encode(&ServerMessage::Error(ResponseError {
+                                    request_id: request.id,
+                                    code: 400,
+                                    message: "bad request".to_string(),
+                                })))
+                                .await
+                                .unwrap();
+                                continue;
+                            }
                             Behaviour::Answer => {
                                 // Hold requests in pairs and answer the later one first, so a
                                 // client that reads replies in send order would mix them up.
@@ -530,7 +562,7 @@ mod tests {
                                     continue;
                                 }
                             }
-                            Behaviour::AnswerOnceThenDrop => held.push(request),
+                            _ => held.push(request),
                         }
                         for request in held.drain(..).rev() {
                             let RequestData::NewSwapQuoteStream(quote) = &request.data else {
@@ -547,17 +579,23 @@ mod tests {
                             })))
                             .await
                             .unwrap();
-                            ws.send(encode(&ServerMessage::StreamData(StreamData {
-                                id: stream_id,
-                                payload: StreamDataPayload::SwapQuotes(SwapQuotes {
-                                    quotes: HashMap::from([(
-                                        "mock".to_string(),
-                                        route(quote.swap.amount * 2),
-                                    )]),
-                                }),
-                            })))
-                            .await
-                            .unwrap();
+                            let amount = quote.swap.amount;
+                            let updates = match behaviour {
+                                Behaviour::EndWithError => {
+                                    vec![ServerMessage::StreamEnd(StreamEnd {
+                                        id: stream_id,
+                                        error_message: Some("no routes".to_string()),
+                                    })]
+                                }
+                                Behaviour::PrebuiltFirst => vec![
+                                    quotes(stream_id, prebuilt(amount * 3)),
+                                    quotes(stream_id, route(amount * 2)),
+                                ],
+                                _ => vec![quotes(stream_id, route(amount * 2))],
+                            };
+                            for update in &updates {
+                                ws.send(encode(update)).await.unwrap();
+                            }
                         }
                         if matches!(behaviour, Behaviour::AnswerOnceThenDrop) {
                             let _ = ws.close(None).await;
@@ -608,6 +646,39 @@ mod tests {
             .request_best_route(quote_request(1), &|_| Ok(()))
             .await;
         assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_update_of_prebuilt_routes_is_skipped_until_one_has_instructions() {
+        let (endpoint, _) = mock_titan(Behaviour::PrebuiltFirst).await;
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_secs(5));
+        let (_, route) = client
+            .request_best_route(quote_request(100), &|_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(route.out_amount, 200);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_request_is_an_error() {
+        let (endpoint, _) = mock_titan(Behaviour::Reject).await;
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_secs(5));
+        let error = client
+            .request_best_route(quote_request(1), &|_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Server error: bad request (code 400)");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_before_quoting_is_an_error() {
+        let (endpoint, _) = mock_titan(Behaviour::EndWithError).await;
+        let client = TitanClient::new(endpoint, String::new(), Duration::from_secs(5));
+        let error = client
+            .request_best_route(quote_request(1), &|_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Stream ended with error: no routes");
     }
 
     fn routes(out_amounts: &[(&str, u64)]) -> Vec<(String, SwapRoute)> {

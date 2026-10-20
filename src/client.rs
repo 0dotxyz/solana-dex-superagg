@@ -15,8 +15,8 @@ use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use std::time::Duration;
+use tokio::time::{timeout, Instant};
 
 const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -221,13 +221,26 @@ impl DexSuperAggClient {
         if venues.is_empty() {
             bail!("No DEX aggregator is configured");
         }
-
-        Ok(Self {
+        Ok(Self::with_venues(
             rpc_client,
             config,
-            user: signer.pubkey(),
+            signer.pubkey(),
             venues,
-        })
+        ))
+    }
+
+    fn with_venues(
+        rpc_client: Arc<RpcClient>,
+        config: ClientConfig,
+        user: Pubkey,
+        venues: Vec<Box<dyn DexAggregator>>,
+    ) -> Self {
+        Self {
+            rpc_client,
+            config,
+            user,
+            venues,
+        }
     }
 
     fn venue(&self, aggregator: Aggregator) -> Result<&dyn DexAggregator> {
@@ -598,6 +611,13 @@ impl DexSuperAggClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregators::{QuotePayload, Route};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use solana_client::rpc_request::RpcRequest;
+    use solana_instruction::AccountMeta;
+    use solana_rpc_client::mock_sender::MocksMap;
+    use std::sync::Mutex;
 
     #[test]
     fn sizing_aims_at_half_the_tolerance_above_min_out() {
@@ -629,5 +649,510 @@ mod tests {
         assert!(within_tolerance(1_000_500, 1_000_000));
         assert!(!within_tolerance(1_000_501, 1_000_000));
         assert!(!within_tolerance(999_999, 1_000_000));
+    }
+
+    #[test]
+    fn a_swap_needs_two_mints_and_an_amount() {
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        assert!(check_swap(&a, &b, 1).is_ok());
+        assert!(check_swap(&a, &a, 1).is_err());
+        assert!(check_swap(&a, &b, 0).is_err());
+    }
+
+    const PROGRAM: Pubkey = Pubkey::new_from_array([7; 32]);
+
+    /// A venue that guarantees `prices[n] / 10_000` of the input on its n-th quote (the last price
+    /// repeats), or fails as told. Its route is one instruction of `program` with `accounts`
+    /// accounts.
+    struct MockVenue {
+        kind: Aggregator,
+        prices: Vec<u64>,
+        quote_error: Option<&'static str>,
+        quote_delay: Duration,
+        build_error: Option<&'static str>,
+        build_delay: Duration,
+        program: Pubkey,
+        accounts: usize,
+        quoted: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl MockVenue {
+        fn new(kind: Aggregator, price_bps: u64) -> Self {
+            Self {
+                kind,
+                prices: vec![price_bps],
+                quote_error: None,
+                quote_delay: Duration::ZERO,
+                build_error: None,
+                build_delay: Duration::ZERO,
+                program: PROGRAM,
+                accounts: 2,
+                quoted: Arc::default(),
+            }
+        }
+
+        async fn build(&self) -> Result<()> {
+            tokio::time::sleep(self.build_delay).await;
+            match self.build_error {
+                Some(error) => bail!(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DexAggregator for MockVenue {
+        fn kind(&self) -> Aggregator {
+            self.kind
+        }
+
+        async fn quote(&self, _request: &RouteRequest, amount: u64) -> Result<Quote> {
+            let price = {
+                let mut quoted = self.quoted.lock().unwrap();
+                let price = self.prices[quoted.len().min(self.prices.len() - 1)];
+                quoted.push(amount);
+                price
+            };
+            tokio::time::sleep(self.quote_delay).await;
+            if let Some(error) = self.quote_error {
+                bail!(error);
+            }
+            Ok(Quote {
+                aggregator: self.kind,
+                min_out_amount: amount * price / 10_000,
+                payload: QuotePayload::Dflow(Box::new(Value::Null)),
+            })
+        }
+
+        async fn build_transaction(&self, _quote: &Quote) -> Result<VersionedTransaction> {
+            self.build().await?;
+            Ok(VersionedTransaction::default())
+        }
+
+        async fn build_instructions(
+            &self,
+            _request: &RouteRequest,
+            _quote: &Quote,
+        ) -> Result<Route> {
+            self.build().await?;
+            Ok(Route {
+                instructions: vec![Instruction {
+                    program_id: self.program,
+                    accounts: (0..self.accounts)
+                        .map(|_| AccountMeta::new(Pubkey::new_unique(), false))
+                        .collect(),
+                    data: vec![],
+                }],
+                address_lookup_tables: vec![],
+            })
+        }
+    }
+
+    fn client(venues: Vec<MockVenue>) -> DexSuperAggClient {
+        DexSuperAggClient::with_venues(
+            Arc::new(RpcClient::new_mock("succeeds".to_string())),
+            ClientConfig {
+                quote_timeout: Duration::from_millis(100),
+                build_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+            Pubkey::new_unique(),
+            venues
+                .into_iter()
+                .map(|venue| Box::new(venue) as Box<dyn DexAggregator>)
+                .collect(),
+        )
+    }
+
+    fn route_request(amount: u64, min_out: u64, sizing: Sizing) -> RouteRequest {
+        RouteRequest {
+            sizing,
+            allowed_programs: Some(vec![PROGRAM]),
+            ..RouteRequest::new(
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                amount,
+                min_out,
+                50,
+            )
+        }
+    }
+
+    const USDC: Pubkey = Pubkey::new_from_array([1; 32]);
+    const WSOL: Pubkey = Pubkey::new_from_array([2; 32]);
+
+    #[tokio::test]
+    async fn quotes_rank_by_guaranteed_output_and_configured_order_breaks_ties() {
+        let client = client(vec![
+            MockVenue::new(Aggregator::Jupiter, 9_800),
+            MockVenue::new(Aggregator::Titan, 9_900),
+            MockVenue::new(Aggregator::Dflow, 9_900),
+        ]);
+        let quotes = client.quote(USDC, WSOL, 1_000_000).await.unwrap();
+        assert_eq!(
+            quotes,
+            [
+                (Aggregator::Titan, 990_000),
+                (Aggregator::Dflow, 990_000),
+                (Aggregator::Jupiter, 980_000),
+            ]
+            .map(|(aggregator, min_out_amount)| VenueQuote {
+                aggregator,
+                min_out_amount
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_venue_that_fails_or_misses_the_deadline_is_left_out() {
+        let slow = MockVenue {
+            quote_delay: Duration::from_secs(1),
+            ..MockVenue::new(Aggregator::Jupiter, 9_900)
+        };
+        let broken = MockVenue {
+            quote_error: Some("rate limited"),
+            ..MockVenue::new(Aggregator::Titan, 9_900)
+        };
+        let client = client(vec![slow, broken, MockVenue::new(Aggregator::Dflow, 9_000)]);
+        let quotes = client.quote(USDC, WSOL, 1_000_000).await.unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].aggregator, Aggregator::Dflow);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_quote_at_all_reports_every_venue() {
+        let slow = MockVenue {
+            quote_delay: Duration::from_secs(1),
+            ..MockVenue::new(Aggregator::Jupiter, 9_900)
+        };
+        let broken = MockVenue {
+            quote_error: Some("rate limited"),
+            ..MockVenue::new(Aggregator::Titan, 9_900)
+        };
+        let error = client(vec![slow, broken])
+            .quote(USDC, WSOL, 1_000_000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Jupiter: timed out"), "{}", error);
+        assert!(error.contains("Titan: rate limited"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_is_built_on_the_best_venue_that_can_build() {
+        let best_but_broken = MockVenue {
+            build_error: Some("simulation failed"),
+            ..MockVenue::new(Aggregator::Jupiter, 9_900)
+        };
+        let client = client(vec![
+            best_but_broken,
+            MockVenue::new(Aggregator::Titan, 9_800),
+        ]);
+        let swap = client
+            .build_swap_transaction(USDC, WSOL, 1_000_000, 970_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            (swap.aggregator, swap.in_amount, swap.min_out_amount),
+            (Aggregator::Titan, 1_000_000, 980_000)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_venue_that_misses_the_build_deadline_is_passed_over() {
+        let slow = MockVenue {
+            build_delay: Duration::from_secs(1),
+            ..MockVenue::new(Aggregator::Jupiter, 9_900)
+        };
+        let client = client(vec![slow, MockVenue::new(Aggregator::Titan, 9_800)]);
+        let swap = client
+            .build_swap_transaction(USDC, WSOL, 1_000_000, 0)
+            .await
+            .unwrap();
+        assert_eq!(swap.aggregator, Aggregator::Titan);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_short_of_min_out_is_refused_before_building() {
+        let client = client(vec![MockVenue::new(Aggregator::Jupiter, 9_900)]);
+        let error = client
+            .build_swap_transaction(USDC, WSOL, 1_000_000, 995_000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("guarantees 990000"), "{}", error);
+        assert!(error.contains("short of the 995000"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn fixed_sizing_returns_every_covering_route_best_first() {
+        let client = client(vec![
+            MockVenue::new(Aggregator::Jupiter, 9_700),
+            MockVenue::new(Aggregator::Titan, 9_900),
+            MockVenue::new(Aggregator::Dflow, 9_800),
+        ]);
+        let routes = client
+            .build_swap_instructions(&route_request(1_000_000, 980_000, Sizing::Fixed))
+            .await
+            .unwrap();
+        let summary: Vec<_> = routes
+            .iter()
+            .map(|route| (route.aggregator, route.in_amount, route.min_out_amount))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Aggregator::Titan, 1_000_000, 990_000),
+                (Aggregator::Dflow, 1_000_000, 980_000)
+            ]
+        );
+        assert_eq!(routes[0].instructions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fixed_sizing_fails_when_no_route_covers_min_out() {
+        let client = client(vec![MockVenue::new(Aggregator::Jupiter, 9_700)]);
+        let error = client
+            .build_swap_instructions(&route_request(1_000_000, 980_000, Sizing::Fixed))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("No route pays 980000"), "{}", error);
+        assert!(error.contains("for at most 1000000"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn a_route_that_breaks_the_limits_is_dropped_after_building() {
+        let other_program = MockVenue {
+            program: Pubkey::new_unique(),
+            ..MockVenue::new(Aggregator::Jupiter, 9_900)
+        };
+        let too_many_accounts = MockVenue {
+            accounts: 70,
+            ..MockVenue::new(Aggregator::Titan, 9_900)
+        };
+        let client = client(vec![
+            other_program,
+            too_many_accounts,
+            MockVenue::new(Aggregator::Dflow, 9_800),
+        ]);
+        let routes = client
+            .build_swap_instructions(&route_request(1_000_000, 0, Sizing::Fixed))
+            .await
+            .unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].aggregator, Aggregator::Dflow);
+
+        let client = client_without_dflow();
+        let error = client
+            .build_swap_instructions(&route_request(1_000_000, 0, Sizing::Fixed))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("Could not build swap instructions on any venue"),
+            "{}",
+            error
+        );
+        assert!(error.contains("calls program"), "{}", error);
+        assert!(error.contains("adds 71 accounts"), "{}", error);
+    }
+
+    fn client_without_dflow() -> DexSuperAggClient {
+        client(vec![
+            MockVenue {
+                program: Pubkey::new_unique(),
+                ..MockVenue::new(Aggregator::Jupiter, 9_900)
+            },
+            MockVenue {
+                accounts: 70,
+                ..MockVenue::new(Aggregator::Titan, 9_900)
+            },
+        ])
+    }
+
+    /// Routes for `request` on one 1:1 venue, with the amounts it was asked to quote.
+    async fn sized(
+        venue: MockVenue,
+        request: RouteRequest,
+    ) -> (Result<Vec<SwapInstructions>>, Vec<u64>) {
+        let quoted = Arc::clone(&venue.quoted);
+        let routes = client(vec![venue]).build_swap_instructions(&request).await;
+        let quoted = quoted.lock().unwrap().clone();
+        (routes, quoted)
+    }
+
+    #[tokio::test]
+    async fn to_min_out_sizes_the_input_up_until_it_covers() {
+        let request = route_request(900_000, 1_000_000, Sizing::ToMinOut { max_in: 1_200_000 });
+        let (routes, quoted) = sized(MockVenue::new(Aggregator::Jupiter, 10_000), request).await;
+        assert_eq!(quoted, [900_000, 1_000_250]);
+        let route = &routes.unwrap()[0];
+        assert_eq!(
+            (route.in_amount, route.min_out_amount),
+            (1_000_250, 1_000_250)
+        );
+    }
+
+    #[tokio::test]
+    async fn to_min_out_sizes_the_input_down_when_it_overshoots() {
+        let request = route_request(1_100_000, 1_000_000, Sizing::ToMinOut { max_in: 1_200_000 });
+        let (routes, quoted) = sized(MockVenue::new(Aggregator::Jupiter, 10_000), request).await;
+        assert_eq!(quoted, [1_100_000, 1_000_250]);
+        assert_eq!(routes.unwrap()[0].in_amount, 1_000_250);
+    }
+
+    #[tokio::test]
+    async fn to_min_out_keeps_the_least_covering_input_when_it_cannot_get_tighter() {
+        // The price drops after the first quote: the input sized from it falls short, and the
+        // one that is then tight is larger than the first.
+        let venue = MockVenue {
+            prices: vec![10_000, 9_000],
+            ..MockVenue::new(Aggregator::Jupiter, 0)
+        };
+        let request = route_request(1_100_000, 1_000_000, Sizing::ToMinOut { max_in: 2_000_000 });
+        let (routes, quoted) = sized(venue, request).await;
+        assert_eq!(quoted, [1_100_000, 1_000_250, 1_111_389]);
+        assert_eq!(routes.unwrap()[0].in_amount, 1_100_000);
+    }
+
+    #[tokio::test]
+    async fn to_min_out_stops_after_the_quote_budget() {
+        // Every quote is worse than the last, so no input ever covers.
+        let venue = MockVenue {
+            prices: vec![9_000, 8_000, 7_000, 6_000, 5_000],
+            ..MockVenue::new(Aggregator::Jupiter, 0)
+        };
+        let request = route_request(1_000_000, 1_000_000, Sizing::ToMinOut { max_in: u64::MAX });
+        let (routes, quoted) = sized(venue, request).await;
+        assert_eq!(quoted.len(), SIZING_QUOTES);
+        assert!(routes.unwrap_err().to_string().starts_with("No route pays"));
+    }
+
+    #[tokio::test]
+    async fn to_min_out_gives_up_when_the_cap_cannot_cover() {
+        let request = route_request(900_000, 1_000_000, Sizing::ToMinOut { max_in: 950_000 });
+        let (routes, quoted) = sized(MockVenue::new(Aggregator::Jupiter, 10_000), request).await;
+        assert_eq!(quoted, [900_000, 950_000]);
+        let error = routes.unwrap_err().to_string();
+        assert!(error.contains("for at most 950000"), "{}", error);
+
+        let request = route_request(960_000, 1_000_000, Sizing::ToMinOut { max_in: 950_000 });
+        let (routes, quoted) = sized(MockVenue::new(Aggregator::Jupiter, 10_000), request).await;
+        assert!(quoted.is_empty());
+        let error = routes.unwrap_err().to_string();
+        assert!(error.contains("already exceeds the input cap"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn to_min_out_keeps_a_covering_input_when_a_later_quote_fails() {
+        let quoted = Arc::new(Mutex::new(Vec::new()));
+        let venue = MockVenue {
+            quoted: Arc::clone(&quoted),
+            ..MockVenue::new(Aggregator::Jupiter, 10_000)
+        };
+        // A second venue that only ever fails keeps the first quote round from failing as a
+        // whole; the covering round is kept when the next round has no quote at all.
+        let client = client(vec![venue]);
+        let request = route_request(1_100_000, 1_000_000, Sizing::ToMinOut { max_in: 1_200_000 });
+        let routes = client.build_swap_instructions(&request).await.unwrap();
+        assert_eq!(routes[0].in_amount, 1_000_250);
+        assert_eq!(quoted.lock().unwrap().len(), 2);
+    }
+
+    fn rpc(mocks: MocksMap) -> DexSuperAggClient {
+        DexSuperAggClient::with_venues(
+            Arc::new(RpcClient::new_mock_with_mocks_map("sig_not_found", mocks)),
+            ClientConfig {
+                confirm_timeout: Duration::from_secs(3),
+                ..Default::default()
+            },
+            Pubkey::new_unique(),
+            vec![],
+        )
+    }
+
+    fn status(value: Value) -> Value {
+        json!({ "context": { "slot": 1 }, "value": [value] })
+    }
+
+    fn transaction() -> VersionedTransaction {
+        VersionedTransaction {
+            signatures: vec![Signature::from([9; 64])],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transaction_is_confirmed_once_its_status_is_ok() {
+        let mut mocks = MocksMap::default();
+        mocks.insert(RpcRequest::GetSignatureStatuses, status(Value::Null));
+        mocks.insert(
+            RpcRequest::GetSignatureStatuses,
+            status(json!({
+                "slot": 1, "confirmations": 1, "confirmationStatus": "confirmed",
+                "status": { "Ok": null }, "err": null
+            })),
+        );
+        let signature = rpc(mocks)
+            .send_and_confirm(&transaction(), CommitmentLevel::Confirmed)
+            .await
+            .unwrap();
+        assert_eq!(signature, Signature::from([9; 64]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_transaction_is_an_error() {
+        let mut mocks = MocksMap::default();
+        mocks.insert(
+            RpcRequest::GetSignatureStatuses,
+            status(json!({
+                "slot": 1, "confirmations": 1, "confirmationStatus": "confirmed",
+                "status": { "Err": "AccountInUse" }, "err": "AccountInUse"
+            })),
+        );
+        let error = rpc(mocks)
+            .send_and_confirm(&transaction(), CommitmentLevel::Confirmed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed: Account in use"), "{}", error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_blockhash_ends_the_wait() {
+        let mut mocks = MocksMap::default();
+        for _ in 0..REBROADCAST_EVERY_POLLS + 1 {
+            mocks.insert(RpcRequest::GetSignatureStatuses, status(Value::Null));
+        }
+        mocks.insert(
+            RpcRequest::IsBlockhashValid,
+            json!({ "context": { "slot": 1 }, "value": false }),
+        );
+        let error = rpc(mocks)
+            .send_and_confirm(&transaction(), CommitmentLevel::Confirmed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expired without landing"), "{}", error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unconfirmed_transaction_times_out() {
+        let mut mocks = MocksMap::default();
+        for _ in 0..20 {
+            mocks.insert(RpcRequest::GetSignatureStatuses, status(Value::Null));
+        }
+        mocks.insert(
+            RpcRequest::IsBlockhashValid,
+            json!({ "context": { "slot": 1 }, "value": true }),
+        );
+        let error = rpc(mocks)
+            .send_and_confirm(&transaction(), CommitmentLevel::Confirmed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Timed out waiting"), "{}", error);
     }
 }

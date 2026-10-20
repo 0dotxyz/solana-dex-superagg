@@ -10,11 +10,11 @@ src/
 ├── lib.rs
 ├── config.rs                       # ClientConfig, venue configs
 ├── json.rs                         # parsers for the HTTP venues' JSON (amounts, pubkeys, instructions)
-├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, build_swap_instructions, send_and_confirm
+├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, build_swap_instructions, send_and_confirm (+ mock-venue and mock-RPC tests)
 └── aggregators/
-    ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload, Route, misfit
-    ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected; maxAccounts + /swap-instructions for routes)
-    ├── dflow/mod.rs                # DFlow HTTP API (quote JSON passed back to /swap unchanged; /swap-instructions for routes)
+    ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload, Route, misfit, sign_transaction
+    ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected; maxAccounts + /swap-instructions for routes); response handling is pure and unit-tested
+    ├── dflow/mod.rs                # DFlow HTTP API (quote JSON passed back to /swap unchanged; /swap-instructions for routes); request body and response handling are pure and unit-tested
     └── titan/
         ├── mod.rs                  # Titan venue: quote params (outputWsol), build, route instructions
         ├── client.rs               # WebSocket client: id routing, deadlines, reconnect, route filter (+ mock-server tests)

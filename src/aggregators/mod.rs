@@ -9,6 +9,7 @@ use crate::config::Aggregator;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use solana_instruction::Instruction;
+use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 use std::collections::HashSet;
@@ -62,6 +63,7 @@ impl Quote {
 }
 
 /// A quoted route as instructions, for the caller's own transaction.
+#[derive(Debug)]
 pub(crate) struct Route {
     /// The swap instructions, plus any token accounts the route creates for itself. No compute
     /// budget and no wrapping or unwrapping.
@@ -115,11 +117,63 @@ pub(crate) fn misfit(instructions: &[Instruction], request: &RouteRequest) -> Op
     })
 }
 
+/// Signs the serialized transaction a venue built for `signer`.
+pub(crate) fn sign_transaction(
+    bytes: &[u8],
+    signer: &Keypair,
+    venue: Aggregator,
+) -> Result<VersionedTransaction> {
+    let tx = bincode::deserialize::<VersionedTransaction>(bytes)
+        .map_err(|e| anyhow!("Failed to deserialize {:?} transaction: {}", venue, e))?;
+    VersionedTransaction::try_new(tx.message, &[signer])
+        .map_err(|e| anyhow!("Failed to sign {:?} transaction: {}", venue, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::Sizing;
     use solana_instruction::AccountMeta;
+    use solana_message::{Message, VersionedMessage};
+    use solana_signer::Signer;
+
+    #[test]
+    fn a_venue_transaction_is_signed_for_its_fee_payer() {
+        let signer = Keypair::new();
+        let unsigned = VersionedTransaction {
+            signatures: vec![Default::default()],
+            message: VersionedMessage::Legacy(Message::new(
+                &[instruction(Pubkey::new_unique(), &[])],
+                Some(&signer.pubkey()),
+            )),
+        };
+        let bytes = bincode::serialize(&unsigned).unwrap();
+
+        let signed = sign_transaction(&bytes, &signer, Aggregator::Dflow).unwrap();
+        assert_eq!(signed.message, unsigned.message);
+        assert_eq!(
+            signed.signatures,
+            [signer.sign_message(&signed.message.serialize())]
+        );
+
+        let error = sign_transaction(&bytes, &Keypair::new(), Aggregator::Dflow).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to sign Dflow transaction"),
+            "{}",
+            error
+        );
+        let error =
+            sign_transaction(b"not a transaction", &signer, Aggregator::Jupiter).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to deserialize Jupiter transaction"),
+            "{}",
+            error
+        );
+    }
 
     fn instruction(program: Pubkey, accounts: &[Pubkey]) -> Instruction {
         Instruction {

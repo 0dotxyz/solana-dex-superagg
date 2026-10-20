@@ -186,5 +186,27 @@ mod tests {
         assert_eq!(min_out(1_000_000, 50), 995_000);
         assert_eq!(min_out(999, 50), 994);
         assert_eq!(min_out(1_000, 0), 1_000);
+        assert_eq!(min_out(1_000, 10_000), 0);
+        assert_eq!(min_out(1_000, u16::MAX), 0);
+    }
+
+    #[test]
+    fn an_expired_route_is_not_built() {
+        let route = |expires_at_ms| SwapRoute {
+            out_amount: 1,
+            slippage_bps: None,
+            instructions: vec![],
+            address_lookup_tables: vec![],
+            expires_at_ms,
+            compute_units: None,
+            compute_units_safe: None,
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(ensure_unexpired(&route(None)).is_ok());
+        assert!(ensure_unexpired(&route(Some(now_ms + 60_000))).is_ok());
+        assert!(ensure_unexpired(&route(Some(now_ms - 1))).is_err());
     }
 }
