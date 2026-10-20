@@ -221,14 +221,15 @@ impl DexSuperAggClient {
         if venues.is_empty() {
             bail!("No DEX aggregator is configured");
         }
-        Ok(Self::with_venues(
+        Ok(Self {
             rpc_client,
             config,
-            signer.pubkey(),
+            user: signer.pubkey(),
             venues,
-        ))
+        })
     }
 
+    #[cfg(test)]
     fn with_venues(
         rpc_client: Arc<RpcClient>,
         config: ClientConfig,
@@ -668,6 +669,8 @@ mod tests {
         kind: Aggregator,
         prices: Vec<u64>,
         quote_error: Option<&'static str>,
+        /// Fail every quote after this many.
+        quotes_before_failing: usize,
         quote_delay: Duration,
         build_error: Option<&'static str>,
         build_delay: Duration,
@@ -682,6 +685,7 @@ mod tests {
                 kind,
                 prices: vec![price_bps],
                 quote_error: None,
+                quotes_before_failing: usize::MAX,
                 quote_delay: Duration::ZERO,
                 build_error: None,
                 build_delay: Duration::ZERO,
@@ -707,15 +711,19 @@ mod tests {
         }
 
         async fn quote(&self, _request: &RouteRequest, amount: u64) -> Result<Quote> {
-            let price = {
+            let (price, failing) = {
                 let mut quoted = self.quoted.lock().unwrap();
                 let price = self.prices[quoted.len().min(self.prices.len() - 1)];
+                let failing = quoted.len() >= self.quotes_before_failing;
                 quoted.push(amount);
-                price
+                (price, failing)
             };
             tokio::time::sleep(self.quote_delay).await;
             if let Some(error) = self.quote_error {
                 bail!(error);
+            }
+            if failing {
+                bail!("venue down");
             }
             Ok(Quote {
                 aggregator: self.kind,
@@ -932,35 +940,18 @@ mod tests {
             accounts: 70,
             ..MockVenue::new(Aggregator::Titan, 9_900)
         };
-        let client = client(vec![
+        let routes = client(vec![
             other_program,
             too_many_accounts,
             MockVenue::new(Aggregator::Dflow, 9_800),
-        ]);
-        let routes = client
-            .build_swap_instructions(&route_request(1_000_000, 0, Sizing::Fixed))
-            .await
-            .unwrap();
+        ])
+        .build_swap_instructions(&route_request(1_000_000, 0, Sizing::Fixed))
+        .await
+        .unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].aggregator, Aggregator::Dflow);
 
-        let client = client_without_dflow();
-        let error = client
-            .build_swap_instructions(&route_request(1_000_000, 0, Sizing::Fixed))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.starts_with("Could not build swap instructions on any venue"),
-            "{}",
-            error
-        );
-        assert!(error.contains("calls program"), "{}", error);
-        assert!(error.contains("adds 71 accounts"), "{}", error);
-    }
-
-    fn client_without_dflow() -> DexSuperAggClient {
-        client(vec![
+        let error = client(vec![
             MockVenue {
                 program: Pubkey::new_unique(),
                 ..MockVenue::new(Aggregator::Jupiter, 9_900)
@@ -970,6 +961,17 @@ mod tests {
                 ..MockVenue::new(Aggregator::Titan, 9_900)
             },
         ])
+        .build_swap_instructions(&route_request(1_000_000, 0, Sizing::Fixed))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("Could not build swap instructions on any venue"),
+            "{}",
+            error
+        );
+        assert!(error.contains("calls program"), "{}", error);
+        assert!(error.contains("adds 71 accounts"), "{}", error);
     }
 
     /// Routes for `request` on one 1:1 venue, with the amounts it was asked to quote.
@@ -1047,18 +1049,14 @@ mod tests {
 
     #[tokio::test]
     async fn to_min_out_keeps_a_covering_input_when_a_later_quote_fails() {
-        let quoted = Arc::new(Mutex::new(Vec::new()));
         let venue = MockVenue {
-            quoted: Arc::clone(&quoted),
+            quotes_before_failing: 1,
             ..MockVenue::new(Aggregator::Jupiter, 10_000)
         };
-        // A second venue that only ever fails keeps the first quote round from failing as a
-        // whole; the covering round is kept when the next round has no quote at all.
-        let client = client(vec![venue]);
         let request = route_request(1_100_000, 1_000_000, Sizing::ToMinOut { max_in: 1_200_000 });
-        let routes = client.build_swap_instructions(&request).await.unwrap();
-        assert_eq!(routes[0].in_amount, 1_000_250);
-        assert_eq!(quoted.lock().unwrap().len(), 2);
+        let (routes, quoted) = sized(venue, request).await;
+        assert_eq!(quoted, [1_100_000, 1_000_250]);
+        assert_eq!(routes.unwrap()[0].in_amount, 1_100_000);
     }
 
     fn rpc(mocks: MocksMap) -> DexSuperAggClient {
