@@ -3,12 +3,14 @@ use crate::client::RouteRequest;
 use crate::config::{Aggregator, ClientConfig, JupiterConfig};
 use anyhow::{anyhow, Result};
 use jupiter_swap_api_client::{
-    quote::QuoteRequest,
+    quote::{QuoteRequest, QuoteResponse},
+    route_plan_with_metadata::RoutePlanStep,
     swap::{SwapInstructionsResponse, SwapRequest},
     transaction_config::{ComputeUnitPriceMicroLamports, TransactionConfig},
     JupiterSwapApiClient,
 };
 use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
@@ -106,10 +108,7 @@ impl DexAggregator for JupiterAggregator {
             .swap_instructions(&SwapRequest {
                 user_public_key: request.user.to_bytes().into(),
                 quote_response: quote_response.clone(),
-                config: TransactionConfig {
-                    wrap_and_unwrap_sol: false,
-                    ..Default::default()
-                },
+                config: instructions_config(quote_response),
             })
             .await
             .map_err(|e| anyhow!("Jupiter swap instructions failed: {}", e))?;
@@ -117,13 +116,31 @@ impl DexAggregator for JupiterAggregator {
     }
 }
 
-/// Jupiter's limit counts every account of the route, including those the transaction already
-/// has, and allows at most 64.
+/// Settings for a route handed out as instructions. A route through a third mint hops through
+/// Jupiter's shared token accounts, so it touches no user token account of that mint.
+fn instructions_config(quote: &QuoteResponse) -> TransactionConfig {
+    TransactionConfig {
+        wrap_and_unwrap_sol: false,
+        use_shared_accounts: Some(through_a_third_mint(
+            quote.input_mint,
+            quote.output_mint,
+            &quote.route_plan,
+        )),
+        ..Default::default()
+    }
+}
+
+/// Whether some step of the route swaps from or into a mint other than `input` and `output`.
+fn through_a_third_mint(input: Pubkey, output: Pubkey, route_plan: &[RoutePlanStep]) -> bool {
+    route_plan
+        .iter()
+        .flat_map(|step| [step.swap_info.input_mint, step.swap_info.output_mint])
+        .any(|mint| mint != input && mint != output)
+}
+
+/// Jupiter's limit counts every account of the route and allows at most 64.
 fn max_accounts(request: &RouteRequest) -> usize {
-    request
-        .max_accounts
-        .saturating_add(request.transaction_accounts.len())
-        .min(64)
+    request.max_accounts.min(64)
 }
 
 /// The route in a `/swap-instructions` response. We never ask for wSOL unwrapping (cleanup) or a
@@ -147,11 +164,11 @@ fn route(response: SwapInstructionsResponse) -> Result<Route> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jupiter_swap_api_client::route_plan_with_metadata::SwapInfo;
     use solana_instruction::Instruction;
-    use solana_pubkey::Pubkey;
 
     #[test]
-    fn the_account_limit_is_gross_and_at_most_64() {
+    fn the_account_limit_is_the_requests_max_accounts_and_at_most_64() {
         let mut request = RouteRequest::new(
             Pubkey::new_unique(),
             Pubkey::new_unique(),
@@ -162,11 +179,46 @@ mod tests {
         );
         request.max_accounts = 30;
         request.transaction_accounts = vec![Pubkey::new_unique(); 10];
-        assert_eq!(max_accounts(&request), 40);
-        request.max_accounts = 60;
-        assert_eq!(max_accounts(&request), 64);
+        assert_eq!(max_accounts(&request), 30);
         request.max_accounts = usize::MAX;
         assert_eq!(max_accounts(&request), 64);
+    }
+
+    fn step(input_mint: Pubkey, output_mint: Pubkey) -> RoutePlanStep {
+        RoutePlanStep {
+            swap_info: SwapInfo {
+                input_mint,
+                output_mint,
+                ..Default::default()
+            },
+            percent: 100,
+            bps: None,
+        }
+    }
+
+    #[test]
+    fn only_a_route_through_a_third_mint_hops_through_shared_accounts() {
+        let (usdc, sol, msol) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        assert!(!through_a_third_mint(usdc, sol, &[step(usdc, sol)]));
+        assert!(!through_a_third_mint(
+            usdc,
+            sol,
+            &[step(usdc, sol), step(usdc, sol)]
+        ));
+        assert!(through_a_third_mint(
+            usdc,
+            msol,
+            &[step(usdc, sol), step(sol, msol)]
+        ));
+        assert!(through_a_third_mint(
+            usdc,
+            sol,
+            &[step(usdc, sol), step(usdc, msol), step(msol, sol)]
+        ));
     }
 
     fn instruction(program: Pubkey) -> Instruction {
