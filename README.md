@@ -68,11 +68,12 @@ let routes = client
   caller's transaction already references, and its top-level instructions may call only
   `allowed_programs` (the programs those call in turn are not checked). Jupiter is quoted with
   `maxAccounts`; any route that breaks a limit is left out.
-- **The route alone**: built for `user`, with no compute budget, wrapping or closing; a multi-hop
-  route may create its intermediate token accounts (ATA program, so allow it). The user's token
-  accounts for both mints must exist. The venue does not simulate here, since the input may only
-  arrive earlier in the caller's transaction. The lookup tables are optional; a transaction may
-  list the accounts inline instead.
+- **The route alone**: built for `user`, with no compute budget, wrapping or closing. A Jupiter
+  route through a third mint hops through Jupiter's shared token accounts; another venue's
+  multi-hop route may create its intermediate token accounts (ATA program, so allow it). The
+  user's token accounts for both mints must exist. The venue does not simulate here, since the
+  input may only arrive earlier in the caller's transaction. The lookup tables are optional; a
+  transaction may list the accounts inline instead.
 - Every route that covers `min_out` is returned, so a caller can fall back to the next.
 
 ## Adding a venue

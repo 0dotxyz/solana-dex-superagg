@@ -13,7 +13,7 @@ src/
 ├── client.rs                       # DexSuperAggClient: parallel quotes, build_best, min-out, build_swap_instructions, send_and_confirm (+ mock-venue and mock-RPC tests)
 └── aggregators/
     ├── mod.rs                      # DexAggregator trait, Quote/QuotePayload, Route, misfit, sign_transaction
-    ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected; maxAccounts + /swap-instructions for routes); response handling is pure and unit-tested
+    ├── jupiter/mod.rs              # Jupiter HTTP API (dynamicComputeUnitLimit, simulation errors rejected; maxAccounts + /swap-instructions for routes, with shared accounts through a third mint); response handling is pure and unit-tested
     ├── dflow/mod.rs                # DFlow HTTP API (quote JSON passed back to /swap unchanged; /swap-instructions for routes); request body and response handling are pure and unit-tested
     └── titan/
         ├── mod.rs                  # Titan venue: quote params (outputWsol), build, route instructions
