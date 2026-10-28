@@ -138,9 +138,45 @@ fn through_a_third_mint(input: Pubkey, output: Pubkey, route_plan: &[RoutePlanSt
         .any(|mint| mint != input && mint != output)
 }
 
-/// Jupiter's limit counts every account of the route and allows at most 64.
+const JUPITER: Pubkey = solana_pubkey::pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
+const ASSOCIATED_TOKEN_PROGRAM: Pubkey =
+    solana_pubkey::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const TOKEN_PROGRAMS: [Pubkey; 2] = [
+    solana_pubkey::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+    solana_pubkey::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
+];
+
+/// Jupiter's limit counts every account of the route and allows at most 64: the caller's room
+/// plus the accounts of its transaction that the route is sure to list.
 fn max_accounts(request: &RouteRequest) -> usize {
-    request.max_accounts.min(64)
+    let reused = always_listed(request)
+        .filter(|account| request.transaction_accounts.contains(account))
+        .count();
+    request.max_accounts.saturating_add(reused).min(64)
+}
+
+/// Accounts both Jupiter swap instructions (`route` and `sharedAccountsRoute`) list: the user,
+/// the output mint, Jupiter's program and event authority, and the user's token accounts of both
+/// mints. A user token account in the transaction tells which token program owns its mint, and
+/// moving that mint lists the program too.
+fn always_listed(request: &RouteRequest) -> impl Iterator<Item = Pubkey> + '_ {
+    let event_authority = Pubkey::find_program_address(&[b"__event_authority"], &JUPITER).0;
+    let owned = TOKEN_PROGRAMS.into_iter().flat_map(move |program| {
+        let token_accounts = [request.input_mint, request.output_mint].map(|mint| {
+            Pubkey::find_program_address(
+                &[request.user.as_ref(), program.as_ref(), mint.as_ref()],
+                &ASSOCIATED_TOKEN_PROGRAM,
+            )
+            .0
+        });
+        let used = token_accounts
+            .iter()
+            .any(|account| request.transaction_accounts.contains(account));
+        token_accounts.into_iter().chain(used.then_some(program))
+    });
+    [request.user, request.output_mint, JUPITER, event_authority]
+        .into_iter()
+        .chain(owned)
 }
 
 /// The route in a `/swap-instructions` response. We never ask for wSOL unwrapping (cleanup) or a
@@ -167,19 +203,49 @@ mod tests {
     use jupiter_swap_api_client::route_plan_with_metadata::SwapInfo;
     use solana_instruction::Instruction;
 
+    fn token_account(owner: Pubkey, program: Pubkey, mint: Pubkey) -> Pubkey {
+        Pubkey::find_program_address(
+            &[owner.as_ref(), program.as_ref(), mint.as_ref()],
+            &ASSOCIATED_TOKEN_PROGRAM,
+        )
+        .0
+    }
+
     #[test]
-    fn the_account_limit_is_the_requests_max_accounts_and_at_most_64() {
-        let mut request = RouteRequest::new(
+    fn the_account_limit_adds_only_transaction_accounts_every_route_lists() {
+        let (user, input, output) = (
             Pubkey::new_unique(),
             Pubkey::new_unique(),
             Pubkey::new_unique(),
-            1,
-            0,
-            50,
         );
+        let [token, token_2022] = TOKEN_PROGRAMS;
+        let mut request = RouteRequest::new(user, input, output, 1, 0, 50);
         request.max_accounts = 30;
         request.transaction_accounts = vec![Pubkey::new_unique(); 10];
-        assert_eq!(max_accounts(&request), 30);
+        assert_eq!(max_accounts(&request), 30, "unrelated accounts add nothing");
+
+        request.transaction_accounts.extend([
+            user,
+            input,
+            output,
+            token_account(user, token, input),
+            token_account(user, token_2022, output),
+            token,
+            token_2022,
+        ]);
+        assert_eq!(
+            max_accounts(&request),
+            30 + 6,
+            "the input mint is not sure to be listed"
+        );
+
+        request.transaction_accounts = vec![user, token, token_2022];
+        assert_eq!(
+            max_accounts(&request),
+            31,
+            "a token program counts only with a user token account it owns"
+        );
+
         request.max_accounts = usize::MAX;
         assert_eq!(max_accounts(&request), 64);
     }
