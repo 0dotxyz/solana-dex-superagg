@@ -39,6 +39,9 @@ pub struct ClientConfig {
     pub compute_unit_price_micro_lamports: u64,
     /// Per-venue quote deadline; a venue that misses it is left out of the comparison.
     pub quote_timeout: Duration,
+    /// How long the other venues still get once one has returned a usable quote (one that
+    /// guarantees the requested minimum). `None` waits for every venue, up to `quote_timeout`.
+    pub quote_grace: Option<Duration>,
     /// Per-venue deadline for building a transaction from its quote.
     pub build_timeout: Duration,
     /// How long `send_and_confirm` waits for the transaction.
@@ -55,6 +58,7 @@ impl Default for ClientConfig {
             slippage_bps: 50,
             compute_unit_price_micro_lamports: 0,
             quote_timeout: Duration::from_secs(5),
+            quote_grace: None,
             build_timeout: Duration::from_secs(10),
             confirm_timeout: Duration::from_secs(90),
             jupiter: None,
@@ -87,6 +91,7 @@ impl fmt::Debug for ClientConfig {
                 &self.compute_unit_price_micro_lamports,
             )
             .field("quote_timeout", &self.quote_timeout)
+            .field("quote_grace", &self.quote_grace)
             .field("build_timeout", &self.build_timeout)
             .field("confirm_timeout", &self.confirm_timeout)
             .field("jupiter", &self.jupiter)

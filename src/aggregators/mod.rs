@@ -23,6 +23,9 @@ pub(crate) struct Quote {
     pub aggregator: Aggregator,
     /// Output the venue guarantees after slippage. The route fails on-chain below it.
     pub min_out_amount: u64,
+    /// Whether the request's limits (programs, accounts) were already checked on the route. A
+    /// venue that only learns its route when building can't tell yet whether it fits.
+    pub limits_checked: bool,
     pub payload: QuotePayload,
 }
 

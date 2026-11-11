@@ -167,6 +167,7 @@ impl DexAggregator for DflowAggregator {
             aggregator: Aggregator::Dflow,
             min_out_amount,
             // Passed back to `/swap` unchanged.
+            limits_checked: false,
             payload: QuotePayload::Dflow(Box::new(quote)),
         })
     }

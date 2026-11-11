@@ -22,13 +22,18 @@ client.send_and_confirm(&swap.transaction, CommitmentLevel::Confirmed).await?;
 ```
 
 - **Routing**: every configured venue is quoted in parallel (`quote_timeout` each); failures,
-  including rate limits, are logged and left out, so each extra venue is redundancy for free. The
-  quote with the most guaranteed output is built (`build_timeout`), falling back to the next if
-  its venue fails to build.
+  including rate limits, are logged and left out, so each extra venue is redundancy for free. With
+  `quote_grace` set, the other venues get only that long once one returns a quote that guarantees
+  the minimum on a route known to fit the request's limits, for callers who'd rather be fast than
+  wait for the slowest venue. Jupiter's v1 quote only shows its route when built, so under limits
+  it doesn't start the grace; Titan's does. The quote with the
+  most guaranteed output is built (`build_timeout`), falling back to the next if its venue fails to
+  build.
 - **Min-out**: `min_out` is checked against what the route guarantees at the configured slippage,
   not its expected output.
 - **wSOL** is an ordinary SPL token: swapped from/into the wallet's wSOL ATA (which must exist for a
-  wSOL input), never wrapped, unwrapped or closed.
+  wSOL input), never wrapped, unwrapped or closed. A Titan route that closes the wallet's wSOL
+  account (routes from other providers can, despite `outputWsol`) has that instruction removed.
 - **Titan**: one WebSocket shared by all callers, opened lazily; replies are routed by request and
   stream id, every request has a deadline, and a dropped or timed-out connection is replaced. Its
   routes get a compute budget (`computeUnitsSafe` limit plus the configured CU price).
@@ -67,7 +72,8 @@ let routes = client
 - **Limits**: a route may add at most `max_accounts` accounts beyond the `transaction_accounts` the
   caller's transaction already references, and its top-level instructions may call only
   `allowed_programs` (the programs those call in turn are not checked). Jupiter is quoted with
-  `maxAccounts`; any route that breaks a limit is left out.
+  `maxAccounts` a few accounts below the room, since its multi-hop routes overshoot it; any route
+  that breaks a limit is left out.
 - **The route alone**: built for `user`, with no compute budget, wrapping or closing. A Jupiter
   route through a third mint hops through Jupiter's shared token accounts; another venue's
   multi-hop route may create its intermediate token accounts (ATA program, so allow it). The

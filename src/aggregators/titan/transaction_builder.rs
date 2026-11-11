@@ -30,8 +30,41 @@ fn to_solana_instruction(instruction: &types::Instruction) -> Instruction {
     }
 }
 
+const TOKEN_PROGRAM: Pubkey = solana_pubkey::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM: Pubkey =
+    solana_pubkey::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const WSOL: Pubkey = solana_pubkey::pubkey!("So11111111111111111111111111111111111111112");
+/// SPL Token's `CloseAccount`.
+const CLOSE_ACCOUNT: u8 = 9;
+
+/// The route's instructions, without any that closes a wallet's wSOL token account. Titan is
+/// asked to keep the output as wSOL (`outputWsol`), but routes it gets from another provider can
+/// still create the wSOL account, swap into it and close it, leaving native SOL and no wSOL account
+/// for whatever needs it next. Without the close, the output stays as wSOL.
 pub(crate) fn solana_instructions(route: &SwapRoute) -> impl Iterator<Item = Instruction> + '_ {
-    route.instructions.iter().map(to_solana_instruction)
+    route
+        .instructions
+        .iter()
+        .map(to_solana_instruction)
+        .filter(|instruction| !closes_wsol_account(instruction))
+}
+
+/// A `CloseAccount` of its owner's wSOL associated token account.
+fn closes_wsol_account(instruction: &Instruction) -> bool {
+    if instruction.program_id != TOKEN_PROGRAM || instruction.data.first() != Some(&CLOSE_ACCOUNT) {
+        return false;
+    }
+    // account, destination, owner
+    let (Some(account), Some(owner)) = (instruction.accounts.first(), instruction.accounts.get(2))
+    else {
+        return false;
+    };
+    let wsol_account = Pubkey::find_program_address(
+        &[owner.pubkey.as_ref(), TOKEN_PROGRAM.as_ref(), WSOL.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM,
+    )
+    .0;
+    account.pubkey == wsol_account
 }
 
 pub(crate) fn lookup_table_addresses(route: &SwapRoute) -> Vec<Pubkey> {
@@ -125,6 +158,44 @@ mod tests {
         assert_eq!(compute_unit_limit(&route(Some(100_000), None)), 120_000);
         assert_eq!(compute_unit_limit(&route(None, None)), 1_400_000);
         assert_eq!(compute_unit_limit(&route(None, Some(9_000_000))), 1_400_000);
+    }
+
+    fn meta(key: Pubkey) -> types::AccountMeta {
+        types::AccountMeta {
+            p: key.to_bytes(),
+            s: false,
+            w: true,
+        }
+    }
+
+    #[test]
+    fn a_route_never_closes_the_wallets_wsol_account() {
+        let user = Pubkey::new_unique();
+        let token_account = |mint: &Pubkey| {
+            Pubkey::find_program_address(
+                &[user.as_ref(), TOKEN_PROGRAM.as_ref(), mint.as_ref()],
+                &ASSOCIATED_TOKEN_PROGRAM,
+            )
+            .0
+        };
+        let close = |account: Pubkey| types::Instruction {
+            p: TOKEN_PROGRAM.to_bytes(),
+            a: vec![meta(account), meta(user), meta(user)],
+            d: vec![CLOSE_ACCOUNT],
+        };
+        let swap = types::Instruction {
+            p: [9; 32],
+            a: vec![],
+            d: vec![42],
+        };
+        let other = token_account(&Pubkey::new_unique());
+        let mut with_closes = route(None, None);
+        with_closes.instructions = vec![swap.clone(), close(token_account(&WSOL)), close(other)];
+
+        let kept: Vec<_> = solana_instructions(&with_closes).collect();
+        assert_eq!(kept.len(), 2, "only the wSOL close goes");
+        assert_eq!(kept[0].program_id, Pubkey::new_from_array([9; 32]));
+        assert_eq!(kept[1].accounts[0].pubkey, other);
     }
 
     #[test]

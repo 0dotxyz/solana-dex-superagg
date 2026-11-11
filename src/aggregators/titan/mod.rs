@@ -154,6 +154,7 @@ impl DexAggregator for TitanAggregator {
                 route.out_amount,
                 route.slippage_bps.unwrap_or(request.slippage_bps),
             ),
+            limits_checked: true,
             payload: QuotePayload::Titan(Box::new(route)),
         })
     }

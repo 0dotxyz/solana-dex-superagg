@@ -97,6 +97,7 @@ impl DexAggregator for JupiterAggregator {
         Ok(Quote {
             aggregator: Aggregator::Jupiter,
             min_out_amount: quote_response.other_amount_threshold,
+            limits_checked: false,
             payload: QuotePayload::Jupiter(Box::new(quote_response)),
         })
     }
@@ -146,13 +147,23 @@ const TOKEN_PROGRAMS: [Pubkey; 2] = [
     solana_pubkey::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
 ];
 
+/// How many accounts below the caller's room Jupiter is asked to stay. Its `maxAccounts` is loose:
+/// multi-hop routes (LSTs, thin tokens) came back up to 6 accounts over it, and such a route is
+/// left out, while direct routes stay far below the limit either way.
+const MAX_ACCOUNTS_MARGIN: usize = 4;
+
 /// Jupiter's limit counts every account of the route and allows at most 64: the caller's room
-/// plus the accounts of its transaction that the route is sure to list.
+/// plus the accounts of its transaction that the route is sure to list, less the margin for its
+/// overshoot.
 fn max_accounts(request: &RouteRequest) -> usize {
     let reused = always_listed(request)
         .filter(|account| request.transaction_accounts.contains(account))
         .count();
-    request.max_accounts.saturating_add(reused).min(64)
+    request
+        .max_accounts
+        .saturating_add(reused)
+        .saturating_sub(MAX_ACCOUNTS_MARGIN)
+        .min(64)
 }
 
 /// Accounts both Jupiter swap instructions (`route` and `sharedAccountsRoute`) list: the user,
@@ -222,7 +233,11 @@ mod tests {
         let mut request = RouteRequest::new(user, input, output, 1, 0, 50);
         request.max_accounts = 30;
         request.transaction_accounts = vec![Pubkey::new_unique(); 10];
-        assert_eq!(max_accounts(&request), 30, "unrelated accounts add nothing");
+        assert_eq!(
+            max_accounts(&request),
+            30 - MAX_ACCOUNTS_MARGIN,
+            "unrelated accounts add nothing"
+        );
 
         request.transaction_accounts.extend([
             user,
@@ -235,14 +250,14 @@ mod tests {
         ]);
         assert_eq!(
             max_accounts(&request),
-            30 + 6,
+            30 + 6 - MAX_ACCOUNTS_MARGIN,
             "the input mint is not sure to be listed"
         );
 
         request.transaction_accounts = vec![user, token, token_2022];
         assert_eq!(
             max_accounts(&request),
-            31,
+            31 - MAX_ACCOUNTS_MARGIN,
             "a token program counts only with a user token account it owns"
         );
 

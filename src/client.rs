@@ -4,7 +4,7 @@ use crate::aggregators::{
 };
 use crate::config::{Aggregator, ClientConfig};
 use anyhow::{anyhow, bail, Result};
-use futures_util::future::join_all;
+use futures_util::{future::join_all, stream::FuturesUnordered, StreamExt};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_instruction::Instruction;
@@ -94,6 +94,13 @@ impl RouteRequest {
             max_accounts: 64,
             allowed_programs: None,
         }
+    }
+}
+
+impl RouteRequest {
+    /// Whether any route fits: every program allowed and room for a whole transaction's accounts.
+    pub(crate) fn is_unconstrained(&self) -> bool {
+        self.allowed_programs.is_none() && self.max_accounts >= 64
     }
 }
 
@@ -252,33 +259,79 @@ impl DexSuperAggClient {
             .ok_or_else(|| anyhow!("{:?} is not configured", aggregator))
     }
 
-    /// Runs `quote` on every venue in parallel, each under `quote_timeout`. Venues that fail are
-    /// logged and skipped; it is an error only when all of them fail.
+    /// Runs `quote` on every venue in parallel, each under `quote_timeout`. Once one returns a
+    /// result `usable` accepts, the others get `quote_grace` more, if set. Results keep the
+    /// venues' order. Venues that fail are logged and skipped, and those still quoting when the
+    /// grace ends are left out; it is an error only when no venue returned a result.
     async fn quote_each<'a, T, Fut>(
         &self,
         venues: impl Iterator<Item = &'a dyn DexAggregator>,
         quote: impl Fn(&'a dyn DexAggregator) -> Fut,
+        usable: impl Fn(&T) -> bool,
     ) -> Result<Vec<T>>
     where
         Fut: Future<Output = Result<T>>,
     {
         let quote_timeout = self.config.quote_timeout;
-        let results = join_all(venues.map(|venue| {
-            let quoted = quote(venue);
-            async move { (venue.kind(), within(quote_timeout, quoted).await) }
-        }))
-        .await;
+        let mut pending: FuturesUnordered<_> = venues
+            .enumerate()
+            .map(|(order, venue)| {
+                let quoted = quote(venue);
+                async move { (order, venue.kind(), within(quote_timeout, quoted).await) }
+            })
+            .collect();
 
-        successes(results, "Quote failed", "No aggregator returned a quote")
+        let mut results = Vec::new();
+        let mut grace_ends: Option<Instant> = None;
+        loop {
+            let next = match grace_ends {
+                None => pending.next().await,
+                Some(at) => match tokio::time::timeout_at(at, pending.next()).await {
+                    Ok(next) => next,
+                    Err(_) => break,
+                },
+            };
+            let Some((order, aggregator, result)) = next else {
+                break;
+            };
+            if grace_ends.is_none() && result.as_ref().is_ok_and(&usable) {
+                grace_ends = self.config.quote_grace.map(|grace| Instant::now() + grace);
+            }
+            results.push((order, aggregator, result));
+        }
+        if !pending.is_empty() {
+            tracing::debug!(
+                left_out = pending.len(),
+                "Quote grace ended with venues still quoting"
+            );
+        }
+
+        results.sort_by_key(|(order, _, _)| *order);
+        successes(
+            results
+                .into_iter()
+                .map(|(_, aggregator, result)| (aggregator, result))
+                .collect(),
+            "Quote failed",
+            "No aggregator returned a quote",
+        )
     }
 
-    /// Quotes every venue for `request` at `amount`, sorted by guaranteed output, best first.
+    /// Quotes every venue for `request` at `amount`, sorted by guaranteed output, best first. A
+    /// quote that guarantees `request.min_out`, on a route known to fit the request's limits,
+    /// starts the grace for the other venues: one that may turn out not to fit must not cut off a
+    /// venue whose route does.
     async fn collect_quotes(&self, request: &RouteRequest, amount: u64) -> Result<Vec<Quote>> {
         check_swap(&request.input_mint, &request.output_mint, amount)?;
         let mut quotes = self
-            .quote_each(self.venues.iter().map(|venue| venue.as_ref()), |venue| {
-                venue.quote(request, amount)
-            })
+            .quote_each(
+                self.venues.iter().map(|venue| venue.as_ref()),
+                |venue| venue.quote(request, amount),
+                |quote: &Quote| {
+                    quote.min_out_amount >= request.min_out
+                        && (quote.limits_checked || request.is_unconstrained())
+                },
+            )
             .await?;
 
         // Stable: on a tie the configured order decides.
@@ -425,7 +478,11 @@ impl DexSuperAggClient {
         amount: u64,
         min_out: u64,
     ) -> Result<SwapTransaction> {
-        let request = self.transaction_request(input_mint, output_mint, amount);
+        // The minimum decides which quote is usable, and so when the other venues' grace starts.
+        let request = RouteRequest {
+            min_out,
+            ..self.transaction_request(input_mint, output_mint, amount)
+        };
         let quotes = self.collect_quotes(&request, amount).await?;
         let best_out = quotes[0].min_out_amount;
         if best_out < min_out {
@@ -676,6 +733,8 @@ mod tests {
         build_delay: Duration,
         program: Pubkey,
         accounts: usize,
+        /// Whether its quotes say the route was checked against the request's limits.
+        limits_checked: bool,
         quoted: Arc<Mutex<Vec<u64>>>,
     }
 
@@ -691,6 +750,7 @@ mod tests {
                 build_delay: Duration::ZERO,
                 program: PROGRAM,
                 accounts: 2,
+                limits_checked: true,
                 quoted: Arc::default(),
             }
         }
@@ -728,6 +788,7 @@ mod tests {
             Ok(Quote {
                 aggregator: self.kind,
                 min_out_amount: amount * price / 10_000,
+                limits_checked: self.limits_checked,
                 payload: QuotePayload::Dflow(Box::new(Value::Null)),
             })
         }
@@ -770,6 +831,101 @@ mod tests {
                 .map(|venue| Box::new(venue) as Box<dyn DexAggregator>)
                 .collect(),
         )
+    }
+
+    /// A client whose venues get `grace` after the first usable quote, within a 1 s deadline.
+    fn client_with_grace(venues: Vec<MockVenue>, grace: Duration) -> DexSuperAggClient {
+        let mut client = client(venues);
+        client.config.quote_timeout = Duration::from_secs(1);
+        client.config.quote_grace = Some(grace);
+        client
+    }
+
+    fn delayed(kind: Aggregator, price_bps: u64, millis: u64) -> MockVenue {
+        MockVenue {
+            quote_delay: Duration::from_millis(millis),
+            ..MockVenue::new(kind, price_bps)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn venues_slower_than_the_grace_after_the_first_quote_are_left_out() {
+        let started = Instant::now();
+        let quotes = client_with_grace(venues_all(), Duration::from_millis(20))
+            .quote(USDC, WSOL, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].aggregator, Aggregator::Jupiter);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(30),
+            "10 ms + the grace"
+        );
+
+        // A venue within the grace competes, and wins on output.
+        let quotes = client_with_grace(venues_all(), Duration::from_millis(60))
+            .quote(USDC, WSOL, 1_000_000)
+            .await
+            .unwrap();
+        let venues: Vec<_> = quotes.iter().map(|quote| quote.aggregator).collect();
+        assert_eq!(venues, [Aggregator::Titan, Aggregator::Jupiter]);
+
+        // Without a grace, every venue is waited for.
+        let mut waiting = client(venues_all());
+        waiting.config.quote_timeout = Duration::from_secs(1);
+        assert_eq!(waiting.quote(USDC, WSOL, 1_000_000).await.unwrap().len(), 3);
+    }
+
+    fn venues_all() -> Vec<MockVenue> {
+        vec![
+            delayed(Aggregator::Jupiter, 9_800, 10),
+            delayed(Aggregator::Titan, 9_900, 50),
+            delayed(Aggregator::Dflow, 9_950, 500),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quote_not_yet_checked_against_the_limits_starts_no_grace() {
+        // Jupiter quotes first, but its route only shows whether it fits when built: here it
+        // doesn't, so Titan must still be waited for.
+        let unchecked_misfit = MockVenue {
+            limits_checked: false,
+            accounts: 100,
+            ..delayed(Aggregator::Jupiter, 9_900, 10)
+        };
+        let client = client_with_grace(
+            vec![unchecked_misfit, delayed(Aggregator::Titan, 9_800, 50)],
+            Duration::from_millis(20),
+        );
+        let mut request = route_request(1_000_000, 0, Sizing::Fixed);
+        request.max_accounts = 30;
+        let routes = client.build_swap_instructions(&request).await.unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].aggregator, Aggregator::Titan);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_quote_that_covers_the_minimum_starts_the_grace() {
+        let failing_fast = MockVenue {
+            quote_error: Some("rate limited"),
+            ..delayed(Aggregator::Dflow, 9_900, 5)
+        };
+        let client = client_with_grace(
+            vec![
+                delayed(Aggregator::Jupiter, 9_000, 10),
+                delayed(Aggregator::Titan, 9_900, 50),
+                failing_fast,
+            ],
+            Duration::from_millis(20),
+        );
+        // Jupiter's 900_000 doesn't cover 950_000 and DFlow failed: Titan is waited for.
+        let routes = client
+            .build_swap_instructions(&route_request(1_000_000, 950_000, Sizing::Fixed))
+            .await
+            .unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].aggregator, Aggregator::Titan);
     }
 
     fn route_request(amount: u64, min_out: u64, sizing: Sizing) -> RouteRequest {
